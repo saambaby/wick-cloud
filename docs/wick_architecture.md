@@ -434,7 +434,7 @@ This differs from blind-signing architectures (such as Greenlight's default mode
 | Relay stream squatting | External attacker | 128-bit server-issued stream IDs exchanged inside Noise_KK; client-chosen IDs rejected; per-IP connect rate limit (§3.10) |
 | Suspended-wallet griefing | Adversarial client | Suspension is admin-only (no self-suspend API); incoming HTLCs fail back with temporary_node_failure at LSP boundary (§7.5) |
 
-**7.3 Operational Security**
+### 7.3 Operational Security
 
 **LSPS5 webhook egress.** Client-controlled webhook URLs fire server-side HTTPS POSTs. The dispatcher applies strict validation at registration and at every fire:
 
@@ -448,7 +448,7 @@ This differs from blind-signing architectures (such as Greenlight's default mode
 
 **Observability for every fix.** Every security-relevant mechanism above exports a Prometheus metric. Notable counters: `tenant_guard_mismatch_total`, `reorg_exposure_unconfirmed_sats`, `reorg_reserve_sats`, `reorg_loss_events_total`, `lsp_dispatch_unknown_scid_total`, `peer_registry_epoch`, `wake_semaphore_blocked_total`, `wake_latency_seconds{priority}`, `jit_grief_score_p99`, `jit_first_fulfil_rate`, `webhook_fire_rejected_total{reason}`, `webhook_egress_violations_total`, `macaroon_revocation_propagation_seconds`, `macaroon_window_rejections_total`. A red-team test suite in CI exercises SSRF payloads, DNS rebinders, macaroon replay, reorg simulation, wake flood, and grief automation; failures block deploys.
 
-**7.4 Privacy Hardening**
+### 7.4 Privacy Hardening
 
 **VSS metadata side-channel.** The VSS server sees object keys, encrypted payload sizes, and write timing. To bound inference:
 
@@ -456,34 +456,38 @@ This differs from blind-signing architectures (such as Greenlight's default mode
 - A per-tenant scheduler emits at least one write per `vss_dummy_write_interval_s` (default 60s) whether or not real state changed.
 - Write timestamps are jittered ±5s to obscure HTLC arrival timing.
 
-After padding and dummy traffic, the operator can learn a tenant\'s write *cadence* but not its *content* or *event triggers*.
+After padding and dummy traffic, the operator can learn a tenant's write *cadence* but not its *content* or *event triggers*.
 
-**NWC relay privacy.** The Wick-operated NWC relay is private rather than a public Nostr relay --- public Nostr relays expose message timing and pubkeys to all connected clients, which is a non-trivial payment-metadata leak. A self-hosted relay restricts visibility to the operator only.
+**NWC relay privacy.** The Wick-operated NWC relay is private rather than a public Nostr relay — public Nostr relays expose message timing and pubkeys to all connected clients, which is a non-trivial payment-metadata leak. A self-hosted relay restricts visibility to the operator only.
 
 **RGS source diversity.** Routing decisions consume RapidGossipSync snapshots from at least three independent feeds (LDK public snapshot, self-hosted mirror, partner feed). Gossip deltas are applied only when 2-of-3 agree; divergence triggers an investigation alert. No routing decision is taken from a lone feed.
 
-**7.5 Wallet Lifecycle Controls**
+### 7.5 Wallet Lifecycle Controls
 
 **Suspension semantics.** The `wallets.suspended` flag is administrative only; there is no self-suspend API. Admin suspension is gated on a signed request with audit log. Suspended wallets refuse new HTLCs at the LSP boundary via `LiquidityManager` interception (returning `update_fail_htlc` with `temporary_node_failure`). In-flight HTLCs complete normally; suspension takes effect after drain. The UI shows a clear banner with contact/appeal info, and send functionality is disabled. Resume requires admin action and a forced monitor reload.
 
-**8 LSP Economics**
+---
 
-**8.1 Fee Model Parameters**
+## 8. LSP Economics
+
+### 8.1 Fee Model Parameters
 
 Each JIT channel open involves three fee parameters negotiated at invoice time:
 
-- min_fee_msat --- floor fee regardless of payment size; must cover on-chain open cost (typically 2,000--10,000 sats depending on mempool fee rate)
+- **min_fee_msat** — floor fee regardless of payment size; must cover on-chain open cost (typically 2,000–10,000 sats depending on mempool fee rate)
+- **proportional_ppm** — fee as parts-per-million of the forwarded payment; competitive range is 5,000–10,000 ppm for JIT channels
+- **valid_until** — expiry time for the signed fee param set; default 30-minute validity window via FeeParamCache
 
-- proportional_ppm --- fee as parts-per-million of the forwarded payment; competitive range is 5,000--10,000 ppm for JIT channels
+### 8.2 Capital Efficiency Tracking
 
-- valid_until --- expiry time for the signed fee param set; default 30-minute validity window via FeeParamCache
+The lsp_channels table records `routing_fees_earned` per channel, enabling calculation of actual ROI per channel and per-cohort fee sensitivity analysis over time. Capital efficiency is measured as:
 
-**8.2 Capital Efficiency Tracking**
+```
+ROI = routing_fees_earned / (capacity_sats × days_open)
+```
 
-The lsp_channels table records routing_fees_earned per channel, enabling calculation of actual ROI per channel and per-cohort fee sensitivity analysis over time. Capital efficiency is measured as:
+The liquidity_pool record tracks total deployed vs available capital at the LSP level, and the utxo_set table exposes real-time available liquidity. These two signals drive dynamic fee adjustment — when liquidity is constrained, proportional_ppm increases; when the pool is deep, it decreases to remain competitive.
 
-> ROI = routing_fees_earned / (capacity_sats x days_open)
+---
 
-The liquidity_pool record tracks total deployed vs available capital at the LSP level, and the utxo_set table exposes real-time available liquidity. These two signals drive dynamic fee adjustment --- when liquidity is constrained, proportional_ppm increases; when the pool is deep, it decreases to remain competitive.
-
-*Wick --- wick.cloud --- Architecture v0.2 --- April 2026*
+**Wick — wick.cloud — Architecture v0.2 — April 2026**
