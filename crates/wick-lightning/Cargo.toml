@@ -1,0 +1,60 @@
+[package]
+name = "wick-lightning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Per-tenant LDK Lightning node for Wick Cloud (self-custodial — no seed custody on the server)."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal
+wick-core = { workspace = true }
+wick-db   = { workspace = true }
+
+# Async / runtime
+tokio        = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait  = { workspace = true }
+futures      = { workspace = true }
+
+# Errors / logging
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+
+# Serde / encoding
+serde      = { workspace = true }
+serde_json = { workspace = true }
+hex        = { workspace = true }
+
+# DB
+sqlx = { workspace = true }
+
+# Concurrency primitives
+dashmap     = { workspace = true }
+parking_lot = { workspace = true }
+
+# Crypto
+secp256k1 = { workspace = true }
+rand      = { workspace = true }
+
+# LDK
+lightning                      = { workspace = true }
+lightning-block-sync           = { workspace = true }
+lightning-invoice              = { workspace = true }
+lightning-net-tokio            = { workspace = true }
+lightning-background-processor = { workspace = true }
+lightning-persister            = { workspace = true }
+lightning-rapid-gossip-sync    = { workspace = true }
+bitcoin                        = { workspace = true }
+
+# Chain backend
+esplora-client = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
