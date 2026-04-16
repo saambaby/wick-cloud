@@ -1,0 +1,14 @@
+msrv = "1.82.0"
+avoid-breaking-exported-api = false
+cognitive-complexity-threshold = 25
+too-many-arguments-threshold = 8
+type-complexity-threshold = 350
+
+# Disallow panics and process exits from library code.
+disallowed-macros = [
+    { path = "std::dbg", reason = "use tracing::debug instead" },
+]
+
+disallowed-methods = [
+    { path = "std::process::exit", reason = "return an error instead" },
+]
