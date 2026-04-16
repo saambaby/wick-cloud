@@ -1,0 +1,42 @@
+[package]
+name = "wick-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Multi-tenant ldk-server process. Phase 1: actor model + gRPC."
+
+[lib]
+name = "wick_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wick-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+wick-core      = { workspace = true }
+wick-db        = { workspace = true }
+wick-proto     = { workspace = true }
+wick-lightning = { workspace = true }
+
+tokio      = { workspace = true }
+tracing    = { workspace = true }
+anyhow     = { workspace = true }
+serde      = { workspace = true }
+dashmap    = { workspace = true }
+sqlx       = { workspace = true }
+tonic      = { workspace = true }
+hex        = "0.4"
+bitcoin    = { workspace = true }
+hmac       = { workspace = true }
+sha2       = { workspace = true }
+rand       = { workspace = true }
+
+[dev-dependencies]
+tokio      = { workspace = true }
