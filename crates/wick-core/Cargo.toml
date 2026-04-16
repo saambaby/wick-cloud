@@ -1,0 +1,25 @@
+[package]
+name = "wick-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared types, config, errors, and metrics helpers for Wick Cloud."
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+figment = { workspace = true }
+serde = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
