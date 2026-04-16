@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__obsidian__read-note",
+      "Bash(python3 -c \"import docx\")",
+      "Bash(brew install:*)",
+      "Bash(pandoc \"/Users/sambaby/Development/@saam.baby/wick/wick-cloud/docs/wick_architecture.docx\" -o \"/Users/sambaby/Development/@saam.baby/wick/wick-cloud/docs/wick_architecture.md\" --wrap=none)",
+      "mcp__obsidian__list-available-vaults",
+      "Bash(rustc --version)",
+      "Bash(cargo --version)",
+      "Bash(rustup toolchain:*)",
+      "Bash(cargo build:*)",
+      "mcp__obsidian__edit-note",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(grep -v \"^--$\")",
+      "Bash(gh api:*)",
+      "Bash(gh repo:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(gh auth:*)",
+      "Bash(unset GITHUB_TOKEN)",
+      "Bash(git mv:*)",
+      "Bash(cargo check:*)",
+      "Bash(grep -n \"pub fn\\\\|pub struct\" /Users/sambaby/Development/@saam.baby/wick/wick-cloud/crates/wick-db/src/*.rs)",
+      "Bash(grep -n \"schema_name\\\\|tenant_id\" /Users/sambaby/Development/@saam.baby/wick/wick-cloud/crates/wick-core/src/*.rs)",
+      "Bash(grep -E \"^error|^warning: \\\\`wick\")",
+      "Bash(curl -s \"https://api.github.com/repos/nuCode-Tech/ln-gateway/contents/gateway-lightning/src\")",
+      "Bash(awk '{p+=$4; f+=$6; i+=$8} END {print \"passed:\",p,\" failed:\",f,\" ignored:\",i}')",
+      "Bash(echo ---exists?---)"
+    ]
+  },
+  "spinnerTipsEnabled": true
+}

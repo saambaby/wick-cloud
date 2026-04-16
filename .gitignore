@@ -1,0 +1,40 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Flutter
+/flutter/wick_wallet/build/
+/flutter/wick_wallet/.dart_tool/
+/flutter/wick_wallet/.flutter-plugins
+/flutter/wick_wallet/.flutter-plugins-dependencies
+/flutter/wick_wallet/ios/Pods/
+/flutter/wick_wallet/android/.gradle/
+/flutter/wick_wallet/android/local.properties
+
+# Web extension
+/web/extension/node_modules/
+/web/extension/dist/
+
+# Docker volumes
+/deploy/docker/data/
+/deploy/docker/.regtest/
+
+# Test artefacts
+/corpus/
+/artifacts/
+CLAUDE.md
