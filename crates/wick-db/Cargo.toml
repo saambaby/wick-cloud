@@ -1,0 +1,25 @@
+[package]
+name = "wick-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Postgres pool with tenant-isolation discipline (SET LOCAL + AfterRelease + runtime guard)."
+
+[lints]
+workspace = true
+
+[dependencies]
+wick-core = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
