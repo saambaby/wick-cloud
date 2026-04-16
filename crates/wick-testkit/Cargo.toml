@@ -1,0 +1,42 @@
+[package]
+name = "wick-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Regtest harness, mock LSP, chaos injectors, red-team fixtures. Dev-only."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+wick-core          = { workspace = true }
+wick-db            = { workspace = true }
+wick-lightning     = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }
+sqlx               = { workspace = true }
+bitcoin            = { workspace = true }
+lightning          = { workspace = true }
+lightning-invoice  = { workspace = true }
+rand               = { workspace = true }
+hex                = { workspace = true }
+
+# BDK 1.x — on-chain wallet for funding channels + verifying on-chain
+# receive in regtest integration tests. `bdk_wallet` is the 1.0+ frontend.
+bdk_wallet = "1.0"
+
+# bdk_electrum 0.20 is the version that shares bdk_core 0.4.x with
+# bdk_wallet 1.2. Use the Electrum TCP protocol to sync against Electrs
+# (port 50001 in the docker-compose stack) — proper SPK-range scanning,
+# not the fake bitcoind-RPC checkpoint the stub used.
+bdk_electrum = { version = "0.20", default-features = false, features = ["use-rustls"] }
+
+# bitcoind JSON-RPC client for chain control (mining, invalidate_block).
+# Wallet sync no longer uses bitcoind RPC — that's now done via Electrs.
+bitcoincore-rpc = "0.19"
