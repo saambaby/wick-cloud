@@ -1,0 +1,18 @@
+[package]
+name = "wick-sdk-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "flutter_rust_bridge bindings for the Wick SDK. Phase 5."
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+wick-sdk = { workspace = true, features = ["ffi"] }

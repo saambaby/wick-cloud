@@ -1,0 +1,22 @@
+[package]
+name = "wick-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Canonical Rust SDK for Wick Cloud. Phase 5."
+
+[lints]
+workspace = true
+
+[features]
+default = ["std"]
+std = []
+ffi = []
+wasm = []
+
+[dependencies]
+wick-core = { workspace = true }
+thiserror = { workspace = true }

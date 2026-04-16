@@ -1,0 +1,18 @@
+[package]
+name = "wick-sdk-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "wasm-pack target for the Wick SDK + WebLN provider. Phase 6."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+wick-sdk = { workspace = true, features = ["wasm"] }
