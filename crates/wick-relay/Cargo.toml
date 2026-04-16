@@ -1,0 +1,22 @@
+[package]
+name = "wick-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dumb-pipe WebSocket relay (mailbox) between VLS signer and ldk-server. Phase 4."
+
+[[bin]]
+name = "wick-relay"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+wick-core = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

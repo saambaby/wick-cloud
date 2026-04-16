@@ -1,0 +1,23 @@
+[package]
+name = "wick-vss-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Versioned Storage Service server — encrypted KV backed by Postgres. Phase 4."
+
+[[bin]]
+name = "wick-vss-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+wick-core = { workspace = true }
+wick-db = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
