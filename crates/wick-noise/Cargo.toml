@@ -1,0 +1,17 @@
+[package]
+name = "wick-noise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Noise_KK tunnel between VLS signer and ldk-server. Phase 4."
+
+[lints]
+workspace = true
+
+[dependencies]
+wick-core = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "wick-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "LSP daemon — LiquidityManager wrapper, peer_registry, JIT channel flow. Phase 3."
+
+[lints]
+workspace = true
+
+[dependencies]
+wick-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

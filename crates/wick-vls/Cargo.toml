@@ -1,0 +1,17 @@
+[package]
+name = "wick-vls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Validating Lightning Signer — on-device policy engine. Phase 4."
+
+[lints]
+workspace = true
+
+[dependencies]
+wick-core = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }

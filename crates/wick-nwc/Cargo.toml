@@ -1,0 +1,16 @@
+[package]
+name = "wick-nwc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "NIP-47 Nostr Wallet Connect implementation. Phase 6."
+
+[lints]
+workspace = true
+
+[dependencies]
+wick-core = { workspace = true }
+thiserror = { workspace = true }

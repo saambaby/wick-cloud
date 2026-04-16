@@ -1,0 +1,19 @@
+[package]
+name = "wick-macaroon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Macaroon HMAC chain + nonce revocation set + spend-window caveat. Phase 4."
+
+[lints]
+workspace = true
+
+[dependencies]
+wick-core = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
