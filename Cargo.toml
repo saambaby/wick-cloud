@@ -1,0 +1,119 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wick-core",
+    "crates/wick-proto",
+    "crates/wick-server",
+    "crates/wick-lightning",
+    "crates/wick-lsp",
+    "crates/wick-relay",
+    "crates/wick-vss-server",
+    "crates/wick-db",
+    "crates/wick-macaroon",
+    "crates/wick-sdk",
+    "crates/wick-vls",
+    "crates/wick-noise",
+    "crates/wick-nwc",
+    "crates/wick-sdk-ffi",
+    "crates/wick-sdk-wasm",
+    "crates/wick-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/saam-baby/wick-cloud"
+authors = ["Wick Cloud contributors"]
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+futures = "0.3"
+
+# errors / logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# metrics
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+
+# config
+figment = { version = "0.10", features = ["toml", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# db
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "uuid", "chrono", "json"] }
+
+# concurrency primitives
+dashmap = "6"
+parking_lot = "0.12"
+
+# crypto / security
+zeroize = { version = "1", features = ["zeroize_derive"] }
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+
+# lightning (pinned to LDK 0.2 release train)
+lightning                      = "0.2.2"
+lightning-block-sync           = { version = "0.2.0", features = ["tokio"] }
+lightning-invoice              = "0.34.0"
+lightning-net-tokio            = "0.2.0"
+lightning-background-processor = "0.2.0"
+lightning-persister            = { version = "0.2.0", features = ["tokio"] }
+lightning-rapid-gossip-sync    = "0.2.0"
+lightning-liquidity            = "0.2"
+bitcoin                        = { version = "0.32", features = ["serde"] }
+esplora-client                 = { version = "0.12", default-features = false, features = ["async", "async-https-rustls", "tokio"] }
+secp256k1                      = { version = "0.29", features = ["rand-std"] }
+hex                            = "0.4"
+
+# grpc
+tonic = "0.12"
+prost = "0.13"
+
+# test
+proptest = "1"
+loom = "0.7"
+
+# internal
+wick-core = { path = "crates/wick-core" }
+wick-proto = { path = "crates/wick-proto" }
+wick-db = { path = "crates/wick-db" }
+wick-macaroon = { path = "crates/wick-macaroon" }
+wick-lsp = { path = "crates/wick-lsp" }
+wick-sdk = { path = "crates/wick-sdk" }
+wick-vls = { path = "crates/wick-vls" }
+wick-noise = { path = "crates/wick-noise" }
+wick-nwc = { path = "crates/wick-nwc" }
+wick-lightning = { path = "crates/wick-lightning" }
+wick-testkit = { path = "crates/wick-testkit" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# security-critical lints
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
