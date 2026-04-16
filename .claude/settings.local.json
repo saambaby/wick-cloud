@@ -27,7 +27,10 @@
       "Bash(grep -E \"^error|^warning: \\\\`wick\")",
       "Bash(curl -s \"https://api.github.com/repos/nuCode-Tech/ln-gateway/contents/gateway-lightning/src\")",
       "Bash(awk '{p+=$4; f+=$6; i+=$8} END {print \"passed:\",p,\" failed:\",f,\" ignored:\",i}')",
-      "Bash(echo ---exists?---)"
+      "Bash(echo ---exists?---)",
+      "Bash(cat .github/workflows/*.yml)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
     ]
   },
   "spinnerTipsEnabled": true
