@@ -1,0 +1,7 @@
+# Dev config for wick-server against the docker-compose stack.
+
+database_url        = "postgres://wick:wick@localhost:5432/wick"
+max_db_connections  = 16
+metrics_addr        = "127.0.0.1:9464"
+grpc_addr           = "127.0.0.1:50051"
+memory_budget_bytes = 536870912   # 512 MiB

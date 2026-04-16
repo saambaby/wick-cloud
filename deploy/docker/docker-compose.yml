@@ -1,0 +1,98 @@
+# Local dev stack for Wick Cloud.
+# Start: `just regtest-up`   Stop: `just regtest-down`
+#
+# Exposes:
+#   bitcoind regtest RPC  http://bitcoin:bitcoin@localhost:18443
+#   bitcoind P2P          localhost:18444
+#   bitcoind zmqpubrawblock tcp://localhost:28332
+#   bitcoind zmqpubrawtx    tcp://localhost:28333
+#   postgres              postgres://wick:wick@localhost:5432/wick
+#   electrs               http://localhost:3002
+#   esplora               http://localhost:3000
+
+services:
+  bitcoind:
+    image: lncm/bitcoind:v27.1
+    container_name: wick-bitcoind
+    command:
+      - -regtest=1
+      - -server=1
+      - -txindex=1
+      - -rpcuser=bitcoin
+      - -rpcpassword=bitcoin
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -fallbackfee=0.0002
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+      - -printtoconsole=1
+    ports:
+      - "18443:18443"
+      - "18444:18444"
+      - "28332:28332"
+      - "28333:28333"
+    volumes:
+      - bitcoind-data:/data/.bitcoin
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=bitcoin", "-rpcpassword=bitcoin", "getblockchaininfo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: wick-postgres
+    environment:
+      POSTGRES_USER: wick
+      POSTGRES_PASSWORD: wick
+      POSTGRES_DB: wick
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wick -d wick"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  electrs:
+    image: getumbrel/electrs:v0.10.6
+    container_name: wick-electrs
+    command:
+      - --network=regtest
+      - --daemon-rpc-addr=bitcoind:18443
+      - --cookie=bitcoin:bitcoin
+      - --electrum-rpc-addr=0.0.0.0:50001
+      - --http-addr=0.0.0.0:3002
+      - --jsonrpc-import
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    ports:
+      - "50001:50001"
+      - "3002:3002"
+
+  esplora:
+    # Esplora HTTP API for on-chain address queries.
+    # Phase 0 uses it for Lightning-routing fee estimates only; portfolio
+    # queries in later phases go to public Esplora (mempool.space etc.).
+    image: blockstream/esplora:latest
+    container_name: wick-esplora
+    environment:
+      - FLAVOR=base
+      - NO_PRECACHE=1
+    command: >
+      bash -c "/srv/explorer/run.sh bitcoin-regtest explorer"
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    # The upstream image is opinionated; for Phase 0 we tolerate flakiness and
+    # mostly use electrs directly.
+    restart: unless-stopped
+
+volumes:
+  bitcoind-data:
+  postgres-data:
