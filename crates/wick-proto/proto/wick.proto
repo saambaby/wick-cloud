@@ -1,0 +1,141 @@
+syntax = "proto3";
+
+package wick;
+
+option java_multiple_files = true;
+option java_package = "cloud.wick.v1";
+
+// WalletService is the primary gRPC surface for the wick-server.
+// Phase 1: tenant management + balance/payment stubs.
+// Phase 3+: real LDK-backed implementations.
+service WalletService {
+  // CreateTenant provisions a new wallet tenant.
+  // Returns the tenant_id which identifies this wallet in all subsequent calls.
+  rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
+
+  // GetBalance returns the current Lightning + on-chain balance for a tenant.
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+
+  // SendPayment initiates an outbound payment for a tenant.
+  rpc SendPayment(SendPaymentRequest) returns (SendPaymentResponse);
+
+  // ReceivePayment creates a BOLT11 invoice for a tenant.
+  rpc ReceivePayment(ReceivePaymentRequest) returns (ReceivePaymentResponse);
+
+  // GetTransactions returns paginated payment history for a tenant.
+  rpc GetTransactions(GetTransactionsRequest) returns (GetTransactionsResponse);
+}
+
+// ── CreateTenant ─────────────────────────────────────────────────────────────
+
+message CreateTenantRequest {
+  // The Lightning pubkey (33-byte compressed SEC1, hex-encoded) of the wallet.
+  string pubkey_hex = 1;
+
+  // Subscription plan tier: "free" | "standard" | "premium".
+  string plan_tier = 2;
+}
+
+message CreateTenantResponse {
+  // Assigned tenant ID. Stable and used in all subsequent requests.
+  uint64 tenant_id = 1;
+
+  // Opaque bearer token for this tenant. Present exactly once at registration;
+  // never re-issued. Include in all subsequent requests as:
+  //   Authorization: Bearer <token>
+  // Phase 4 replaces this with a macaroon (architecture §5.4).
+  string api_token = 2;
+}
+
+// ── GetBalance ────────────────────────────────────────────────────────────────
+
+message GetBalanceRequest {
+  uint64 tenant_id = 1;
+}
+
+message GetBalanceResponse {
+  // Spendable Lightning balance in millisatoshis.
+  uint64 lightning_balance_msat = 1;
+
+  // Confirmed on-chain balance in satoshis.
+  uint64 onchain_balance_sats = 2;
+}
+
+// ── SendPayment ───────────────────────────────────────────────────────────────
+
+message SendPaymentRequest {
+  uint64 tenant_id = 1;
+
+  // BOLT11 invoice to pay.
+  string bolt11 = 2;
+}
+
+message SendPaymentResponse {
+  // 32-byte payment hash.
+  bytes payment_hash = 1;
+
+  // Routing fee paid in millisatoshis.
+  uint64 fee_paid_msat = 2;
+
+  // "succeeded" | "failed" | "pending"
+  string status = 3;
+}
+
+// ── ReceivePayment ────────────────────────────────────────────────────────────
+
+message ReceivePaymentRequest {
+  uint64 tenant_id = 1;
+
+  // Amount in millisatoshis. Omit for any-amount invoice.
+  optional uint64 amount_msat = 2;
+
+  // Human-readable memo / description.
+  string memo = 3;
+}
+
+message ReceivePaymentResponse {
+  // BOLT11 invoice string.
+  string bolt11 = 1;
+
+  // 32-byte payment hash.
+  bytes payment_hash = 2;
+}
+
+// ── GetTransactions ───────────────────────────────────────────────────────────
+
+message GetTransactionsRequest {
+  uint64 tenant_id = 1;
+
+  // Maximum number of records to return (default 50, max 200).
+  uint32 limit = 2;
+
+  // If set, return only payments created before this Unix timestamp (cursor pagination).
+  optional int64 before_timestamp = 3;
+}
+
+message GetTransactionsResponse {
+  repeated Payment payments = 1;
+}
+
+message Payment {
+  // 32-byte payment hash.
+  bytes payment_hash = 1;
+
+  // true = outbound (sent), false = inbound (received).
+  bool is_outbound = 2;
+
+  // Amount in millisatoshis.
+  uint64 amount_msat = 3;
+
+  // Fee in millisatoshis (0 for inbound).
+  uint64 fee_msat = 4;
+
+  // "pending" | "succeeded" | "failed"
+  string status = 5;
+
+  // Unix timestamp (seconds) when the payment was created.
+  int64 timestamp = 6;
+
+  // Optional memo attached to the invoice.
+  optional string memo = 7;
+}
