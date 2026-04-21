@@ -55,6 +55,7 @@ bitcoin                        = { workspace = true }
 
 # Chain backend
 esplora-client = { workspace = true }
+reqwest        = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 use tokio::runtime::Handle;
-use wick_core::TenantId;
+use wick_core::{TenantId, WickNetwork};
 
 use crate::chain::{EsploraBroadcaster, EsploraChainClient, FeeEstimator};
 use crate::logger::TracingLogger;
@@ -29,6 +29,8 @@ pub const DEFAULT_LISTEN_PORT_BASE: u16 = 9735;
 pub struct NodeDeps {
     /// Postgres pool. Each tenant's schema is isolated but shares the pool.
     pub pg_pool: PgPool,
+    /// Which network the server is running against.
+    pub network: WickNetwork,
     /// Esplora chain client (`BlockSource`).
     pub esplora: Arc<EsploraChainClient>,
     /// Transaction broadcaster.
@@ -52,19 +54,21 @@ pub struct NodeDeps {
 impl NodeDeps {
     /// Compute the listen [`SocketAddr`] for a given tenant.
     ///
-    /// Uses `listen_port_base + tenant_id` on `0.0.0.0`. If
+    /// Uses `listen_port_base + offset` on `0.0.0.0`. If
     /// `listen_port_base == 0`, returns `0.0.0.0:0` (OS-assigned port) — the
     /// builder will read back the bound port after `TcpListener::bind`.
+    ///
+    /// The port offset is derived from the last two bytes of the UUID so it
+    /// is stable per tenant but unpredictable to external observers.
     #[must_use]
     pub fn listen_addr_for(&self, tenant_id: TenantId) -> SocketAddr {
         let port = if self.listen_port_base == 0 {
             0
         } else {
-            // Saturate if the computed port would overflow u16. Callers with
-            // 60k+ tenants should configure a lower base or use 0.
-            let offset = u32::try_from(tenant_id.as_u64()).unwrap_or(u32::MAX);
-            u16::try_from(u32::from(self.listen_port_base).saturating_add(offset))
-                .unwrap_or(u16::MAX)
+            let uuid = tenant_id.as_uuid();
+            let b = uuid.as_bytes();
+            let offset = u16::from_le_bytes([b[14], b[15]]);
+            self.listen_port_base.saturating_add(offset)
         };
         SocketAddr::from(([0, 0, 0, 0], port))
     }
