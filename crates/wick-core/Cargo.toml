@@ -20,6 +20,10 @@ metrics-exporter-prometheus = { workspace = true }
 figment = { workspace = true }
 serde = { workspace = true }
 zeroize = { workspace = true }
+uuid = { workspace = true }
+bitcoin = { workspace = true }
+bip39 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+serde_json = { workspace = true }
