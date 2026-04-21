@@ -37,6 +37,18 @@ impl FeeEstimator {
         }
     }
 
+    /// Convert the cached rate for `target` back to sat/vB (ceiling-rounded).
+    ///
+    /// Inverse of the `×250` conversion used by `update`. Minimum return
+    /// value is 1 sat/vB (LDK's relay floor rounds up to 253 sat/kW = 2 sat/vB
+    /// via ceiling division).
+    #[must_use]
+    pub fn sat_per_vb(&self, target: ConfirmationTarget) -> u64 {
+        let sat_per_kw = u64::from(self.get_est_sat_per_1000_weight(target));
+        // ceil((sat/kW) / 250) to avoid going below 1 sat/vB
+        (sat_per_kw + 249) / 250
+    }
+
     /// Recompute and store all target rates from a fresh Esplora fee-estimates
     /// map (`block_count → sat/vB`).
     ///
@@ -123,22 +135,14 @@ fn sat_per_vb_from_estimates(estimates: &HashMap<u16, f64>, blocks: u16) -> f64 
 }
 
 /// Convert sat/vB → sat/1000-weight, clamped to LDK's minimum floor.
+///
+/// Correct derivation:
+///   1 vbyte = 4 weight units
+///   sat/vB = sat per 4 weight units
+///   sat/1000-weight = (sat/vB) × 1000 / 4 = (sat/vB) × 250
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn sat_per_1000_weight(sat_per_vb: f64) -> u32 {
-    // 1 vbyte = 4 weight units, so sat/vB × 4 = sat/4-weight;
-    // then × 250 gives sat per 1000-weight... wait: sat/vB × 4 = sat/4000-weight
-    // => sat/1000-weight = (sat/vB × 4000) / 4 = sat/vB × 1000? No.
-    //
-    // Correct: 1 vbyte = 4 weight units.
-    //   sat/vB           = sat per 4 weight units
-    //   sat/1000-weight  = (sat/vB) × 1000 / 4  = (sat/vB) × 250
-    //
-    // LDK wants sat/kw. ln-gateway multiplies by 4 — that is what LDK's
-    // built-in conversion does for some call sites, so we mirror that here to
-    // keep compatibility with the reference implementation. If a live rate
-    // audit shows these need to be /4-ed, adjust here.
-    let scaled = (sat_per_vb * 4.0).max(f64::from(MIN_SAT_PER_1000_WEIGHT));
-    // Clamp before casting; above we already ensure scaled >= 253.
+    let scaled = (sat_per_vb * 250.0).max(f64::from(MIN_SAT_PER_1000_WEIGHT));
     scaled.min(f64::from(u32::MAX)) as u32
 }
 
@@ -173,9 +177,18 @@ mod tests {
     }
 
     #[test]
+    fn conversion_pins_sat_per_vb_to_sat_per_kw() {
+        // 1 sat/vB = 250 sat/kW (1000 weight units / 4 weight-per-vbyte)
+        assert_eq!(sat_per_1000_weight(1.0), MIN_SAT_PER_1000_WEIGHT); // 250 < floor → clamped
+        assert_eq!(sat_per_1000_weight(2.0), 500);
+        assert_eq!(sat_per_1000_weight(10.0), 2_500);
+        assert_eq!(sat_per_1000_weight(100.0), 25_000);
+    }
+
+    #[test]
     fn update_lifts_rates_above_floor_when_fees_are_high() {
         let fe = FeeEstimator::new();
-        // Push estimates well above the relay floor so the × 4 conversion
+        // Push estimates well above the relay floor so the ×250 conversion
         // clears the MIN_SAT_PER_1000_WEIGHT clamp.
         let mut estimates = HashMap::new();
         estimates.insert(1_u16, 500.0);

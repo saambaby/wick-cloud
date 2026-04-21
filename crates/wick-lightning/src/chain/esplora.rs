@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use esplora_client::Utxo;
-use lightning_block_sync::{BlockData, BlockHeaderData, BlockSource, BlockSourceError};
+use lightning_block_sync::{ BlockData, BlockHeaderData, BlockSource, BlockSourceError };
+use wick_core::WickNetwork;
 
 /// Esplora-backed chain source.
 ///
@@ -23,7 +24,7 @@ use lightning_block_sync::{BlockData, BlockHeaderData, BlockSource, BlockSourceE
 #[derive(Debug)]
 pub struct EsploraChainClient {
     esplora: Arc<esplora_client::AsyncClient>,
-    network: ::bitcoin::Network,
+    wick_network: WickNetwork,
 }
 
 impl EsploraChainClient {
@@ -31,19 +32,28 @@ impl EsploraChainClient {
     ///
     /// # Errors
     /// Returns an error if the Esplora client builder rejects the URL.
-    pub fn new(esplora_url: &str, network: ::bitcoin::Network) -> anyhow::Result<Self> {
+    pub fn new(esplora_url: &str, wick_network: WickNetwork) -> anyhow::Result<Self> {
         let esplora = Arc::new(
-            esplora_client::Builder::new(esplora_url)
+            esplora_client::Builder
+                ::new(esplora_url)
                 .build_async()
-                .map_err(|e| anyhow::anyhow!("esplora client: {e:?}"))?,
+                .map_err(|e| anyhow::anyhow!("esplora client: {e:?}"))?
         );
-        Ok(Self { esplora, network })
+        Ok(Self { esplora, wick_network })
     }
 
-    /// Bitcoin network this client is bound to.
+    /// Wick-layer network enum (includes mutinynet distinction from signet).
+    #[must_use]
+    pub fn wick_network(&self) -> WickNetwork {
+        self.wick_network
+    }
+
+    /// `bitcoin` crate `Network` value for LDK and chain-sync APIs.
+    ///
+    /// Both `Signet` and `Mutinynet` return `bitcoin::Network::Signet`.
     #[must_use]
     pub fn network(&self) -> ::bitcoin::Network {
-        self.network
+        self.wick_network.into()
     }
 
     /// Shared Esplora async client — used by [`super::EsploraBroadcaster`] and
@@ -59,11 +69,10 @@ impl EsploraChainClient {
     /// Propagates the underlying `esplora-client` error.
     pub async fn get_address_utxos(
         &self,
-        address: &::bitcoin::Address,
+        address: &::bitcoin::Address
     ) -> anyhow::Result<Vec<Utxo>> {
         self.esplora
-            .get_address_utxos(address)
-            .await
+            .get_address_utxos(address).await
             .map_err(|e| anyhow::anyhow!("esplora get_address_utxos: {e}"))
     }
 
@@ -76,8 +85,7 @@ impl EsploraChainClient {
     /// Propagates the underlying `esplora-client` error.
     pub async fn fetch_fee_estimates(&self) -> anyhow::Result<HashMap<u16, f64>> {
         self.esplora
-            .get_fee_estimates()
-            .await
+            .get_fee_estimates().await
             .map_err(|e| anyhow::anyhow!("esplora get_fee_estimates: {e}"))
     }
 }
@@ -88,18 +96,16 @@ impl BlockSource for EsploraChainClient {
     fn get_header<'a>(
         &'a self,
         header_hash: &'a ::bitcoin::BlockHash,
-        _height_hint: Option<u32>,
+        _height_hint: Option<u32>
     ) -> lightning_block_sync::AsyncBlockSourceResult<'a, BlockHeaderData> {
         let esplora = self.esplora.clone();
         let hash = *header_hash;
         Box::pin(async move {
             let header = esplora
-                .get_header_by_hash(&hash)
-                .await
+                .get_header_by_hash(&hash).await
                 .map_err(|e| BlockSourceError::transient(e.to_string()))?;
             let info = esplora
-                .get_block_info(&hash)
-                .await
+                .get_block_info(&hash).await
                 .map_err(|e| BlockSourceError::transient(e.to_string()))?;
             if header.block_hash() != hash {
                 return Err(BlockSourceError::transient("header hash mismatch"));
@@ -118,7 +124,7 @@ impl BlockSource for EsploraChainClient {
             let per_block_lo = u128::from_be_bytes(
                 per_block_bytes[16..32]
                     .try_into()
-                    .map_err(|_| BlockSourceError::transient("unexpected work byte length"))?,
+                    .map_err(|_| BlockSourceError::transient("unexpected work byte length"))?
             );
             let count = u128::from(info.height) + 1;
             let total_lo = per_block_lo.saturating_mul(count);
@@ -136,14 +142,13 @@ impl BlockSource for EsploraChainClient {
 
     fn get_block<'a>(
         &'a self,
-        header_hash: &'a ::bitcoin::BlockHash,
+        header_hash: &'a ::bitcoin::BlockHash
     ) -> lightning_block_sync::AsyncBlockSourceResult<'a, BlockData> {
         let esplora = self.esplora.clone();
         let hash = *header_hash;
         Box::pin(async move {
             let block = esplora
-                .get_block_by_hash(&hash)
-                .await
+                .get_block_by_hash(&hash).await
                 .map_err(|e| BlockSourceError::transient(e.to_string()))?
                 .ok_or_else(|| BlockSourceError::transient("block not found"))?;
             if block.block_hash() != hash {
@@ -154,19 +159,23 @@ impl BlockSource for EsploraChainClient {
     }
 
     fn get_best_block(
-        &self,
+        &self
     ) -> lightning_block_sync::AsyncBlockSourceResult<'_, (::bitcoin::BlockHash, Option<u32>)> {
         let esplora = self.esplora.clone();
         Box::pin(async move {
+            // Fetch tip hash, then look up *that block's* height — never
+            // call `get_height()` separately. A naive `(get_tip_hash,
+            // get_height)` pair races against electrs's indexer: a new
+            // block can land between the two calls, returning a hash from
+            // height N and a height of N+1. SPV then walks the wrong chain
+            // and trips the channel-manager `chain-order` assert.
             let hash = esplora
-                .get_tip_hash()
-                .await
+                .get_tip_hash().await
                 .map_err(|e| BlockSourceError::transient(e.to_string()))?;
-            let height = esplora
-                .get_height()
-                .await
+            let info = esplora
+                .get_block_info(&hash).await
                 .map_err(|e| BlockSourceError::transient(e.to_string()))?;
-            Ok((hash, Some(height)))
+            Ok((hash, Some(info.height)))
         })
     }
 }
