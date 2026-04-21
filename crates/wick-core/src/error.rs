@@ -34,6 +34,10 @@ pub enum WickError {
     #[error("dependency error: {0}")]
     Dependency(String),
 
+    /// BIP39 mnemonic parse failure or BIP32/BIP84 key derivation failure.
+    #[error("key derivation error: {0}")]
+    KeyDerivation(String),
+
     /// Catch-all for errors we haven't categorised yet. Avoid using this in
     /// new code — add a proper variant instead.
     #[error("internal error: {0}")]

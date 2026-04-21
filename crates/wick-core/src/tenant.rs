@@ -1,36 +1,58 @@
-//! Strongly-typed tenant identifier.
+//! Strongly-typed tenant identifier backed by UUID v4/v5.
 //!
-//! `TenantId` is the *only* type permitted as a schema-name component in
-//! SQL formatting. Construction requires an explicit validation step and
-//! rejects any value that does not match `^[0-9]+$`. This closes the
-//! SQL-injection class of bug enumerated in `§4.1` of the architecture doc.
+//! `TenantId` wraps a `uuid::Uuid` so tenant schema names are unpredictable
+//! UUIDs rather than sequential integers, closing the enumeration risk from
+//! `§4.1` of the architecture doc.
+//!
+//! `schema_name()` renders as `tenant_<32-hex-chars>` — no dashes, safe SQL
+//! identifier — and is the *only* accepted way to embed a tenant id in DDL.
 
 use std::fmt;
-use std::str::FromStr;
 
-use crate::error::WickError;
+use uuid::Uuid;
 
 /// A validated tenant identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TenantId(u64);
+pub struct TenantId(Uuid);
 
 impl TenantId {
-    /// Construct a tenant-id from a raw integer.
+    /// Generate a fresh random tenant id (UUID v4).
+    ///
+    /// Each call produces a unique id — safe to use in tests where schema
+    /// reuse across runs would cause state accumulation.
     #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
+    pub fn generate() -> Self {
+        Self(Uuid::new_v4())
     }
 
-    /// Return the underlying integer.
+    /// Wrap an existing UUID (e.g. read back from the database).
     #[must_use]
-    pub const fn as_u64(self) -> u64 {
+    pub fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+
+    /// Derive a deterministic UUID v5 from a compressed SEC1 pubkey.
+    ///
+    /// Used by `create_tenant` so the server can always recompute the same
+    /// `TenantId` from a known pubkey without storing a separate mapping.
+    #[must_use]
+    pub fn from_pubkey(pubkey: &[u8]) -> Self {
+        Self(Uuid::new_v5(&Uuid::NAMESPACE_OID, pubkey))
+    }
+
+    /// The underlying UUID.
+    #[must_use]
+    pub fn as_uuid(self) -> Uuid {
         self.0
     }
 
-    /// Render as a Postgres schema-name component (`tenant_{id}`).
+    /// Render as a Postgres schema-name component (`tenant_<32 hex chars>`).
+    ///
+    /// Uses the simple (no-dash) UUID format so the result is a safe SQL
+    /// identifier with no special characters.
     #[must_use]
     pub fn schema_name(self) -> String {
-        format!("tenant_{}", self.0)
+        format!("tenant_{}", self.0.simple())
     }
 }
 
@@ -40,57 +62,45 @@ impl fmt::Display for TenantId {
     }
 }
 
-impl FromStr for TenantId {
-    type Err = WickError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(WickError::InvalidTenantId(s.to_owned()));
-        }
-        s.parse::<u64>()
-            .map(Self)
-            .map_err(|_| WickError::InvalidTenantId(s.to_owned()))
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
 
     #[test]
-    fn parses_simple_digits() {
-        assert_eq!(TenantId::from_str("42").unwrap().as_u64(), 42);
+    fn generate_produces_unique_ids() {
+        let a = TenantId::generate();
+        let b = TenantId::generate();
+        assert_ne!(a, b);
     }
 
     #[test]
-    fn rejects_empty() {
-        assert!(TenantId::from_str("").is_err());
+    fn from_uuid_round_trips() {
+        let u = Uuid::new_v4();
+        assert_eq!(TenantId::from_uuid(u).as_uuid(), u);
     }
 
     #[test]
-    fn rejects_non_digits() {
-        for bad in ["abc", "1; DROP TABLE", "1 OR 1=1", "-1", "1.0", " 1"] {
-            assert!(TenantId::from_str(bad).is_err(), "should reject: {bad}");
-        }
+    fn from_pubkey_is_deterministic() {
+        let pk = [0xdeu8; 33];
+        let a = TenantId::from_pubkey(&pk);
+        let b = TenantId::from_pubkey(&pk);
+        assert_eq!(a, b);
     }
 
     #[test]
-    fn schema_name_is_well_formed() {
-        assert_eq!(TenantId::new(7).schema_name(), "tenant_7");
+    fn from_pubkey_distinct_for_different_keys() {
+        let a = TenantId::from_pubkey(&[0u8; 33]);
+        let b = TenantId::from_pubkey(&[1u8; 33]);
+        assert_ne!(a, b);
     }
 
-    proptest! {
-        #[test]
-        fn rejects_adversarial_strings(s in "[^0-9]{1,32}") {
-            // Any string containing a non-digit must be rejected.
-            prop_assert!(TenantId::from_str(&s).is_err());
-        }
-
-        #[test]
-        fn accepts_any_u64_as_digits(n in any::<u64>()) {
-            prop_assert_eq!(TenantId::from_str(&n.to_string()).unwrap().as_u64(), n);
-        }
+    #[test]
+    fn schema_name_has_no_dashes() {
+        let tid = TenantId::generate();
+        let name = tid.schema_name();
+        assert!(name.starts_with("tenant_"));
+        assert!(!name.contains('-'));
+        assert_eq!(name.len(), "tenant_".len() + 32);
     }
 }
