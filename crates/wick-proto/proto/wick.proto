@@ -37,8 +37,9 @@ message CreateTenantRequest {
 }
 
 message CreateTenantResponse {
-  // Assigned tenant ID. Stable and used in all subsequent requests.
-  uint64 tenant_id = 1;
+  // Assigned tenant ID (UUID string). Stable across re-registrations with
+  // the same pubkey.
+  string tenant_id = 1;
 
   // Opaque bearer token for this tenant. Present exactly once at registration;
   // never re-issued. Include in all subsequent requests as:
