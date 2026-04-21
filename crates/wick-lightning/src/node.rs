@@ -39,7 +39,6 @@ use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeePa
 use lightning::routing::utxo::UtxoLookup;
 use lightning::sign::SignerProvider;
 use lightning::util::async_poll::{MaybeSend, MaybeSync};
-use lightning_block_sync::poll::ValidatedBlockHeader;
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
 use lightning_net_tokio::SocketDescriptor;
 use tokio::sync::watch;
@@ -63,10 +62,14 @@ pub struct Balance {
     pub lightning_balance_msat: u64,
     /// Inbound capacity in millisatoshis (maximum a counterparty can push).
     pub inbound_capacity_msat: u64,
-    /// Confirmed on-chain balance in satoshis. Phase-1: always 0 (queried
-    /// from Esplora by the testkit wallet, not by the Lightning node).
+    /// Funds claimable from `ChainMonitor::get_claimable_balances` for
+    /// channels not currently active — i.e. closed channels whose outputs
+    /// are spendable on-chain (cooperative close + force-close + revoked
+    /// counterparty + HTLC timeouts/preimages). Excludes active channels
+    /// to avoid double-counting `lightning_balance_msat`.
     pub onchain_balance_sats: u64,
-    /// Unconfirmed on-chain balance in satoshis.
+    /// Closed-channel funds awaiting on-chain confirmation
+    /// (`Balance::ClaimableAwaitingConfirmations` from LDK).
     pub onchain_unconfirmed_sats: u64,
     /// Sum of inflight outbound HTLC amounts in millisatoshis.
     pub pending_outbound_htlc_msat: u64,
@@ -190,23 +193,34 @@ where
 {
     pub(crate) tenant_id: TenantId,
     pub(crate) node_id: PublicKey,
-    pub(crate) signer: Arc<S>,
     pub(crate) channel_manager: Arc<LnChannelManager<S>>,
     pub(crate) chain_monitor: Arc<LnChainMonitor<S>>,
     pub(crate) peer_manager: Arc<LnPeerManager<S>>,
-    pub(crate) network_graph: Arc<LnNetworkGraph>,
-    pub(crate) gossip_sync: Arc<LnGossipSync>,
-    pub(crate) scorer: LnScorer,
     pub(crate) payments: Arc<PaymentStore>,
     pub(crate) peer_store: Arc<PeerStore>,
+    // Lifetime anchors — none of these are read by Node's current impl
+    // methods, but they must be held here to guarantee the underlying LDK
+    // objects outlive the Node even if a background task drops its own Arc
+    // clone early (e.g. on panic). They will be promoted to active use when
+    // admin/inspection APIs are added (route scoring, graph queries, etc.).
+    #[allow(dead_code)]
+    pub(crate) signer: Arc<S>,
+    #[allow(dead_code)]
+    pub(crate) network_graph: Arc<LnNetworkGraph>,
+    #[allow(dead_code)]
+    pub(crate) gossip_sync: Arc<LnGossipSync>,
+    #[allow(dead_code)]
+    pub(crate) scorer: LnScorer,
+    #[allow(dead_code)]
     pub(crate) broadcaster: Arc<EsploraBroadcaster>,
+    #[allow(dead_code)]
     pub(crate) fee_estimator: Arc<FeeEstimator>,
+    #[allow(dead_code)]
     pub(crate) logger: Arc<TracingLogger>,
+    #[allow(dead_code)]
     pub(crate) chain: Arc<EsploraChainClient>,
+    #[allow(dead_code)]
     pub(crate) kv_store: Arc<PgKvStore>,
-    /// Last validated block header at construction time — used as the SPV
-    /// poller's anchor.
-    pub(crate) best_block_header: ValidatedBlockHeader,
     /// Actual port bound by the P2P listener (`None` until `start()` binds).
     pub(crate) listen_addr: RwLock<Option<std::net::SocketAddr>>,
     /// Shared stop signal for every background task this node spawns.
@@ -275,12 +289,33 @@ where
             .flat_map(|c| c.pending_outbound_htlcs.iter())
             .map(|h| h.amount_msat)
             .sum();
+
+        // On-chain balance = sums of `ChainMonitor::get_claimable_balances`
+        // EXCLUDING active channels (whose `ClaimableOnChannelClose` would
+        // double-count `lightning_balance_msat`). Funds in
+        // `ClaimableAwaitingConfirmations` are reported as unconfirmed; every
+        // other claimable variant maps to confirmed.
+        let active_refs: Vec<&_> = channels.iter().collect();
+        let claimable = self.chain_monitor.get_claimable_balances(&active_refs);
+        let (mut confirmed_sat, mut unconfirmed_sat) = (0u64, 0u64);
+        for bal in claimable {
+            let amt = bal.claimable_amount_satoshis();
+            if matches!(
+                bal,
+                lightning::chain::channelmonitor::Balance::ClaimableAwaitingConfirmations { .. }
+            ) {
+                unconfirmed_sat = unconfirmed_sat.saturating_add(amt);
+            } else {
+                confirmed_sat = confirmed_sat.saturating_add(amt);
+            }
+        }
+
         Ok(Balance {
             lightning_balance_msat,
             inbound_capacity_msat,
             pending_outbound_htlc_msat,
-            onchain_balance_sats: 0,
-            onchain_unconfirmed_sats: 0,
+            onchain_balance_sats: confirmed_sat,
+            onchain_unconfirmed_sats: unconfirmed_sat,
         })
     }
 
@@ -320,6 +355,9 @@ where
             preimage: None,
             direction: Direction::Outbound,
             amount_msat,
+            // Fee is unknown at send time — LDK hasn't selected a route yet.
+            // The actual fee is written by the PaymentSent event handler once
+            // the HTLC settles (event.rs PaymentSent arm, fee_paid_msat field).
             fee_msat: 0,
             status: PaymentStatus::Pending,
         };
@@ -335,6 +373,9 @@ where
 
         Ok(PaymentResult {
             payment_hash: hash_bytes.to_vec(),
+            // Fee is unknown until the payment settles. The caller should treat
+            // this as a pending result and poll get_transactions for the final
+            // fee once status transitions to "succeeded".
             fee_paid_msat: 0,
             status: "pending".to_owned(),
         })
@@ -344,9 +385,10 @@ where
         &self,
         amount_msat: Option<u64>,
         memo: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, Vec<u8>)> {
         const MIN_FINAL_CLTV_DEV: u16 = 72;
-        let description = Description::new(memo.to_owned()).unwrap_or_else(|_| Description::empty());
+        let description =
+            Description::new(memo.to_owned()).unwrap_or_else(|_| Description::empty());
         let params = Bolt11InvoiceParameters {
             amount_msats: amount_msat,
             description: Bolt11InvoiceDescription::Direct(description),
@@ -358,7 +400,8 @@ where
             .channel_manager
             .create_bolt11_invoice(params)
             .map_err(|e| anyhow::anyhow!("create_bolt11_invoice: {e:?}"))?;
-        Ok(invoice.to_string())
+        let hash_bytes: [u8; 32] = *invoice.payment_hash().as_ref();
+        Ok((invoice.to_string(), hash_bytes.to_vec()))
     }
 
     async fn get_transactions(&self, limit: u32) -> anyhow::Result<Vec<PaymentRecord>> {
@@ -373,12 +416,7 @@ where
         self.listen_addr.read().ok().and_then(|g| *g)
     }
 
-    async fn connect_peer(
-        &self,
-        node_id: PublicKey,
-        host: &str,
-        port: u16,
-    ) -> anyhow::Result<()> {
+    async fn connect_peer(&self, node_id: PublicKey, host: &str, port: u16) -> anyhow::Result<()> {
         if !self.is_running() {
             anyhow::bail!("node is not running");
         }
@@ -465,6 +503,27 @@ where
                 is_pending: !c.is_channel_ready,
             })
             .collect())
+    }
+
+    async fn has_pending_htlcs(&self) -> anyhow::Result<bool> {
+        Ok(self.channel_manager.list_channels().iter().any(|c| {
+            !c.pending_outbound_htlcs.is_empty() || !c.pending_inbound_htlcs.is_empty()
+        }))
+    }
+
+    async fn has_inflight_outbound(&self) -> anyhow::Result<bool> {
+        Ok(self.payments.has_inflight_outbound().await?)
+    }
+
+    async fn has_unresolved_monitor_events(&self) -> anyhow::Result<bool> {
+        // `list_pending_monitor_updates` returns channels with persisted
+        // updates not yet acknowledged by the channel manager. Non-empty ⇒
+        // the BackgroundProcessor has work to finish before park is safe.
+        Ok(self
+            .chain_monitor
+            .list_pending_monitor_updates()
+            .iter()
+            .any(|(_, updates)| !updates.is_empty()))
     }
 
     async fn shutdown(&self) {

@@ -11,7 +11,7 @@
 //!
 //! ## Phase mapping
 //!
-//! - Regtest / dev (Phase 1–3): [`wick_testkit::TestWallet`] implements this
+//! - Regtest / dev (Phase 1–3): [`wick_testkit::WickKitWallet`] implements this
 //!   trait against BDK 1.x with bitcoind RPC sync.
 //! - Production (Phase 5+): the SDK implements this over a Noise_KK channel
 //!   — the server forwards the request to the user's device, which signs
@@ -24,7 +24,7 @@
 
 use std::fmt::Debug;
 
-use bitcoin::{ScriptBuf, Transaction};
+use bitcoin::{ ScriptBuf, Transaction };
 
 /// Callback that produces a signed on-chain funding tx.
 ///
@@ -44,6 +44,6 @@ pub trait FundingSource: Send + Sync + Debug + 'static {
     fn fund_channel(
         &self,
         output_script: ScriptBuf,
-        channel_value_sats: u64,
+        channel_value_sats: u64
     ) -> anyhow::Result<Transaction>;
 }

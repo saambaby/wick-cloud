@@ -5,9 +5,10 @@
 //! sign without the device (VLS). This crate owns the node-side runtime —
 //! channel management, payments, persistence — but never custody.
 //!
-//! Phase 1: in-memory stub — balances and payments are not persisted.
-//! Phase 3: stub fields replaced by a real LDK assembly (`ChannelManager`,
-//! `ChainMonitor`, `PeerManager`, `BackgroundProcessor`, event loop).
+//! Real LDK 0.2 assembly — `ChannelManager`, `ChainMonitor`, `PeerManager`,
+//! `BackgroundProcessor`, SPV loop, peer-reconnect loop. Payments and
+//! channels are persisted via [`PaymentStore`] and [`ChannelStore`] into
+//! the per-tenant Postgres schema.
 //!
 //! `wick-server` depends on this crate for all Lightning operations. This
 //! crate knows nothing about gRPC, actors, or mpsc dispatch.
@@ -15,20 +16,25 @@
 pub mod api;
 pub mod builder;
 pub mod chain;
+pub mod channel_store;
 pub mod deps;
 pub mod error;
 pub mod event;
 pub mod funding;
+pub mod gossip;
 pub mod logger;
 pub mod node;
 pub mod payment_store;
 pub mod peer_store;
+pub mod peers;
 pub mod persistence;
 pub mod signer;
 
 pub use api::NodeApi;
 pub use builder::NodeBuilder;
 pub use chain::{EsploraBroadcaster, EsploraChainClient, FeeEstimator};
+pub use wick_core::WickNetwork;
+pub use channel_store::{ChannelState, ChannelStore, ChannelUpsert};
 pub use deps::{NodeDeps, DEFAULT_LISTEN_PORT_BASE};
 pub use error::{Result, WickLightningError};
 pub use event::{ChannelManagerOps, ChannelManagerRuntimeOps, EventHandler, EventRuntimeOps};

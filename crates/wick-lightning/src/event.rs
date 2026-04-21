@@ -11,13 +11,17 @@
 //! bridge to async sqlx via `tokio::task::block_in_place` + `runtime.block_on`
 //! the same way as [`crate::PgKvStore`].
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+use bitcoin::secp256k1::PublicKey;
 use lightning::events::{Event, EventHandler as LdkEventHandler, ReplayEvent};
 use lightning::ln::channelmanager::ChannelManager;
 use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::channel_store::{ChannelState, ChannelStore, ChannelUpsert};
 use crate::funding::FundingSource;
 use crate::payment_store::{Direction, PaymentStatus, PaymentStore, PaymentWrite};
 
@@ -43,6 +47,11 @@ pub trait EventRuntimeOps: Send + Sync + 'static {
         counterparty_node_id: bitcoin::secp256k1::PublicKey,
         funding_transaction: bitcoin::Transaction,
     ) -> Result<(), String>;
+
+    /// Look up a channel's capacity in satoshis. Returns `None` if the
+    /// channel is no longer in the ChannelManager (e.g., a race on close —
+    /// harmless, as `ChannelClosed` fires next and marks the row closed).
+    fn channel_value_sats(&self, channel_id: &[u8; 32]) -> Option<u64>;
 }
 
 /// Adapter so a real [`ChannelManager`] satisfies [`EventRuntimeOps`].
@@ -69,9 +78,13 @@ where
             funding_transaction,
         )
     }
+
+    fn channel_value_sats(&self, channel_id: &[u8; 32]) -> Option<u64> {
+        self.0.channel_value_sats(channel_id)
+    }
 }
 
-/// Thin trait over the two [`ChannelManager`] methods the event handler
+/// Thin trait over the [`ChannelManager`] methods the event handler
 /// needs, to avoid dragging its generic params into [`EventRuntimeOps`].
 pub trait ChannelManagerOps {
     fn claim_funds(&self, payment_preimage: lightning::types::payment::PaymentPreimage);
@@ -81,6 +94,10 @@ pub trait ChannelManagerOps {
         counterparty_node_id: bitcoin::secp256k1::PublicKey,
         funding_transaction: bitcoin::Transaction,
     ) -> Result<(), String>;
+    /// Look up a channel's capacity in satoshis. Returns `None` if the
+    /// channel is no longer in the ChannelManager (e.g., a race on close —
+    /// harmless, as `ChannelClosed` fires next and marks the row closed).
+    fn channel_value_sats(&self, channel_id: &[u8; 32]) -> Option<u64>;
 }
 
 /// Historic alias retained so external call sites that reference
@@ -100,7 +117,8 @@ where
     R: std::ops::Deref,
     MR: std::ops::Deref,
     L: std::ops::Deref,
-    M::Target: lightning::chain::Watch<<SP::Target as lightning::sign::SignerProvider>::EcdsaSigner>,
+    M::Target:
+        lightning::chain::Watch<<SP::Target as lightning::sign::SignerProvider>::EcdsaSigner>,
     T::Target: lightning::chain::chaininterface::BroadcasterInterface,
     ES::Target: lightning::sign::EntropySource,
     NS::Target: lightning::sign::NodeSigner,
@@ -128,6 +146,13 @@ where
         )
         .map_err(|e| format!("{e:?}"))
     }
+
+    fn channel_value_sats(&self, channel_id: &[u8; 32]) -> Option<u64> {
+        ChannelManager::list_channels(self)
+            .into_iter()
+            .find(|c| &c.channel_id.0 == channel_id)
+            .map(|c| c.channel_value_satoshis)
+    }
 }
 
 /// Per-tenant LDK event handler.
@@ -138,9 +163,14 @@ where
 /// the event handler logs the event and lets LDK time out the channel.
 pub struct EventHandler {
     payments: Arc<PaymentStore>,
+    channels: Arc<ChannelStore>,
     runtime: Handle,
     ops: Arc<dyn EventRuntimeOps>,
     funding: Option<Arc<dyn FundingSource>>,
+    /// Fire-and-forget channel for `ConnectionNeeded` dispatches.
+    /// A background task in `NodeBuilder` consumes this and calls
+    /// `lightning_net_tokio::connect_outbound`.
+    connection_tx: Option<mpsc::UnboundedSender<(PublicKey, SocketAddr)>>,
 }
 
 impl std::fmt::Debug for EventHandler {
@@ -155,14 +185,17 @@ impl EventHandler {
     #[must_use]
     pub fn new(
         payments: Arc<PaymentStore>,
+        channels: Arc<ChannelStore>,
         runtime: Handle,
         ops: Arc<dyn EventRuntimeOps>,
     ) -> Self {
         Self {
             payments,
+            channels,
             runtime,
             ops,
             funding: None,
+            connection_tx: None,
         }
     }
 
@@ -171,6 +204,17 @@ impl EventHandler {
     #[must_use]
     pub fn with_funding_source(mut self, funding: Arc<dyn FundingSource>) -> Self {
         self.funding = Some(funding);
+        self
+    }
+
+    /// Bind a sender for `ConnectionNeeded` dispatches. The builder spawns a
+    /// task that reads from the paired receiver and calls `connect_outbound`.
+    #[must_use]
+    pub fn with_connection_dispatch(
+        mut self,
+        tx: mpsc::UnboundedSender<(PublicKey, SocketAddr)>,
+    ) -> Self {
+        self.connection_tx = Some(tx);
         self
     }
 
@@ -247,6 +291,9 @@ impl LdkEventHandler for EventHandler {
                     preimage: None,
                     direction: Direction::Inbound,
                     amount_msat,
+                    // Inbound payments carry no routing fee — the sender pays
+                    // the fee to route to us. `fee_msat` tracks what *we* paid
+                    // on outbound routes only; it is set by `PaymentSent`.
                     fee_msat: 0,
                     status: PaymentStatus::Succeeded,
                 };
@@ -277,6 +324,8 @@ impl LdkEventHandler for EventHandler {
                     if let Err(e) = self.block_on(self.payments.update_status(
                         &hash.0,
                         PaymentStatus::Failed,
+                        // Failed payments incur no fee — LDK retries until the
+                        // path exhausts and never settles an HTLC on failure.
                         0,
                     )) {
                         error!(target: "wick_lightning", error = %e, "PaymentFailed: DB update failed");
@@ -336,34 +385,133 @@ impl LdkEventHandler for EventHandler {
                 }
             }
 
-            // ── Events we acknowledge but don't persist yet ─────────────────
-            Event::ChannelReady { .. }
-            | Event::ChannelPending { .. }
-            | Event::ChannelClosed { .. }
-            | Event::SpendableOutputs { .. }
-            | Event::OpenChannelRequest { .. }
-            | Event::PaymentPathSuccessful { .. }
+            Event::ChannelPending {
+                channel_id,
+                counterparty_node_id,
+                ..
+            } => {
+                // Capacity isn't in the event; query the ChannelManager directly.
+                // Harmless if `None` (race on close) — ChannelClosed fires next.
+                let capacity_sat = self.ops.channel_value_sats(&channel_id.0).unwrap_or(0);
+                let write = ChannelUpsert {
+                    channel_id: &channel_id.0,
+                    peer_pubkey: &counterparty_node_id.serialize(),
+                    capacity_sat,
+                    // The channel has no funds yet — the funding tx hasn't been
+                    // broadcast. Even if push_msat was supplied on open, LDK
+                    // doesn't surface it in this event. local_balance_msat is
+                    // not stored in the channels table: it changes with every
+                    // payment and is always queried live from the ChannelManager
+                    // via NodeApi::get_balance / list_channels.
+                    local_balance_msat: 0,
+                    state: ChannelState::Pending,
+                };
+                if let Err(e) = self.block_on(self.channels.upsert(write)) {
+                    error!(target: "wick_lightning", error = %e, "ChannelPending: DB upsert failed");
+                    return Err(ReplayEvent());
+                }
+            }
+
+            Event::ChannelReady {
+                channel_id,
+                counterparty_node_id,
+                ..
+            } => {
+                let capacity_sat = self.ops.channel_value_sats(&channel_id.0).unwrap_or(0);
+                let write = ChannelUpsert {
+                    channel_id: &channel_id.0,
+                    peer_pubkey: &counterparty_node_id.serialize(),
+                    capacity_sat,
+                    // ChannelReady doesn't carry balance. local_balance_msat is
+                    // intentionally not persisted here: it shifts with every
+                    // payment and would be stale within milliseconds. The live
+                    // value is always read from the ChannelManager directly via
+                    // NodeApi::get_balance / list_channels.
+                    local_balance_msat: 0,
+                    state: ChannelState::Ready,
+                };
+                if let Err(e) = self.block_on(self.channels.upsert(write)) {
+                    error!(target: "wick_lightning", error = %e, "ChannelReady: DB upsert failed");
+                    return Err(ReplayEvent());
+                }
+            }
+
+            Event::ChannelClosed { channel_id, .. } => {
+                if let Err(e) = self.block_on(self.channels.mark_closed(&channel_id.0)) {
+                    error!(target: "wick_lightning", error = %e, "ChannelClosed: DB update failed");
+                    return Err(ReplayEvent());
+                }
+            }
+
+            // ── Deferred to Phase 2 (LSPS2 JIT + park/wake) ────────────────
+            Event::HTLCIntercepted { .. } | Event::OpenChannelRequest { .. } => {
+                debug!(target: "wick_lightning", ?event, "event deferred to phase 2");
+            }
+
+            // ── Deferred to Phase 3 (on-chain sweep + splicing) ────────────
+            Event::SpendableOutputs { .. }
+            | Event::BumpTransaction(..)
+            | Event::DiscardFunding { .. } => {
+                debug!(target: "wick_lightning", ?event, "event deferred to phase 3");
+            }
+
+            // ── Deferred to Phase 8 (forwarding + onion / BOLT12) ──────────
+            Event::PaymentForwarded { .. }
+            | Event::InvoiceReceived { .. }
+            | Event::OnionMessageIntercepted { .. }
+            | Event::OnionMessagePeerConnected { .. } => {
+                debug!(target: "wick_lightning", ?event, "event deferred to phase 8");
+            }
+
+            // ── Peer reconnect dispatch ────────────────────────────────────
+            Event::ConnectionNeeded { node_id, addresses } => {
+                if let Some(tx) = &self.connection_tx {
+                    let socket_addr = addresses.iter().find_map(socket_addr_from_ldk);
+                    if let Some(addr) = socket_addr {
+                        let _ = tx.send((node_id, addr));
+                    } else {
+                        debug!(
+                            target: "wick_lightning",
+                            peer = %node_id,
+                            "ConnectionNeeded: no reachable address in list"
+                        );
+                    }
+                } else {
+                    debug!(target: "wick_lightning", peer = %node_id, "ConnectionNeeded (no dispatcher wired)");
+                }
+            }
+
+            // ── Observed but no persistence required ───────────────────────
+            Event::PaymentPathSuccessful { .. }
             | Event::PaymentPathFailed { .. }
             | Event::ProbeSuccessful { .. }
             | Event::ProbeFailed { .. }
-            | Event::HTLCIntercepted { .. }
-            | Event::HTLCHandlingFailed { .. }
-            | Event::BumpTransaction(..)
-            | Event::DiscardFunding { .. }
-            | Event::PaymentForwarded { .. }
-            | Event::InvoiceReceived { .. }
-            | Event::ConnectionNeeded { .. }
-            | Event::OnionMessageIntercepted { .. }
-            | Event::OnionMessagePeerConnected { .. } => {
-                debug!(target: "wick_lightning", ?event, "event acknowledged (phase 3 stub)");
+            | Event::HTLCHandlingFailed { .. } => {
+                debug!(target: "wick_lightning", ?event, "event observed; no persistence required");
             }
 
-            // Catch-all for any variants we haven't matched explicitly. LDK
-            // may add new variants in future versions.
+            // Catch-all for variants LDK may add in future versions.
             other => {
                 debug!(target: "wick_lightning", ?other, "unhandled event variant");
             }
         }
         Ok(())
+    }
+}
+
+/// Convert an LDK [`SocketAddress`] to a stdlib [`SocketAddr`].
+/// Returns `None` for onion and unresolved-hostname variants.
+fn socket_addr_from_ldk(addr: &lightning::ln::msgs::SocketAddress) -> Option<SocketAddr> {
+    use lightning::ln::msgs::SocketAddress;
+    match addr {
+        SocketAddress::TcpIpV4 { addr, port } => Some(SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(*addr)),
+            *port,
+        )),
+        SocketAddress::TcpIpV6 { addr, port } => Some(SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(*addr)),
+            *port,
+        )),
+        _ => None,
     }
 }

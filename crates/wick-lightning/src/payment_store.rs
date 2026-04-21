@@ -189,6 +189,24 @@ LIMIT 1
         })
     }
 
+    /// `true` if any outbound payment row is in `pending` status.
+    ///
+    /// Queryable without a live `Node` — reads Postgres directly. Used by the
+    /// activity poller (pre-park pre-flight) and by dispatch on parked
+    /// tenants (so we don't park a node that has an in-flight send the
+    /// channel manager hasn't yet seen).
+    pub async fn has_inflight_outbound(&self) -> Result<bool> {
+        let sql = format!(
+            r#"SELECT EXISTS(
+    SELECT 1 FROM "{schema}".payments
+    WHERE status = 'pending' AND direction = 'outbound'
+)"#,
+            schema = self.schema
+        );
+        let (exists,): (bool,) = sqlx::query_as(&sql).fetch_one(&self.pool).await?;
+        Ok(exists)
+    }
+
     /// Return the most recent `limit` payments in descending-time order.
     pub async fn list(&self, limit: u32) -> Result<Vec<PaymentRecord>> {
         let limit_i = i64::from(limit.clamp(1, 1000));
