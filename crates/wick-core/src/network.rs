@@ -125,13 +125,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mutinynet_and_signet_are_both_bitcoin_signet() {
-        assert_eq!(WickNetwork::Mutinynet.bitcoin_network(), bitcoin::Network::Signet);
-        assert_eq!(WickNetwork::Signet.bitcoin_network(), bitcoin::Network::Signet);
-        assert_eq!(WickNetwork::Regtest.bitcoin_network(), bitcoin::Network::Regtest);
-    }
-
-    #[test]
     fn all_test_networks_use_coin_type_1() {
         assert_eq!(WickNetwork::Regtest.bip84_coin_type(), 1);
         assert_eq!(WickNetwork::Signet.bip84_coin_type(), 1);

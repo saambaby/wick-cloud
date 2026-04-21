@@ -1,0 +1,16 @@
+[package]
+name = "wick-loom-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Loom concurrency models for wick-server park/wake CAS invariants. No tokio dependency."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+loom = { workspace = true }
