@@ -51,7 +51,7 @@ where
         .map_err(|e| WickError::Dependency(format!("set search_path: {e}")))?;
 
     sqlx::query("SELECT set_config('app.current_tenant_id', $1::text, true)")
-        .bind(i64::try_from(tenant.as_u64()).unwrap_or(i64::MAX))
+        .bind(tenant.to_string())
         .execute(&mut *tx)
         .await
         .map_err(|e| WickError::Dependency(format!("set current_tenant_id: {e}")))?;
