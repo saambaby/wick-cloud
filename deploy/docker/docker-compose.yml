@@ -2,7 +2,7 @@
 # Start: `just regtest-up`   Stop: `just regtest-down`
 #
 # Exposes:
-#   bitcoind regtest RPC  http://bitcoin:bitcoin@localhost:18443
+#   bitcoind regtest RPC  http://wick:wick@localhost:18443
 #   bitcoind P2P          localhost:18444
 #   bitcoind zmqpubrawblock tcp://localhost:28332
 #   bitcoind zmqpubrawtx    tcp://localhost:28333
@@ -18,8 +18,8 @@ services:
       - -regtest=1
       - -server=1
       - -txindex=1
-      - -rpcuser=bitcoin
-      - -rpcpassword=bitcoin
+      - -rpcuser=wick
+      - -rpcpassword=wick
       - -rpcbind=0.0.0.0
       - -rpcallowip=0.0.0.0/0
       - -fallbackfee=0.0002
@@ -34,7 +34,7 @@ services:
     volumes:
       - bitcoind-data:/data/.bitcoin
     healthcheck:
-      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=bitcoin", "-rpcpassword=bitcoin", "getblockchaininfo"]
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=wick", "-rpcpassword=wick", "getblockchaininfo"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -57,14 +57,21 @@ services:
       retries: 10
 
   electrs:
-    image: getumbrel/electrs:v0.10.6
+    # mempool/electrs is the Blockstream-derived fork that serves both the
+    # Electrum protocol (50001) and the Esplora REST API (3002) from one
+    # process. It accepts inline `--cookie USER:PASSWORD` against bitcoind's
+    # static -rpcuser/-rpcpassword (no cookie file required). The romanz
+    # `getumbrel/electrs` fork doesn't ship the REST endpoint, which is why
+    # we don't use it here.
+    image: mempool/electrs:latest
     container_name: wick-electrs
     command:
       - --network=regtest
       - --daemon-rpc-addr=bitcoind:18443
-      - --cookie=bitcoin:bitcoin
+      - --cookie=wick:wick
       - --electrum-rpc-addr=0.0.0.0:50001
       - --http-addr=0.0.0.0:3002
+      - --cors=*
       - --jsonrpc-import
     depends_on:
       bitcoind:
@@ -72,26 +79,6 @@ services:
     ports:
       - "50001:50001"
       - "3002:3002"
-
-  esplora:
-    # Esplora HTTP API for on-chain address queries.
-    # Phase 0 uses it for Lightning-routing fee estimates only; portfolio
-    # queries in later phases go to public Esplora (mempool.space etc.).
-    image: blockstream/esplora:latest
-    container_name: wick-esplora
-    environment:
-      - FLAVOR=base
-      - NO_PRECACHE=1
-    command: >
-      bash -c "/srv/explorer/run.sh bitcoin-regtest explorer"
-    depends_on:
-      bitcoind:
-        condition: service_healthy
-    ports:
-      - "3000:3000"
-    # The upstream image is opinionated; for Phase 0 we tolerate flakiness and
-    # mostly use electrs directly.
-    restart: unless-stopped
 
 volumes:
   bitcoind-data:

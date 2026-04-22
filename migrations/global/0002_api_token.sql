@@ -13,6 +13,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS wallets_api_token_hash_idx
 -- Enforce plan_tier to known values. Any previously stored arbitrary
 -- strings that don't match will cause this migration to fail — that is
 -- intentional: they must be corrected before the constraint is added.
-ALTER TABLE global.wallets
-    ADD CONSTRAINT wallets_plan_tier_check
-    CHECK (plan_tier IN ('free', 'standard', 'premium'));
+-- Wrapped in a DO block so the migration is idempotent: re-running is a
+-- no-op when the constraint already exists.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'wallets_plan_tier_check'
+          AND conrelid = 'global.wallets'::regclass
+    ) THEN
+        ALTER TABLE global.wallets
+            ADD CONSTRAINT wallets_plan_tier_check
+            CHECK (plan_tier IN ('free', 'standard', 'premium'));
+    END IF;
+END $$;
