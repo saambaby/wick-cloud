@@ -24,17 +24,21 @@
 //! Phase 1 ships `Active` only; park/wake arrives in Phase 2.
 
 pub mod actor;
+pub mod admission;
 pub mod manager;
 
-use std::sync::{
-    atomic::{AtomicU64, AtomicU8, AtomicUsize},
-    Arc,
-};
+use std::sync::{ atomic::{ AtomicU64, AtomicU8 }, Arc, RwLock };
+use std::time::Instant;
 
-use tokio::sync::{mpsc, oneshot, Notify};
+use arc_swap::ArcSwap;
+use tokio::sync::{ mpsc, oneshot, Notify };
+use wick_lightning::NodeApi;
 
-/// Memory placeholder per active node (64 KiB).
-/// Phase 2 will replace this with actual LDK memory measurement.
+/// Memory reserved per active node (bytes).
+///
+/// All active nodes are charged this flat amount against the global
+/// `ManagerConfig::memory_budget_bytes`. Replace with real LDK per-node
+/// measurement in a later phase once `BackgroundProcessor` exposes it.
 pub const PER_NODE_BYTES: usize = 64 * 1024;
 
 /// Channel capacity for each node's command queue.
@@ -54,12 +58,49 @@ pub mod state {
     pub const ERROR: u8 = 3;
 }
 
+// ── Error state ──────────────────────────────────────────────────────────────
+
+/// Reason a tenant is in [`state::ERROR`].
+#[derive(Debug, Clone)]
+pub enum ErrorReason {
+    /// Factory call (node build) or wake activation failed.
+    FactoryFailed(String),
+    /// Node shutdown exceeded its 10 s task-join timeout.
+    ShutdownTimeout,
+}
+
+/// Per-tenant error bookkeeping. Stored on [`NodeHandle::error`]; `None`
+/// when the tenant is healthy.
+#[derive(Debug, Clone)]
+pub struct ErrorState {
+    /// What transitioned the tenant into [`state::ERROR`].
+    pub reason: ErrorReason,
+    /// When the tenant entered the current error state.
+    pub since: Instant,
+    /// Consecutive failed wake/recovery attempts. Starts at 1 on the
+    /// transition into ERROR, increments each failed recovery probe.
+    pub attempts: u8,
+}
+
 // ── Response types (owned by `wick-lightning`) ───────────────────────────────
 
 /// Re-exported from [`wick_lightning`] so callers need only import from here.
-pub use wick_lightning::{Balance, PaymentRecord, PaymentResult};
+pub use wick_lightning::{ Balance, ChannelSummary, PaymentRecord, PaymentResult };
 
 // ── NodeCmd ──────────────────────────────────────────────────────────────────
+
+/// Outcome of a [`NodeCmd::Park`] request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkOutcome {
+    /// Actor drained its mpsc queue, all safety checks passed, `shutdown`
+    /// completed. Caller should run `NodeManager::complete_park` to flip
+    /// state and release the memory budget.
+    Parked,
+    /// Post-drain recheck found pending HTLCs, an inflight outbound
+    /// payment, or unacknowledged monitor updates. Actor stayed running;
+    /// caller should re-enqueue `Park` after a backoff.
+    RequeuedDueToActivity,
+}
 
 /// Commands sent to a [`actor::NodeActor`] over its mpsc channel.
 ///
@@ -85,8 +126,8 @@ pub enum NodeCmd {
         amount_msat: Option<u64>,
         /// Invoice memo / description.
         memo: String,
-        /// Response channel — yields the BOLT11 string.
-        resp: oneshot::Sender<anyhow::Result<String>>,
+        /// Response channel — yields `(bolt11_string, payment_hash_bytes)`.
+        resp: oneshot::Sender<anyhow::Result<(String, Vec<u8>)>>,
     },
     /// Return paginated payment history.
     GetTransactions {
@@ -95,35 +136,105 @@ pub enum NodeCmd {
         /// Response channel.
         resp: oneshot::Sender<anyhow::Result<Vec<PaymentRecord>>>,
     },
-    /// Gracefully shut down the actor.
+    /// Install (or re-install) a [`NodeApi`] into a parked actor.
+    ///
+    /// Sent by [`crate::node::manager::NodeManager::wake_loading`] after the
+    /// factory has built a fresh node. The actor stores the node, publishes it
+    /// to the shared [`NodeInner`] via `ArcSwap`, and acks via `resp`. The
+    /// manager then CAS-es state `LOADING → ACTIVE`.
+    ///
+    /// Note: the original `Activate { node, tasks }` spec dropped the `tasks`
+    /// parameter — the node owns its `BackgroundProcessor` / SPV loop /
+    /// peer-reconnect loop internally via `NodeBuilder`. The actor never holds
+    /// task handles.
+    Activate {
+        /// The freshly-built node to install.
+        node: Arc<dyn NodeApi>,
+        /// Response channel — `Ok(())` on success.
+        resp: oneshot::Sender<anyhow::Result<()>>,
+    },
+    /// Request the actor park itself.
+    ///
+    /// The handler drains any already-enqueued commands, then re-checks the
+    /// three park-safety conditions ([`wick_lightning::NodeApi::has_pending_htlcs`],
+    /// [`wick_lightning::NodeApi::has_inflight_outbound`],
+    /// [`wick_lightning::NodeApi::has_unresolved_monitor_events`]). If any
+    /// returns `true`, responds [`ParkOutcome::RequeuedDueToActivity`] and
+    /// stays running. Otherwise calls `node.shutdown()`, responds
+    /// [`ParkOutcome::Parked`], clears the internal node reference, and
+    /// continues the run loop (the actor stays alive — only `Shutdown`
+    /// exits the loop).
+    Park {
+        /// Response channel.
+        resp: oneshot::Sender<ParkOutcome>,
+    },
+    /// Gracefully shut down the actor (exits the run loop).
     Shutdown,
 }
 
 // ── NodeHandle ───────────────────────────────────────────────────────────────
 
+/// The mutable pair swapped atomically on park/wake transitions.
+///
+/// When a node is `ACTIVE`, both fields are `Some`. When it is `PARKED` or
+/// `LOADING`, both are `None` — no actor is running, no memory is held.
+///
+/// Swapping `(tx, node)` together (rather than separately) is load-bearing:
+/// publishing a fresh `tx` without publishing the matching `node` (or vice
+/// versa) would produce a window where `dispatch` could see a live tx
+/// pointing at a not-yet-usable node.
+#[derive(Debug, Default)]
+pub struct NodeInner {
+    /// Sender into the actor's mpsc command channel.
+    pub tx: Option<mpsc::Sender<NodeCmd>>,
+    /// The same `Arc<dyn NodeApi>` the actor owns. Integration tests
+    /// borrow this to run setup operations not yet exposed via
+    /// [`NodeCmd`] (`connect_peer`, `open_channel`, `list_channels`).
+    pub node: Option<Arc<dyn NodeApi>>,
+}
+
 /// A non-owning reference to a running [`actor::NodeActor`], stored in the
 /// [`manager::NodeManager`]'s `DashMap`.
 ///
-/// All fields are cheap to clone (`Arc` or `Sender`).
+/// All fields are cheap to clone (`Arc`). The mutable `(tx, node)` pair lives
+/// inside [`NodeInner`] behind an [`ArcSwap`] so that park/wake can publish
+/// it atomically without stranding callers mid-dispatch.
 #[derive(Debug, Clone)]
 pub struct NodeHandle {
-    /// Send commands to the actor's mpsc channel.
-    pub tx: mpsc::Sender<NodeCmd>,
     /// Current lifecycle state (see `state::*` constants).
     pub state: Arc<AtomicU8>,
     /// Unix timestamp of last activity, `SeqCst` ordering.
     pub last_active: Arc<AtomicU64>,
-    /// Bytes reserved in the global memory budget for this node.
-    pub mem_bytes: Arc<AtomicUsize>,
     /// Notified when a `Loading → Active` transition completes.
     pub wake_notify: Arc<Notify>,
+    /// `(tx, node)` — swapped atomically on park/wake. Lock-free read on
+    /// the dispatch hot path via [`ArcSwap::load`].
+    pub inner: Arc<ArcSwap<NodeInner>>,
+    /// Populated when `state == ERROR`; drives the error recovery loop.
+    /// `None` for healthy tenants.
+    pub error: Arc<RwLock<Option<ErrorState>>>,
 }
 
 impl NodeHandle {
+    /// Current sender, if the node is `ACTIVE`. Returns `None` when
+    /// `PARKED` / `LOADING` / `ERROR`.
+    #[must_use]
+    pub fn tx(&self) -> Option<mpsc::Sender<NodeCmd>> {
+        self.inner.load().tx.clone()
+    }
+
+    /// Current `Arc<dyn NodeApi>` if `ACTIVE`. Returns `None` otherwise.
+    /// Integration tests use this to drive setup operations not yet exposed
+    /// via [`NodeCmd`]; production code should prefer [`Self::tx`].
+    #[must_use]
+    pub fn node(&self) -> Option<Arc<dyn NodeApi>> {
+        self.inner.load().node.clone()
+    }
+
     /// Construct a `NodeHandle` with no backing actor — the mpsc sender is
-    /// paired with an immediately-dropped receiver, so any `tx.send(...)`
-    /// fails. Intended purely for bookkeeping-only tests (DashMap counts,
-    /// memory-budget arithmetic) that don't dispatch commands.
+    /// paired with an immediately-dropped receiver, so any send fails.
+    /// Intended purely for bookkeeping-only tests that do **not** exercise
+    /// the wake path (no `mgr.wake()` calls).
     ///
     /// Not gated by `#[cfg(test)]` because `#[tokio::test]` integration
     /// tests in sibling crates need it too.
@@ -133,11 +244,16 @@ impl NodeHandle {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         Self {
-            tx,
             state: Arc::new(AtomicU8::new(state::ACTIVE)),
             last_active: Arc::new(AtomicU64::new(0)),
-            mem_bytes: Arc::new(AtomicUsize::new(PER_NODE_BYTES)),
             wake_notify: Arc::new(Notify::new()),
+            inner: Arc::new(
+                ArcSwap::from_pointee(NodeInner {
+                    tx: Some(tx),
+                    node: None,
+                })
+            ),
+            error: Arc::new(RwLock::new(None)),
         }
     }
 }

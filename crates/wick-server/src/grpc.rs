@@ -3,7 +3,7 @@
 //! `WickGrpcService` wraps `NodeManager` and exposes the generated
 //! `WalletService` trait. Each data-plane handler:
 //!
-//! 1. Authenticates the request via `auth::authenticate` — extracts the
+//! 1. Authenticates the request via `Auth::authenticate` — extracts the
 //!    `Authorization: Bearer <token>` metadata header, hashes it, and looks
 //!    up the owning tenant in `global.wallets`. The caller-supplied
 //!    `tenant_id` field in the request body is **ignored**; the authenticated
@@ -26,8 +26,30 @@ use wick_proto::wick::{
     SendPaymentResponse,
 };
 
-use crate::auth;
-use crate::node::{manager::NodeManager, NodeCmd};
+use crate::auth::Auth;
+use crate::node::{
+    manager::{DispatchError, NodeManager, ProvisionError},
+    NodeCmd,
+};
+
+/// Translate a typed [`DispatchError`] into the appropriate gRPC
+/// `Status`. Preserves the Phase-2 error taxonomy so clients can tell
+/// "retry later" (UNAVAILABLE, RESOURCE_EXHAUSTED, DEADLINE_EXCEEDED)
+/// apart from "this tenant doesn't exist" (NOT_FOUND) and "something
+/// broke" (INTERNAL).
+fn dispatch_error_to_status(e: DispatchError) -> Status {
+    match e {
+        DispatchError::NotFound(_) => Status::not_found(e.to_string()),
+        DispatchError::InErrorState(_) | DispatchError::ActorStopped(_) => {
+            Status::unavailable(e.to_string())
+        }
+        DispatchError::WakeTimeout(_) => Status::deadline_exceeded(e.to_string()),
+        DispatchError::RateLimited(_) | DispatchError::HeadroomDenied(_) => {
+            Status::resource_exhausted(e.to_string())
+        }
+        DispatchError::Internal(_) => Status::internal(e.to_string()),
+    }
+}
 
 // ── Plan tier allowlist ───────────────────────────────────────────────────────
 
@@ -65,7 +87,7 @@ impl WalletService for WickGrpcService {
             return Err(Status::invalid_argument("pubkey_hex is required"));
         }
 
-        // Decode hex pubkey → bytes for the DB.
+        // Decode and validate pubkey — must be a valid compressed secp256k1 point.
         let pubkey_bytes = hex::decode(&pubkey_hex)
             .map_err(|_| Status::invalid_argument("pubkey_hex is not valid hex"))?;
         if pubkey_bytes.len() != 33 {
@@ -73,6 +95,8 @@ impl WalletService for WickGrpcService {
                 "pubkey_hex must be a 33-byte compressed SEC1 pubkey (66 hex chars)",
             ));
         }
+        bitcoin::secp256k1::PublicKey::from_slice(&pubkey_bytes)
+            .map_err(|_| Status::invalid_argument("pubkey_hex is not a valid secp256k1 public key"))?;
 
         // Validate plan_tier against the known allowlist.
         let plan_tier = if req.plan_tier.is_empty() {
@@ -88,40 +112,57 @@ impl WalletService for WickGrpcService {
 
         // Generate a bearer token. Only the hash is persisted; the raw token
         // is returned once and must be stored by the client.
-        let (raw_token, token_hash) = auth::generate_token();
+        let (raw_token, token_hash) = Auth::generate_token();
 
-        // Insert into global.wallets, get the auto-assigned tenant_id.
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO global.wallets (pubkey, plan_tier, api_token_hash) \
-             VALUES ($1, $2, $3) RETURNING id",
+        // Derive a deterministic UUID v5 from the pubkey so the tenant_id is
+        // stable across re-registrations with the same key.
+        let tenant_id = TenantId::from_pubkey(&pubkey_bytes);
+
+        // Idempotent registration: if a wallet with this pubkey is already
+        // registered, rotate its api_token_hash and return the existing
+        // tenant_id. The tenant_id is a UUID v5 of the pubkey, so it's
+        // stable across re-registrations either way. Rotating the token
+        // on re-register lets clients recover access without manual
+        // operator intervention; the old token is invalidated by the hash
+        // replacement.
+        sqlx::query(
+            "INSERT INTO global.wallets (id, pubkey, plan_tier, api_token_hash) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (pubkey) DO UPDATE \
+             SET api_token_hash = EXCLUDED.api_token_hash, \
+                 updated_at = now()",
         )
+        .bind(tenant_id.as_uuid())
         .bind(&pubkey_bytes)
         .bind(&plan_tier)
         .bind(&token_hash)
-        .fetch_one(self.pool.raw())
+        .execute(self.pool.raw())
         .await
         .map_err(|e| {
-            warn!(?e, "create_tenant: DB insert failed");
-            Status::internal("failed to create tenant")
+            warn!(?e, "create_tenant: DB upsert failed");
+            Status::internal("failed to register tenant")
         })?;
 
-        let raw_id = u64::try_from(row.0).map_err(|_| {
-            Status::internal("tenant id overflow: BIGSERIAL returned negative value")
-        })?;
-        let tenant_id = TenantId::new(raw_id);
-
-        // Provision the Postgres schema and spawn the actor.
-        self.manager
-            .provision(tenant_id, &self.pool)
-            .await
-            .map_err(|e| {
+        // Provision the Postgres schema and spawn the actor. The schema
+        // DDL is `IF NOT EXISTS`, but in-process the manager rejects
+        // double-provision (actor already spawned). Swallow that specific
+        // error — the tenant is already serviceable and callers shouldn't
+        // have to distinguish "fresh register" from "re-register" at the
+        // gRPC boundary.
+        match self.manager.provision(tenant_id, &self.pool).await {
+            Ok(()) => {}
+            Err(ProvisionError::AlreadyProvisioned(_)) => {
+                info!(%tenant_id, "tenant already provisioned — re-register rotated token only");
+            }
+            Err(ProvisionError::Other(e)) => {
                 warn!(?e, %tenant_id, "create_tenant: provision failed");
-                Status::internal("failed to provision tenant")
-            })?;
+                return Err(Status::internal("failed to provision tenant"));
+            }
+        }
 
-        info!(%tenant_id, plan_tier, "tenant created");
+        info!(%tenant_id, plan_tier, "tenant registered");
         Ok(Response::new(CreateTenantResponse {
-            tenant_id: tenant_id.as_u64(),
+            tenant_id: tenant_id.to_string(),
             api_token: raw_token,
         }))
     }
@@ -131,13 +172,13 @@ impl WalletService for WickGrpcService {
         request: Request<GetBalanceRequest>,
     ) -> Result<Response<GetBalanceResponse>, Status> {
         // Authenticate first — the req.tenant_id field is ignored.
-        let tenant_id = auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
 
         let (tx, rx) = oneshot::channel();
         self.manager
             .dispatch(tenant_id, NodeCmd::GetBalance { resp: tx })
             .await
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(dispatch_error_to_status)?;
 
         let balance = rx
             .await
@@ -155,7 +196,7 @@ impl WalletService for WickGrpcService {
         request: Request<SendPaymentRequest>,
     ) -> Result<Response<SendPaymentResponse>, Status> {
         // Authenticate first — the req.tenant_id field is ignored.
-        let tenant_id = auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
 
         let req = request.into_inner();
         if req.bolt11.is_empty() {
@@ -172,7 +213,7 @@ impl WalletService for WickGrpcService {
                 },
             )
             .await
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(dispatch_error_to_status)?;
 
         let result = rx
             .await
@@ -191,7 +232,7 @@ impl WalletService for WickGrpcService {
         request: Request<ReceivePaymentRequest>,
     ) -> Result<Response<ReceivePaymentResponse>, Status> {
         // Authenticate first — the req.tenant_id field is ignored.
-        let tenant_id = auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
 
         let req = request.into_inner();
         let (tx, rx) = oneshot::channel();
@@ -205,18 +246,16 @@ impl WalletService for WickGrpcService {
                 },
             )
             .await
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(dispatch_error_to_status)?;
 
-        let bolt11 = rx
+        let (bolt11, payment_hash) = rx
             .await
             .map_err(|_| Status::internal("node actor dropped the response channel"))?
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        // Return a stub payment hash matching the invoice length.
-        let fake_hash = vec![0u8; 32];
         Ok(Response::new(ReceivePaymentResponse {
             bolt11,
-            payment_hash: fake_hash,
+            payment_hash,
         }))
     }
 
@@ -225,19 +264,16 @@ impl WalletService for WickGrpcService {
         request: Request<GetTransactionsRequest>,
     ) -> Result<Response<GetTransactionsResponse>, Status> {
         // Authenticate first — the req.tenant_id field is ignored.
-        let tenant_id = auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
 
         let req = request.into_inner();
         let limit = req.limit.clamp(1, 200);
 
         let (tx, rx) = oneshot::channel();
         self.manager
-            .dispatch(
-                tenant_id,
-                NodeCmd::GetTransactions { limit, resp: tx },
-            )
+            .dispatch(tenant_id, NodeCmd::GetTransactions { limit, resp: tx })
             .await
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            .map_err(dispatch_error_to_status)?;
 
         let records = rx
             .await
@@ -258,5 +294,51 @@ impl WalletService for WickGrpcService {
             .collect();
 
         Ok(Response::new(GetTransactionsResponse { payments }))
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Code;
+
+    #[test]
+    fn dispatch_error_maps_to_correct_status_code() {
+        let tid = TenantId::generate();
+
+        assert_eq!(
+            dispatch_error_to_status(DispatchError::NotFound(tid)).code(),
+            Code::NotFound
+        );
+        assert_eq!(
+            dispatch_error_to_status(DispatchError::InErrorState(tid)).code(),
+            Code::Unavailable,
+            "ERROR state → UNAVAILABLE so clients retry"
+        );
+        assert_eq!(
+            dispatch_error_to_status(DispatchError::ActorStopped(tid)).code(),
+            Code::Unavailable
+        );
+        assert_eq!(
+            dispatch_error_to_status(DispatchError::WakeTimeout(tid)).code(),
+            Code::DeadlineExceeded,
+            "wake over CLTV budget → DEADLINE_EXCEEDED"
+        );
+        assert_eq!(
+            dispatch_error_to_status(DispatchError::RateLimited(tid)).code(),
+            Code::ResourceExhausted,
+            "per-tenant rate limit → RESOURCE_EXHAUSTED"
+        );
+        assert_eq!(
+            dispatch_error_to_status(DispatchError::HeadroomDenied(tid)).code(),
+            Code::ResourceExhausted,
+            "memory headroom denial → RESOURCE_EXHAUSTED"
+        );
+        assert_eq!(
+            dispatch_error_to_status(DispatchError::Internal(anyhow::anyhow!("boom"))).code(),
+            Code::Internal
+        );
     }
 }

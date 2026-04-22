@@ -1,93 +1,112 @@
 //! Per-tenant Lightning-node actor.
 //!
-//! Each tenant runs exactly one `NodeActor` task. The actor owns its node
-//! state exclusively — no shared references, no internal mutexes. All
-//! interaction goes through the mpsc `NodeCmd` channel.
+//! Each tenant runs exactly **one** `NodeActor` task for the process lifetime.
+//! The actor owns its node state exclusively — no shared references, no
+//! internal mutexes. All interaction goes through the mpsc `NodeCmd` channel.
 //!
-//! The actor holds the node as an `Arc<dyn NodeApi>` so its lifecycle code
-//! stays **non-generic** while the concrete `Node<S>` in `wick-lightning` is
-//! generic over the signer (required because LDK's [`SignerProvider`] has an
-//! associated type — dynamic dispatch cannot name it). Phase-1 uses
-//! `Node<LocalKeysManager>`; Phase-4 flips to a VLS-backed `Node<RemoteVls>`.
+//! ## Lifecycle
 //!
-//! There is intentionally no mock / stub variant: actor behaviour is
-//! verified end-to-end against a real `Node<LocalKeysManager>` in
-//! `crates/wick-testkit/tests/ldk_assembly.rs`, not through a separate
-//! in-memory double that would duplicate coverage at a lower level.
+//! ```text
+//! spawn(tid) → PARKED (node = None)
+//!   ↓  Activate { node }
+//! ACTIVE (node = Some)
+//!   ↓  Park (safety checks pass)
+//! PARKED (node = None, actor still running)
+//!   ↓  Activate { node }   ← re-activation on each wake
+//! ACTIVE
+//!   ↓  Shutdown
+//! exits run loop
+//! ```
 //!
-//! [`SignerProvider`]: lightning::sign::SignerProvider
+//! State transitions (`AtomicU8`) are owned by the manager, not the actor. The
+//! actor clears/installs the `NodeApi` reference and publishes it to the shared
+//! `NodeInner` via `ArcSwap`, but never writes the state atom directly.
 
 use std::fmt;
-use std::sync::{
-    atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
-    Arc,
-};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{ atomic::{ AtomicU64, Ordering }, Arc, RwLock };
+use std::time::{ SystemTime, UNIX_EPOCH };
 
-use tokio::sync::{mpsc, Notify};
-use tracing::{debug, info, warn};
+use arc_swap::ArcSwap;
+use tokio::sync::{ mpsc, Notify };
+use tracing::{ debug, info, warn };
 use wick_core::TenantId;
 use wick_lightning::NodeApi;
 
-use crate::node::{state, NodeCmd, NodeHandle, NODE_CMD_CAPACITY, PER_NODE_BYTES};
+use crate::node::{ state, NodeCmd, NodeHandle, NodeInner, ParkOutcome, NODE_CMD_CAPACITY };
 
 // ── Actor ─────────────────────────────────────────────────────────────────────
 
 /// Per-tenant actor. Owns all mutable Lightning-node state.
 ///
-/// Spawned by [`crate::node::manager::NodeManager::provision`]; communicated
-/// with via [`NodeHandle::tx`].
+/// Spawned once per tenant by [`crate::node::manager::NodeManager::provision`]
+/// and lives for the process lifetime. Park/wake cycles install and remove
+/// the `Arc<dyn NodeApi>` reference; the actor task and its mpsc channel
+/// persist across them.
 pub struct NodeActor {
     tenant_id: TenantId,
     rx: mpsc::Receiver<NodeCmd>,
-    state: Arc<AtomicU8>,
     last_active: Arc<AtomicU64>,
-    node: Arc<dyn NodeApi>,
+    /// Shared `(tx, node)` pair, also held by [`NodeHandle`].
+    /// Actor writes `node` on Activate and clears it on park; `tx` is set
+    /// at spawn and never changed.
+    inner: Arc<ArcSwap<NodeInner>>,
+    /// `Some` when ACTIVE; `None` when PARKED.
+    node: Option<Arc<dyn NodeApi>>,
 }
 
 impl fmt::Debug for NodeActor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NodeActor")
             .field("tenant_id", &self.tenant_id)
+            .field("active", &self.node.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl NodeActor {
-    /// Spawn an actor for `tenant_id` around an already-built [`NodeApi`].
+    /// Spawn a long-lived actor for `tenant_id`.
     ///
-    /// Production path: `wick_lightning::NodeBuilder::new(tenant_id, deps)
-    /// .with_signer(s).build().await?` returns an `Arc<Node<S>>` which
-    /// coerces to `Arc<dyn NodeApi>` because `Node<S>: NodeApi`.
+    /// The actor starts in `PARKED` state (`node = None`). The first
+    /// [`NodeCmd::Activate`] from [`crate::node::manager::NodeManager::wake_loading`]
+    /// installs the node and the manager then CAS-es state to `ACTIVE`.
     #[must_use]
-    pub fn spawn_with_node(tenant_id: TenantId, node: Arc<dyn NodeApi>) -> NodeHandle {
+    pub fn spawn(tenant_id: TenantId) -> NodeHandle {
         let (tx, rx) = mpsc::channel(NODE_CMD_CAPACITY);
-        let state = Arc::new(AtomicU8::new(state::ACTIVE));
-        let last_active = Arc::new(AtomicU64::new(now_secs()));
-        let mem_bytes = Arc::new(AtomicUsize::new(PER_NODE_BYTES));
+        let state_atom = Arc::new(std::sync::atomic::AtomicU8::new(state::PARKED));
+        let last_active = Arc::new(AtomicU64::new(0));
         let wake_notify = Arc::new(Notify::new());
+        let inner = Arc::new(
+            ArcSwap::from_pointee(NodeInner {
+                tx: Some(tx),
+                node: None,
+            })
+        );
 
         let actor = NodeActor {
             tenant_id,
             rx,
-            state: state.clone(),
             last_active: last_active.clone(),
-            node,
+            inner: inner.clone(),
+            node: None,
         };
 
         tokio::spawn(async move { actor.run().await });
 
         NodeHandle {
-            tx,
-            state,
+            state: state_atom,
             last_active,
-            mem_bytes,
             wake_notify,
+            inner,
+            error: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Main actor loop. Processes commands until the channel is closed or
-    /// `Shutdown` is received.
+    /// Main run loop. Processes commands until `Shutdown` is received or
+    /// the mpsc channel is closed.
+    ///
+    /// The actor **never** writes the lifecycle state atom — the manager
+    /// owns all `state::*` transitions. The actor only manages the node
+    /// reference in `self.node` and publishes it to `self.inner`.
     async fn run(mut self) {
         info!(tenant = %self.tenant_id, "node actor started");
 
@@ -99,60 +118,212 @@ impl NodeActor {
                 }
                 Some(NodeCmd::Shutdown) => {
                     info!(tenant = %self.tenant_id, "node actor received Shutdown");
-                    self.node.shutdown().await;
+                    if let Some(node) = self.node.take() {
+                        node.shutdown().await;
+                    }
                     break;
                 }
+                Some(NodeCmd::Activate { node, resp }) => {
+                    self.handle_activate(node, resp);
+                }
+                Some(NodeCmd::Park { resp }) => {
+                    if self.node.is_none() {
+                        // Already parked — nothing to do; signal requeue so
+                        // the manager knows the request was a no-op.
+                        let _ = resp.send(ParkOutcome::RequeuedDueToActivity);
+                        continue;
+                    }
+                    if self.try_park(resp).await {
+                        // Shutdown arrived during drain — exit the loop.
+                        break;
+                    }
+                }
                 Some(cmd) => {
-                    self.touch_last_active();
-                    self.handle(cmd).await;
+                    if self.node.is_none() {
+                        // Parked: no node to service this command.
+                        self.reject_parked(cmd);
+                    } else {
+                        self.touch_last_active();
+                        self.handle(cmd).await;
+                    }
                 }
             }
         }
 
-        self.state.store(state::PARKED, Ordering::SeqCst);
         info!(tenant = %self.tenant_id, "node actor stopped");
     }
 
+    /// Install a fresh node and publish it to the shared `NodeInner`.
+    fn handle_activate(
+        &mut self,
+        node: Arc<dyn NodeApi>,
+        resp: tokio::sync::oneshot::Sender<anyhow::Result<()>>
+    ) {
+        self.node = Some(node.clone());
+        // Publish node — preserve the existing tx (set at spawn, never changes).
+        let current = self.inner.load();
+        self.inner.store(
+            Arc::new(NodeInner {
+                tx: current.tx.clone(),
+                node: Some(node),
+            })
+        );
+        self.touch_last_active();
+        let _ = resp.send(Ok(()));
+        info!(tenant = %self.tenant_id, "node activated");
+    }
+
+    /// Drain already-enqueued commands, run the three park-safety checks,
+    /// and if all clear: shut down the node, clear the inner reference, and
+    /// respond [`ParkOutcome::Parked`].
+    ///
+    /// Returns `true` only if a `Shutdown` was received during the drain
+    /// (caller should exit the run loop). Returns `false` for both
+    /// [`ParkOutcome::Parked`] and [`ParkOutcome::RequeuedDueToActivity`]
+    /// — the actor keeps running in both cases.
+    async fn try_park(&mut self, resp: tokio::sync::oneshot::Sender<ParkOutcome>) -> bool {
+        // Drain any commands that arrived between the poller enqueueing Park
+        // and Park being dequeued. Non-park commands must be processed so user
+        // requests are not silently dropped.
+        while let Ok(cmd) = self.rx.try_recv() {
+            match cmd {
+                NodeCmd::Shutdown => {
+                    if let Some(node) = self.node.take() {
+                        node.shutdown().await;
+                    }
+                    let _ = resp.send(ParkOutcome::RequeuedDueToActivity);
+                    return true;
+                }
+                NodeCmd::Park { resp: other } => {
+                    // Duplicate Park — collapse.
+                    let _ = other.send(ParkOutcome::RequeuedDueToActivity);
+                }
+                NodeCmd::Activate { resp: act_resp, .. } => {
+                    // Activate arrived during drain (manager racing with poller).
+                    // Reject: the poller wins; wake will re-activate on next demand.
+                    let _ = act_resp.send(
+                        Err(
+                            anyhow::anyhow!(
+                                "Activate rejected: Park already in progress for tenant {}",
+                                self.tenant_id
+                            )
+                        )
+                    );
+                }
+                other => {
+                    self.touch_last_active();
+                    self.handle(other).await;
+                }
+            }
+        }
+
+        // Post-drain recheck — all three must be false for park to be safe.
+        let node = self.node.as_ref().expect("checked is_some before try_park");
+
+        let has_htlcs = node.has_pending_htlcs().await.unwrap_or_else(|e| {
+            warn!(tenant = %self.tenant_id, error = %e,
+                "has_pending_htlcs failed; assuming activity and requeueing Park");
+            true
+        });
+        let has_inflight = node.has_inflight_outbound().await.unwrap_or_else(|e| {
+            warn!(tenant = %self.tenant_id, error = %e,
+                "has_inflight_outbound failed; assuming activity and requeueing Park");
+            true
+        });
+        let has_monitor = node.has_unresolved_monitor_events().await.unwrap_or_else(|e| {
+            warn!(tenant = %self.tenant_id, error = %e,
+                "has_unresolved_monitor_events failed; assuming activity and requeueing Park");
+            true
+        });
+
+        if has_htlcs || has_inflight || has_monitor {
+            debug!(tenant = %self.tenant_id, has_htlcs, has_inflight, has_monitor,
+                "park requeued due to activity");
+            let _ = resp.send(ParkOutcome::RequeuedDueToActivity);
+            return false;
+        }
+
+        info!(tenant = %self.tenant_id, "park safe — shutting down node");
+        // Take the node *before* shutdown so the borrow on `self.node` above ends.
+        let node = self.node.take().expect("checked above");
+        node.shutdown().await;
+
+        // Clear the node reference from the shared inner (preserve tx).
+        let current = self.inner.load();
+        self.inner.store(
+            Arc::new(NodeInner {
+                tx: current.tx.clone(),
+                node: None,
+            })
+        );
+
+        let _ = resp.send(ParkOutcome::Parked);
+        // Actor stays in the run loop — only Shutdown exits.
+        false
+    }
+
+    /// Send an error response for a command that arrived while the actor is
+    /// parked (no node installed). Callers observing the error can retry;
+    /// the manager's dispatch path will transparent-wake on next attempt.
+    fn reject_parked(&self, cmd: NodeCmd) {
+        let tid = self.tenant_id;
+        match cmd {
+            NodeCmd::GetBalance { resp } => {
+                let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
+            }
+            NodeCmd::SendPayment { resp, .. } => {
+                let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
+            }
+            NodeCmd::ReceivePayment { resp, .. } => {
+                let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
+            }
+            NodeCmd::GetTransactions { resp, .. } => {
+                let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
+            }
+            NodeCmd::Activate { .. } | NodeCmd::Park { .. } | NodeCmd::Shutdown => {
+                unreachable!("Activate / Park / Shutdown handled before reject_parked")
+            }
+        }
+    }
+
     fn touch_last_active(&self) {
-        self.last_active.store(now_secs(), Ordering::SeqCst);
+        self.last_active.store(Self::now_secs(), Ordering::SeqCst);
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
     }
 
     async fn handle(&mut self, cmd: NodeCmd) {
+        let node = self.node.as_ref().expect("handle only called when node is Some");
         match cmd {
             NodeCmd::GetBalance { resp } => {
-                if resp.send(self.node.get_balance().await).is_err() {
+                if resp.send(node.get_balance().await).is_err() {
                     warn!(tenant = %self.tenant_id, "GetBalance: caller dropped response receiver");
                 }
             }
 
             NodeCmd::SendPayment { bolt11, resp } => {
-                if resp.send(self.node.send_payment(&bolt11).await).is_err() {
+                if resp.send(node.send_payment(&bolt11).await).is_err() {
                     warn!(tenant = %self.tenant_id, "SendPayment: caller dropped response receiver");
                 }
             }
 
             NodeCmd::ReceivePayment { amount_msat, memo, resp } => {
-                if resp.send(self.node.receive_payment(amount_msat, &memo).await).is_err() {
+                if resp.send(node.receive_payment(amount_msat, &memo).await).is_err() {
                     warn!(tenant = %self.tenant_id, "ReceivePayment: caller dropped response receiver");
                 }
             }
 
             NodeCmd::GetTransactions { limit, resp } => {
-                if resp.send(self.node.get_transactions(limit).await).is_err() {
+                if resp.send(node.get_transactions(limit).await).is_err() {
                     warn!(tenant = %self.tenant_id, "GetTransactions: caller dropped response receiver");
                 }
             }
 
-            NodeCmd::Shutdown => {
-                unreachable!("Shutdown handled in actor run loop");
+            NodeCmd::Activate { .. } | NodeCmd::Shutdown | NodeCmd::Park { .. } => {
+                unreachable!("Activate / Shutdown / Park handled in actor run loop");
             }
         }
     }
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }

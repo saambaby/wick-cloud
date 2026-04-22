@@ -5,5 +5,6 @@
 //! lives here; `main.rs` is a thin boot shim.
 
 pub mod auth;
+pub mod factory;
 pub mod grpc;
 pub mod node;
