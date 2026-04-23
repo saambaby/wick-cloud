@@ -319,7 +319,7 @@ impl NodeManager {
                         return Err(DispatchError::WakeTimeout(tenant_id));
                     }
                     Ok(Err(e)) => {
-                        return Err(classify_wake_error(tenant_id, &e, e.to_string()));
+                        return Err(classify_wake_error(tenant_id, e.to_string()));
                     }
                     Ok(Ok(())) => {}
                 }
@@ -402,8 +402,13 @@ impl NodeManager {
                 }
                 state::LOADING => {
                     // Another waker is in flight; wait for completion.
+                    // `Notified` is lazily registered on first poll, so
+                    // pin + `enable()` before re-checking state — otherwise
+                    // a `notify_waiters()` that fires between creation and
+                    // await is lost and we stall until `wake_deadline`.
                     let notified = handle.wake_notify.notified();
-                    // Re-check in case we missed the notify before subscribing.
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
                     if handle.state.load(Ordering::SeqCst) != state::LOADING {
                         continue;
                     }
@@ -536,14 +541,27 @@ impl NodeManager {
                 .is_err()
         {
             // Extremely rare — state was concurrently moved (e.g. emergency
-            // park). Roll back and bail; the evictor/poller will reconcile.
-            let current_tx = handle.inner.load().tx.clone();
-            handle.inner.store(
-                Arc::new(NodeInner {
-                    tx: current_tx,
-                    node: None,
-                })
-            );
+            // park). The actor already installed the node via handle_activate,
+            // so we must ask it to shut the node down before bailing or the
+            // BackgroundProcessor / SPV loop / peer-reconnect loop leak.
+            // Best-effort: on failure, log and accept the leak (the actor
+            // is already broken in some way the manager can't repair).
+            match
+                tokio::time::timeout(
+                    self.config.wake_deadline,
+                    self.force_park(tenant_id)
+                ).await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::error!(tenant = %tenant_id, error = %e,
+                        "wake_loading rollback: force_park failed; node may be leaked");
+                }
+                Err(_) => {
+                    tracing::error!(tenant = %tenant_id,
+                        "wake_loading rollback: force_park timed out; node may be leaked");
+                }
+            }
             return Err(anyhow!("state moved out of LOADING before wake could publish"));
         }
 
@@ -555,26 +573,52 @@ impl NodeManager {
         Ok(())
     }
 
-    /// Request a tenant park itself.
+    /// Request a tenant park itself (polite path; safety checks apply).
     ///
-    /// Sends [`NodeCmd::Park`] to the actor, awaits the [`ParkOutcome`],
-    /// and — if `Parked` — performs the manager-side completion (swap
-    /// `NodeInner` to empty, release memory budget, CAS `ACTIVE → PARKED`).
-    ///
-    /// Errors if the tenant is not provisioned or not `ACTIVE`.
+    /// Sends [`NodeCmd::Park`] with `force = false`. The actor's post-drain
+    /// recheck can refuse with [`ParkOutcome::RequeuedDueToActivity`] if
+    /// HTLCs are pending, an outbound payment is in flight, or monitor
+    /// events are unresolved. Errors if the tenant is not provisioned or
+    /// not `ACTIVE`.
     pub async fn park(&self, tenant_id: TenantId) -> anyhow::Result<ParkOutcome> {
+        self.park_inner(tenant_id, false).await
+    }
+
+    /// Force a tenant to park, skipping the three park-safety checks.
+    ///
+    /// Used by the emergency evictor and by `wake_loading`'s defensive
+    /// rollback path. The actor always responds [`ParkOutcome::Parked`]
+    /// when it has a node to shut down; in-flight HTLCs may time out.
+    /// The actor task stays alive (it is not a `Shutdown`) so subsequent
+    /// wakes can re-activate the tenant.
+    pub async fn force_park(&self, tenant_id: TenantId) -> anyhow::Result<ParkOutcome> {
+        self.park_inner(tenant_id, true).await
+    }
+
+    async fn park_inner(
+        &self,
+        tenant_id: TenantId,
+        force: bool
+    ) -> anyhow::Result<ParkOutcome> {
         let handle = self.nodes
             .get(&tenant_id)
             .ok_or_else(|| anyhow!("tenant {tenant_id} not found"))?
             .clone();
-        if handle.state.load(Ordering::SeqCst) != state::ACTIVE {
+        // Allow force-park from LOADING too — wake_loading's rollback path
+        // uses it to clean up after a failed CAS while the actor already
+        // installed the node.
+        let s = handle.state.load(Ordering::SeqCst);
+        if !force && s != state::ACTIVE {
             return Err(anyhow!("tenant {tenant_id} not ACTIVE"));
+        }
+        if force && s != state::ACTIVE && s != state::LOADING {
+            return Err(anyhow!("tenant {tenant_id} not ACTIVE or LOADING"));
         }
         let tx = handle.tx().ok_or_else(|| anyhow!("tenant {tenant_id} has no active sender"))?;
 
         let (resp_tx, resp_rx) = oneshot::channel();
         tx
-            .send(NodeCmd::Park { resp: resp_tx }).await
+            .send(NodeCmd::Park { force, resp: resp_tx }).await
             .map_err(|_| anyhow!("actor closed before Park accepted"))?;
 
         let outcome = resp_rx.await.map_err(|_| anyhow!("actor dropped Park response"))?;
@@ -595,7 +639,10 @@ impl NodeManager {
             self.total_mem.fetch_sub(self.config.per_node_bytes, Ordering::SeqCst);
             handle.state.store(state::PARKED, Ordering::SeqCst);
             counter!("wick_park_total").increment(1);
-            info!(tenant = %tenant_id, "park complete — memory released");
+            if force {
+                counter!("wick_forced_park_with_inflight_total").increment(1);
+            }
+            info!(tenant = %tenant_id, force, "park complete — memory released");
         }
 
         Ok(outcome)
@@ -605,7 +652,7 @@ impl NodeManager {
     /// pressure ratio. Exposed so background loops (poller, evictor) can
     /// call it on each tick to keep Prometheus fresh.
     pub fn update_gauges(&self) {
-        let (mut active, mut parked, mut errored) = (0u64, 0u64, 0u64);
+        let (mut active, mut parked, mut loading, mut errored) = (0u64, 0u64, 0u64, 0u64);
         for r in self.nodes.iter() {
             match r.value().state.load(Ordering::SeqCst) {
                 state::ACTIVE => {
@@ -613,6 +660,9 @@ impl NodeManager {
                 }
                 state::PARKED => {
                     parked += 1;
+                }
+                state::LOADING => {
+                    loading += 1;
                 }
                 state::ERROR => {
                     errored += 1;
@@ -626,6 +676,7 @@ impl NodeManager {
             (self.config.memory_budget_bytes.max(1) as f64);
         gauge!("wick_active_nodes").set(active as f64);
         gauge!("wick_parked_nodes").set(parked as f64);
+        gauge!("wick_loading_nodes").set(loading as f64);
         gauge!("wick_error_nodes").set(errored as f64);
         gauge!("wick_memory_pressure_ratio").set(pressure);
     }
@@ -750,17 +801,22 @@ impl NodeManager {
                 break;
             }
             if emergency {
-                // Force-park: send Shutdown, skip the post-drain recheck.
-                if let Some(handle) = self.get_handle(tid) {
-                    if let Some(tx) = handle.tx() {
-                        if tx.send(NodeCmd::Shutdown).await.is_err() {
-                            continue;
-                        }
-                        handle.inner.store(Arc::new(NodeInner::default()));
-                        self.total_mem.fetch_sub(self.config.per_node_bytes, Ordering::SeqCst);
-                        handle.state.store(state::PARKED, Ordering::SeqCst);
-                        counter!("wick_forced_park_with_inflight_total").increment(1);
+                // Force-park: skip safety checks but keep the actor task
+                // alive so the next wake can re-activate the tenant.
+                // Never send Shutdown — that would leave the tenant
+                // permanently unreachable until process restart.
+                match self.force_park(tid).await {
+                    Ok(ParkOutcome::Parked) => {
                         warn!(tenant = %tid, pressure, "emergency evict: force-parked tenant");
+                    }
+                    Ok(ParkOutcome::RequeuedDueToActivity) => {
+                        // Unexpected for force-park; actor only returns
+                        // RequeuedDueToActivity when it had no node or saw
+                        // a Shutdown during drain.
+                        debug!(tenant = %tid, "emergency evict: actor requeued force-park");
+                    }
+                    Err(e) => {
+                        debug!(tenant = %tid, error = %e, "emergency evict force_park failed");
                     }
                 }
             } else {
@@ -820,7 +876,11 @@ impl NodeManager {
             // counter.
             if let Some(handle) = self.nodes.get(&tid).map(|r| r.clone()) {
                 handle.state.store(state::PARKED, Ordering::SeqCst);
-                match self.wake(tid).await {
+                // Payment priority skips the per-tenant token bucket so a
+                // failing tenant doesn't PARKED↔ERROR ping-pong every tick
+                // just because User-priority capacity is exhausted. The
+                // global admission semaphore still bounds concurrency.
+                match self.wake_with_priority(tid, WakePriority::Payment).await {
                     Ok(()) => {
                         info!(tenant = %tid, "error recovery: tenant restored to ACTIVE");
                     }
@@ -865,12 +925,15 @@ fn classify_priority(cmd: &NodeCmd) -> WakePriority {
 /// `wake`/`wake_loading`) would require a much wider refactor; given
 /// wake errors come from a small, well-known set of call sites, the
 /// string inspection is acceptable and covered by tests.
-fn classify_wake_error(tenant_id: TenantId, _e: &anyhow::Error, msg: String) -> DispatchError {
-    if msg.contains("rate") || msg.contains("admission") {
+///
+/// Uses specific phrases rather than single words so unrelated messages
+/// that happen to contain "rate" or "ERROR" substrings don't misclassify.
+fn classify_wake_error(tenant_id: TenantId, msg: String) -> DispatchError {
+    if msg.contains("rate limit") || msg.contains("admission") {
         DispatchError::RateLimited(tenant_id)
-    } else if msg.contains("headroom") {
+    } else if msg.contains("headroom threshold") {
         DispatchError::HeadroomDenied(tenant_id)
-    } else if msg.contains("ERROR") {
+    } else if msg.contains("in ERROR state") {
         DispatchError::InErrorState(tenant_id)
     } else {
         DispatchError::Internal(anyhow!(msg))
@@ -1121,31 +1184,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn budget_exhausted_returns_error() {
-        // Create a manager with tiny budget: exactly 1 node.
-        let mgr = NodeManager::new_for_test(ManagerConfig {
-            memory_budget_bytes: PER_NODE_BYTES,
-            per_node_bytes: PER_NODE_BYTES,
-            ..ManagerConfig::default()
-        });
-
-        // This tenant is "provisioned" without DB — just insert the handle directly
-        // so we can test budget without a live Postgres.
-        let handle = NodeHandle::for_test();
-        mgr.nodes.insert(TenantId::generate(), handle);
-        mgr.total_mem.fetch_add(PER_NODE_BYTES, Ordering::SeqCst);
-
-        // Now node_count == 1, total_mem == budget. Next provision should fail.
-        // We don't call the full provision() because it needs a real DB.
-        // Instead, test the budget arithmetic directly.
-        let prev = mgr.total_mem.fetch_add(PER_NODE_BYTES, Ordering::SeqCst);
-        assert!(
-            prev + PER_NODE_BYTES > mgr.config.memory_budget_bytes,
-            "budget should be exceeded"
-        );
-    }
-
-    #[tokio::test]
     async fn node_count_tracks_inserts() {
         let mgr = mgr();
         assert_eq!(mgr.node_count(), 0);
@@ -1157,5 +1195,227 @@ mod tests {
         let h2 = NodeHandle::for_test();
         mgr.nodes.insert(TenantId::generate(), h2);
         assert_eq!(mgr.node_count(), 2);
+    }
+
+    // ── Park-safety proptest ────────────────────────────────────────────────
+    //
+    // Stub `NodeApi` driven by three `AtomicBool`s. Only the park-path methods
+    // (`has_*`, `shutdown`) are real; the rest panic via `unimplemented!()`
+    // since the park path never calls them. Used by both the proptest below
+    // and the Notify-race regression test.
+    //
+    // `NodeApi` requires `Debug`, and `shutdown` is a no-op — the actor still
+    // drops the `Arc<dyn NodeApi>` afterwards but the stub holds no resources.
+
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    use crate::node::actor::NodeActor;
+    use wick_lightning::{Balance, ChannelSummary, NodeApi, PaymentRecord, PaymentResult};
+
+    #[derive(Debug)]
+    struct StubNode {
+        has_htlcs: AtomicBool,
+        has_inflight: AtomicBool,
+        has_monitor: AtomicBool,
+    }
+
+    impl StubNode {
+        fn with_flags(has_htlcs: bool, has_inflight: bool, has_monitor: bool) -> Self {
+            Self {
+                has_htlcs: AtomicBool::new(has_htlcs),
+                has_inflight: AtomicBool::new(has_inflight),
+                has_monitor: AtomicBool::new(has_monitor),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NodeApi for StubNode {
+        async fn get_balance(&self) -> anyhow::Result<Balance> {
+            unimplemented!("StubNode: not used by park path")
+        }
+        async fn send_payment(&self, _: &str) -> anyhow::Result<PaymentResult> {
+            unimplemented!("StubNode: not used by park path")
+        }
+        async fn receive_payment(
+            &self,
+            _: Option<u64>,
+            _: &str
+        ) -> anyhow::Result<(String, Vec<u8>)> {
+            unimplemented!("StubNode: not used by park path")
+        }
+        async fn get_transactions(&self, _: u32) -> anyhow::Result<Vec<PaymentRecord>> {
+            unimplemented!("StubNode: not used by park path")
+        }
+        fn node_id(&self) -> bitcoin::secp256k1::PublicKey {
+            unimplemented!("StubNode: not used by park path")
+        }
+        fn local_listen_addr(&self) -> Option<std::net::SocketAddr> {
+            None
+        }
+        async fn connect_peer(
+            &self,
+            _: bitcoin::secp256k1::PublicKey,
+            _: &str,
+            _: u16
+        ) -> anyhow::Result<()> {
+            unimplemented!("StubNode: not used by park path")
+        }
+        async fn open_channel(
+            &self,
+            _: bitcoin::secp256k1::PublicKey,
+            _: u64,
+            _: u64
+        ) -> anyhow::Result<()> {
+            unimplemented!("StubNode: not used by park path")
+        }
+        async fn open_channel_init(
+            &self,
+            _: bitcoin::secp256k1::PublicKey,
+            _: u64,
+            _: u64,
+            _: Duration
+        ) -> anyhow::Result<(lightning::ln::types::ChannelId, wick_lightning::PendingFunding)> {
+            unimplemented!("StubNode: not used by park path")
+        }
+        async fn open_channel_finalize(
+            &self,
+            _: &lightning::ln::types::ChannelId,
+            _: &bitcoin::secp256k1::PublicKey,
+            _: bitcoin::Transaction
+        ) -> anyhow::Result<()> {
+            unimplemented!("StubNode: not used by park path")
+        }
+        async fn close_channel(
+            &self,
+            _: &lightning::ln::types::ChannelId,
+            _: &bitcoin::secp256k1::PublicKey
+        ) -> anyhow::Result<()> {
+            unimplemented!("StubNode: not used by park path")
+        }
+        async fn list_channels(&self) -> anyhow::Result<Vec<ChannelSummary>> {
+            unimplemented!("StubNode: not used by park path")
+        }
+        async fn has_pending_htlcs(&self) -> anyhow::Result<bool> {
+            Ok(self.has_htlcs.load(Ordering::SeqCst))
+        }
+        async fn has_inflight_outbound(&self) -> anyhow::Result<bool> {
+            Ok(self.has_inflight.load(Ordering::SeqCst))
+        }
+        async fn has_unresolved_monitor_events(&self) -> anyhow::Result<bool> {
+            Ok(self.has_monitor.load(Ordering::SeqCst))
+        }
+        async fn shutdown(&self) {}
+    }
+
+    fn stub_factory(
+        has_htlcs: bool,
+        has_inflight: bool,
+        has_monitor: bool
+    ) -> NodeFactory {
+        Arc::new(move |_tid| {
+            let stub: Arc<dyn NodeApi> = Arc::new(
+                StubNode::with_flags(has_htlcs, has_inflight, has_monitor)
+            );
+            Box::pin(async move { Ok(stub) })
+        })
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(256))]
+
+        /// Core Phase-2 safety invariant: `Park` must never transition the
+        /// tenant to `PARKED` while any of the three activity predicates
+        /// (pending HTLCs, in-flight outbound, unresolved monitor events)
+        /// returns `true`.
+        ///
+        /// Runs 256 randomised cases over the 2^3 = 8 combinations of the
+        /// three flags. Each case drives the full PARKED → LOADING → ACTIVE
+        /// wake, then issues a polite park and asserts the expected outcome
+        /// and final state.
+        #[test]
+        fn park_never_parks_with_pending_activity(
+            has_htlcs in proptest::prelude::any::<bool>(),
+            has_inflight in proptest::prelude::any::<bool>(),
+            has_monitor in proptest::prelude::any::<bool>(),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            let (outcome, final_state) = rt.block_on(async move {
+                let mgr = NodeManager::new_for_test_with_factory(
+                    ManagerConfig::default(),
+                    stub_factory(has_htlcs, has_inflight, has_monitor),
+                );
+                let tid = TenantId::generate();
+                let handle = NodeActor::spawn(tid);
+                mgr.nodes.insert(tid, handle);
+
+                mgr.wake(tid).await.expect("wake must succeed");
+                let outcome = mgr.park(tid).await.expect("park must not error");
+                let state = mgr.get_handle(tid).unwrap().state.load(Ordering::SeqCst);
+                (outcome, state)
+            });
+
+            let any_activity = has_htlcs || has_inflight || has_monitor;
+            if any_activity {
+                proptest::prop_assert_eq!(outcome, ParkOutcome::RequeuedDueToActivity);
+                proptest::prop_assert_eq!(final_state, state::ACTIVE);
+            } else {
+                proptest::prop_assert_eq!(outcome, ParkOutcome::Parked);
+                proptest::prop_assert_eq!(final_state, state::PARKED);
+            }
+        }
+    }
+
+    // ── Notify-race regression ──────────────────────────────────────────────
+
+    /// Guards the `notified.as_mut().enable()` call in `wake_with_priority`'s
+    /// LOADING branch. Without it, a `notify_waiters()` fired between
+    /// `notified()` creation and first poll is lost to lazy registration;
+    /// the waiter then stalls until `wake_deadline`.
+    ///
+    /// Setup: handle is forced into LOADING with no actor node. Task A calls
+    /// `wake` and enters the LOADING branch. After a short yield the test
+    /// task transitions state to ACTIVE and fires `notify_waiters`. The
+    /// fixed code captures the notify (directly via `enable()` if A is
+    /// between create and await, or as a normal wakeup otherwise) and A
+    /// loops to see ACTIVE and returns.
+    ///
+    /// The assertion is bounded-latency: if `enable()` is removed, the
+    /// waiter can miss the notify and stall to the 2s `wake_deadline`,
+    /// which trips the 500 ms outer timeout and fails the test. The check
+    /// is one-sided (passing does not prove absence of the race), but any
+    /// failure is always a real regression.
+    #[tokio::test]
+    async fn wake_while_loading_completes_when_state_transitions() {
+        let factory: NodeFactory = Arc::new(|_| {
+            Box::pin(async { Err(anyhow!("factory not expected to run")) })
+        });
+        let mgr = Arc::new(NodeManager::new_for_test_with_factory(
+            ManagerConfig::default(),
+            factory,
+        ));
+        let tid = TenantId::generate();
+        let handle = NodeActor::spawn(tid);
+        handle.state.store(state::LOADING, Ordering::SeqCst);
+        mgr.nodes.insert(tid, handle.clone());
+
+        let mgr_a = mgr.clone();
+        let waker = tokio::spawn(async move { mgr_a.wake(tid).await });
+
+        // Let the waker reach the LOADING branch's `.await`.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        handle.state.store(state::ACTIVE, Ordering::SeqCst);
+        handle.wake_notify.notify_waiters();
+
+        let res = tokio::time::timeout(Duration::from_millis(500), waker)
+            .await
+            .expect("wake did not complete within 500ms — Notify race regressed");
+        let join = res.expect("waker task panicked");
+        join.expect("wake returned error");
     }
 }

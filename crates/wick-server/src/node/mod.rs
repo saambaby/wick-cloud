@@ -21,7 +21,8 @@
 //! Any state ─error─▶ Error(3) ─recovery─▶ Parked(0)
 //! ```
 //!
-//! Phase 1 ships `Active` only; park/wake arrives in Phase 2.
+//! See [`manager::NodeManager`] for the park/wake, eviction, and recovery
+//! implementations that drive these transitions.
 
 pub mod actor;
 pub mod admission;
@@ -136,6 +137,57 @@ pub enum NodeCmd {
         /// Response channel.
         resp: oneshot::Sender<anyhow::Result<Vec<PaymentRecord>>>,
     },
+    /// Return the node's pubkey + local listen address.
+    GetNodeInfo {
+        /// Response channel — `(pubkey, Some(host:port)) | (pubkey, None)` if
+        /// the node has no listener.
+        resp: oneshot::Sender<anyhow::Result<(bitcoin::secp256k1::PublicKey, Option<std::net::SocketAddr>)>>,
+    },
+    /// Connect to a Lightning peer and persist it for reconnection.
+    ConnectPeer {
+        /// Peer's compressed secp256k1 pubkey.
+        peer: bitcoin::secp256k1::PublicKey,
+        /// Peer host.
+        host: String,
+        /// Peer port.
+        port: u16,
+        /// Response channel.
+        resp: oneshot::Sender<anyhow::Result<()>>,
+    },
+    /// Start an outbound channel open and wait for LDK's
+    /// `FundingGenerationReady`. Returns the temp_channel_id + pending
+    /// funding request the caller must satisfy with a signed tx.
+    OpenChannelInit {
+        /// Counterparty pubkey.
+        peer: bitcoin::secp256k1::PublicKey,
+        /// Channel value in satoshis (funder side).
+        value_sat: u64,
+        /// Amount pushed to the counterparty in millisatoshis.
+        push_msat: u64,
+        /// Max wait for `Event::FundingGenerationReady`.
+        timeout: std::time::Duration,
+        /// Response channel — yields the temp_channel_id LDK assigned and
+        /// the parked `PendingFunding` (output_script + value).
+        resp: oneshot::Sender<anyhow::Result<(lightning::ln::types::ChannelId, wick_lightning::PendingFunding)>>,
+    },
+    /// Complete an outbound channel open with a caller-supplied, pre-signed
+    /// funding transaction.
+    OpenChannelFinalize {
+        /// Temp channel id returned from [`Self::OpenChannelInit`].
+        temp_channel_id: lightning::ln::types::ChannelId,
+        /// Counterparty pubkey.
+        counterparty: bitcoin::secp256k1::PublicKey,
+        /// Serialised funding tx paying `channel_value_sat` to the
+        /// `output_script` returned from `OpenChannelInit`.
+        funding_tx: bitcoin::Transaction,
+        /// Response channel.
+        resp: oneshot::Sender<anyhow::Result<()>>,
+    },
+    /// Snapshot of the node's current channels.
+    ListChannels {
+        /// Response channel.
+        resp: oneshot::Sender<anyhow::Result<Vec<ChannelSummary>>>,
+    },
     /// Install (or re-install) a [`NodeApi`] into a parked actor.
     ///
     /// Sent by [`crate::node::manager::NodeManager::wake_loading`] after the
@@ -155,8 +207,9 @@ pub enum NodeCmd {
     },
     /// Request the actor park itself.
     ///
-    /// The handler drains any already-enqueued commands, then re-checks the
-    /// three park-safety conditions ([`wick_lightning::NodeApi::has_pending_htlcs`],
+    /// The handler drains any already-enqueued commands, then — unless
+    /// `force` is `true` — re-checks the three park-safety conditions
+    /// ([`wick_lightning::NodeApi::has_pending_htlcs`],
     /// [`wick_lightning::NodeApi::has_inflight_outbound`],
     /// [`wick_lightning::NodeApi::has_unresolved_monitor_events`]). If any
     /// returns `true`, responds [`ParkOutcome::RequeuedDueToActivity`] and
@@ -164,7 +217,13 @@ pub enum NodeCmd {
     /// [`ParkOutcome::Parked`], clears the internal node reference, and
     /// continues the run loop (the actor stays alive — only `Shutdown`
     /// exits the loop).
+    ///
+    /// `force = true` skips the safety checks and unconditionally shuts
+    /// the node down. Used by emergency eviction; accepts that in-flight
+    /// HTLCs may time out.
     Park {
+        /// When `true`, bypass the three park-safety checks.
+        force: bool,
         /// Response channel.
         resp: oneshot::Sender<ParkOutcome>,
     },

@@ -126,14 +126,14 @@ impl NodeActor {
                 Some(NodeCmd::Activate { node, resp }) => {
                     self.handle_activate(node, resp);
                 }
-                Some(NodeCmd::Park { resp }) => {
+                Some(NodeCmd::Park { force, resp }) => {
                     if self.node.is_none() {
                         // Already parked — nothing to do; signal requeue so
                         // the manager knows the request was a no-op.
                         let _ = resp.send(ParkOutcome::RequeuedDueToActivity);
                         continue;
                     }
-                    if self.try_park(resp).await {
+                    if self.try_park(force, resp).await {
                         // Shutdown arrived during drain — exit the loop.
                         break;
                     }
@@ -173,15 +173,19 @@ impl NodeActor {
         info!(tenant = %self.tenant_id, "node activated");
     }
 
-    /// Drain already-enqueued commands, run the three park-safety checks,
-    /// and if all clear: shut down the node, clear the inner reference, and
-    /// respond [`ParkOutcome::Parked`].
+    /// Drain already-enqueued commands, run the three park-safety checks
+    /// (skipped when `force` is `true`), and if all clear: shut down the
+    /// node, clear the inner reference, and respond [`ParkOutcome::Parked`].
     ///
     /// Returns `true` only if a `Shutdown` was received during the drain
     /// (caller should exit the run loop). Returns `false` for both
     /// [`ParkOutcome::Parked`] and [`ParkOutcome::RequeuedDueToActivity`]
     /// — the actor keeps running in both cases.
-    async fn try_park(&mut self, resp: tokio::sync::oneshot::Sender<ParkOutcome>) -> bool {
+    async fn try_park(
+        &mut self,
+        force: bool,
+        resp: tokio::sync::oneshot::Sender<ParkOutcome>
+    ) -> bool {
         // Drain any commands that arrived between the poller enqueueing Park
         // and Park being dequeued. Non-park commands must be processed so user
         // requests are not silently dropped.
@@ -191,10 +195,16 @@ impl NodeActor {
                     if let Some(node) = self.node.take() {
                         node.shutdown().await;
                     }
-                    let _ = resp.send(ParkOutcome::RequeuedDueToActivity);
+                    // Drop `resp` without sending — caller's resp_rx.await
+                    // will surface RecvError, which manager.park maps to
+                    // an actor-dropped error. Previously responded
+                    // `RequeuedDueToActivity`, which left the manager
+                    // thinking the tenant could still receive traffic
+                    // while the actor was exiting.
+                    drop(resp);
                     return true;
                 }
-                NodeCmd::Park { resp: other } => {
+                NodeCmd::Park { resp: other, .. } => {
                     // Duplicate Park — collapse.
                     let _ = other.send(ParkOutcome::RequeuedDueToActivity);
                 }
@@ -218,32 +228,38 @@ impl NodeActor {
         }
 
         // Post-drain recheck — all three must be false for park to be safe.
-        let node = self.node.as_ref().expect("checked is_some before try_park");
+        // Force-park (used by emergency eviction) skips the checks entirely
+        // and accepts that in-flight HTLCs may time out.
+        if force {
+            warn!(tenant = %self.tenant_id, "force-park: skipping safety checks");
+        } else {
+            let node = self.node.as_ref().expect("checked is_some before try_park");
 
-        let has_htlcs = node.has_pending_htlcs().await.unwrap_or_else(|e| {
-            warn!(tenant = %self.tenant_id, error = %e,
-                "has_pending_htlcs failed; assuming activity and requeueing Park");
-            true
-        });
-        let has_inflight = node.has_inflight_outbound().await.unwrap_or_else(|e| {
-            warn!(tenant = %self.tenant_id, error = %e,
-                "has_inflight_outbound failed; assuming activity and requeueing Park");
-            true
-        });
-        let has_monitor = node.has_unresolved_monitor_events().await.unwrap_or_else(|e| {
-            warn!(tenant = %self.tenant_id, error = %e,
-                "has_unresolved_monitor_events failed; assuming activity and requeueing Park");
-            true
-        });
+            let has_htlcs = node.has_pending_htlcs().await.unwrap_or_else(|e| {
+                warn!(tenant = %self.tenant_id, error = %e,
+                    "has_pending_htlcs failed; assuming activity and requeueing Park");
+                true
+            });
+            let has_inflight = node.has_inflight_outbound().await.unwrap_or_else(|e| {
+                warn!(tenant = %self.tenant_id, error = %e,
+                    "has_inflight_outbound failed; assuming activity and requeueing Park");
+                true
+            });
+            let has_monitor = node.has_unresolved_monitor_events().await.unwrap_or_else(|e| {
+                warn!(tenant = %self.tenant_id, error = %e,
+                    "has_unresolved_monitor_events failed; assuming activity and requeueing Park");
+                true
+            });
 
-        if has_htlcs || has_inflight || has_monitor {
-            debug!(tenant = %self.tenant_id, has_htlcs, has_inflight, has_monitor,
-                "park requeued due to activity");
-            let _ = resp.send(ParkOutcome::RequeuedDueToActivity);
-            return false;
+            if has_htlcs || has_inflight || has_monitor {
+                debug!(tenant = %self.tenant_id, has_htlcs, has_inflight, has_monitor,
+                    "park requeued due to activity");
+                let _ = resp.send(ParkOutcome::RequeuedDueToActivity);
+                return false;
+            }
         }
 
-        info!(tenant = %self.tenant_id, "park safe — shutting down node");
+        info!(tenant = %self.tenant_id, force, "park safe — shutting down node");
         // Take the node *before* shutdown so the borrow on `self.node` above ends.
         let node = self.node.take().expect("checked above");
         node.shutdown().await;
@@ -278,6 +294,21 @@ impl NodeActor {
                 let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
             }
             NodeCmd::GetTransactions { resp, .. } => {
+                let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
+            }
+            NodeCmd::GetNodeInfo { resp } => {
+                let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
+            }
+            NodeCmd::ConnectPeer { resp, .. } => {
+                let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
+            }
+            NodeCmd::OpenChannelInit { resp, .. } => {
+                let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
+            }
+            NodeCmd::OpenChannelFinalize { resp, .. } => {
+                let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
+            }
+            NodeCmd::ListChannels { resp } => {
                 let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
             }
             NodeCmd::Activate { .. } | NodeCmd::Park { .. } | NodeCmd::Shutdown => {
@@ -318,6 +349,41 @@ impl NodeActor {
             NodeCmd::GetTransactions { limit, resp } => {
                 if resp.send(node.get_transactions(limit).await).is_err() {
                     warn!(tenant = %self.tenant_id, "GetTransactions: caller dropped response receiver");
+                }
+            }
+
+            NodeCmd::GetNodeInfo { resp } => {
+                let info = Ok((node.node_id(), node.local_listen_addr()));
+                if resp.send(info).is_err() {
+                    warn!(tenant = %self.tenant_id, "GetNodeInfo: caller dropped response receiver");
+                }
+            }
+
+            NodeCmd::ConnectPeer { peer, host, port, resp } => {
+                if resp.send(node.connect_peer(peer, &host, port).await).is_err() {
+                    warn!(tenant = %self.tenant_id, "ConnectPeer: caller dropped response receiver");
+                }
+            }
+
+            NodeCmd::OpenChannelInit { peer, value_sat, push_msat, timeout, resp } => {
+                let outcome = node.open_channel_init(peer, value_sat, push_msat, timeout).await;
+                if resp.send(outcome).is_err() {
+                    warn!(tenant = %self.tenant_id, "OpenChannelInit: caller dropped response receiver");
+                }
+            }
+
+            NodeCmd::OpenChannelFinalize { temp_channel_id, counterparty, funding_tx, resp } => {
+                let result = node
+                    .open_channel_finalize(&temp_channel_id, &counterparty, funding_tx)
+                    .await;
+                if resp.send(result).is_err() {
+                    warn!(tenant = %self.tenant_id, "OpenChannelFinalize: caller dropped response receiver");
+                }
+            }
+
+            NodeCmd::ListChannels { resp } => {
+                if resp.send(node.list_channels().await).is_err() {
+                    warn!(tenant = %self.tenant_id, "ListChannels: caller dropped response receiver");
                 }
             }
 
