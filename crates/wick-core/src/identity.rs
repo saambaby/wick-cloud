@@ -4,8 +4,13 @@
 //! BIP39 mnemonic:
 //!
 //! - `seed` — first 32 bytes of the BIP39 64-byte seed, passed directly into
-//!   `LocalKeysManager` / `from_seed` (same path used by `ProvisionalWallet`
-//!   and `wick-server/factory.rs`).
+//!   `LocalKeysManager` / `from_seed` (LDK's `KeysManager` API requires
+//!   exactly 32 bytes).
+//!
+//! - `master_xprv` — BIP32 master private key derived from the full
+//!   BIP39 64-byte seed. Shared between the SDK's on-chain wallet
+//!   (`wick_sdk::OnchainWallet`) so both derive identical BIP84 / BIP86
+//!   keychains for a given mnemonic.
 //!
 //! - `identity_pubkey` — the compressed secp256k1 public key at the BIP84
 //!   first-external-receive path `m/84'/{coin}'/0'/0/0`. This is the key the
@@ -35,9 +40,14 @@ pub struct WickIdentity {
     /// Network this identity was derived for.
     pub network: WickNetwork,
     /// First 32 bytes of `mnemonic.to_seed("")` — the 32-byte seed passed to
-    /// `LocalKeysManager` / `from_seed`. Also used as the BDK wallet seed
-    /// (via `WickKitWallet::new(seed, network)`).
+    /// `LocalKeysManager` / `from_seed`. Required by LDK's `KeysManager` API
+    /// which takes exactly 32 bytes.
     pub seed: [u8; 32],
+    /// BIP32 master xprv derived from the full 64-byte BIP39 seed.
+    ///
+    /// Shared with `wick_sdk::OnchainWallet` — both derive identical BIP84 /
+    /// BIP86 keychains for a given mnemonic.
+    pub master_xprv: Xpriv,
     /// Compressed secp256k1 public key at `m/84'/{coin}'/0'/0/0`.
     /// Supplied as `pubkey_hex` in `CreateTenantRequest`.
     pub identity_pubkey: PublicKey,
@@ -76,7 +86,14 @@ impl WickIdentity {
         let identity_pubkey: PublicKey = Xpub::from_priv(&secp, &child).public_key;
         let tenant_id = TenantId::from_pubkey(&identity_pubkey.serialize());
 
-        Ok(Self { mnemonic, network, seed, identity_pubkey, tenant_id })
+        Ok(Self {
+            mnemonic,
+            network,
+            seed,
+            master_xprv: master,
+            identity_pubkey,
+            tenant_id,
+        })
     }
 
     /// Parse `phrase` as a BIP39 mnemonic, then derive a [`WickIdentity`].

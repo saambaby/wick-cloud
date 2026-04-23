@@ -75,8 +75,7 @@ impl WickNetwork {
     #[must_use]
     pub const fn default_faucet(self) -> Option<&'static str> {
         match self {
-            Self::Regtest => None,
-            Self::Signet => None,
+            Self::Regtest | Self::Signet => None,
             Self::Mutinynet => Some("https://faucet.mutinynet.com"),
         }
     }
