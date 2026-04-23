@@ -1,0 +1,34 @@
+# wick-server config — local regtest via docker-compose stack.
+#
+# Requires the full dev stack:
+#   just regtest-up
+#   cargo run --bin wick-server -- --config deploy/docker/config.regtest.toml
+
+database_url        = "postgres://wick:wick@localhost:5432/wick"
+max_db_connections  = 16
+metrics_addr        = "127.0.0.1:9464"
+grpc_addr           = "127.0.0.1:50051"
+memory_budget_bytes = 536870912   # 512 MiB
+network             = "regtest"
+esplora_url         = "http://localhost:3002"
+
+# OS assigns a random port per tenant. Avoids conflicts with any local
+# Lightning software already listening on 9735 or nearby ports.
+listen_port_base    = 0
+
+# Canonical BIP39 zero-entropy phrase — safe for local regtest only.
+server_mnemonic     = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+
+# ── Phase-2 park/wake tuning (all optional — defaults shown) ─────────────────
+# Uncomment and override for chaos runs or latency profiling.
+#
+# [park_wake]
+# wake_deadline_secs              = 2      # max wall-clock time for one wake
+# activity_poll_interval_secs     = 30     # how often the idle poller ticks
+# idle_threshold_secs             = 300    # 5 min idle before park candidate
+# max_error_attempts              = 5      # failures before ERROR state
+# error_recovery_interval_secs    = 60     # recovery probe interval
+# memory_evictor_interval_secs    = 10     # evictor tick interval
+# lru_eviction_threshold          = 0.80   # pressure to start LRU eviction
+# emergency_eviction_threshold    = 0.95   # pressure for force-park
+# evictor_target_pressure         = 0.70   # pressure target after eviction
