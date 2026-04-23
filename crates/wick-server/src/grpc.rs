@@ -13,6 +13,7 @@
 //! 4. Awaits the response and maps it to gRPC types.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
@@ -20,10 +21,13 @@ use tracing::{info, warn};
 use wick_core::TenantId;
 use wick_db::Pool;
 use wick_proto::wick::{
-    wallet_service_server::WalletService, CreateTenantRequest, CreateTenantResponse,
-    GetBalanceRequest, GetBalanceResponse, GetTransactionsRequest, GetTransactionsResponse,
-    Payment, ReceivePaymentRequest, ReceivePaymentResponse, SendPaymentRequest,
-    SendPaymentResponse,
+    wallet_service_server::WalletService, ChannelSummary as PbChannelSummary,
+    ConnectPeerRequest, ConnectPeerResponse, CreateTenantRequest, CreateTenantResponse,
+    GetBalanceRequest, GetBalanceResponse, GetNodeInfoRequest, GetNodeInfoResponse,
+    GetTransactionsRequest, GetTransactionsResponse, ListChannelsRequest, ListChannelsResponse,
+    OpenChannelFinalizeRequest, OpenChannelFinalizeResponse, OpenChannelInitRequest,
+    OpenChannelInitResponse, Payment, ReceivePaymentRequest, ReceivePaymentResponse,
+    SendPaymentRequest, SendPaymentResponse,
 };
 
 use crate::auth::Auth;
@@ -31,6 +35,12 @@ use crate::node::{
     manager::{DispatchError, NodeManager, ProvisionError},
     NodeCmd,
 };
+
+/// Timeout for `OpenChannelInit` to wait on LDK's `FundingGenerationReady`.
+/// The event typically fires within hundreds of milliseconds after
+/// `ChannelManager::create_channel`, but regtest + cold-peer handshake
+/// can push that out — 15s is generous.
+const OPEN_CHANNEL_INIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Translate a typed [`DispatchError`] into the appropriate gRPC
 /// `Status`. Preserves the Phase-2 error taxonomy so clients can tell
@@ -294,6 +304,196 @@ impl WalletService for WickGrpcService {
             .collect();
 
         Ok(Response::new(GetTransactionsResponse { payments }))
+    }
+
+    async fn get_node_info(
+        &self,
+        request: Request<GetNodeInfoRequest>,
+    ) -> Result<Response<GetNodeInfoResponse>, Status> {
+        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+
+        let (tx, rx) = oneshot::channel();
+        self.manager
+            .dispatch(tenant_id, NodeCmd::GetNodeInfo { resp: tx })
+            .await
+            .map_err(dispatch_error_to_status)?;
+
+        let (pubkey, listen) = rx
+            .await
+            .map_err(|_| Status::internal("node actor dropped the response channel"))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let (host, port) = match listen {
+            Some(addr) => (addr.ip().to_string(), u32::from(addr.port())),
+            None => (String::new(), 0),
+        };
+
+        Ok(Response::new(GetNodeInfoResponse {
+            node_id_hex: hex::encode(pubkey.serialize()),
+            listen_host: host,
+            listen_port: port,
+        }))
+    }
+
+    async fn connect_peer(
+        &self,
+        request: Request<ConnectPeerRequest>,
+    ) -> Result<Response<ConnectPeerResponse>, Status> {
+        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let req = request.into_inner();
+
+        let peer_bytes = hex::decode(&req.peer_pubkey_hex)
+            .map_err(|_| Status::invalid_argument("peer_pubkey_hex is not valid hex"))?;
+        let peer = bitcoin::secp256k1::PublicKey::from_slice(&peer_bytes)
+            .map_err(|_| Status::invalid_argument("peer_pubkey_hex is not a valid secp256k1 key"))?;
+
+        if req.host.is_empty() {
+            return Err(Status::invalid_argument("host is required"));
+        }
+        let port = u16::try_from(req.port)
+            .map_err(|_| Status::invalid_argument("port must fit in u16"))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.manager
+            .dispatch(
+                tenant_id,
+                NodeCmd::ConnectPeer {
+                    peer,
+                    host: req.host,
+                    port,
+                    resp: tx,
+                },
+            )
+            .await
+            .map_err(dispatch_error_to_status)?;
+
+        rx.await
+            .map_err(|_| Status::internal("node actor dropped the response channel"))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(ConnectPeerResponse {}))
+    }
+
+    async fn open_channel_init(
+        &self,
+        request: Request<OpenChannelInitRequest>,
+    ) -> Result<Response<OpenChannelInitResponse>, Status> {
+        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let req = request.into_inner();
+
+        let peer_bytes = hex::decode(&req.peer_pubkey_hex)
+            .map_err(|_| Status::invalid_argument("peer_pubkey_hex is not valid hex"))?;
+        let peer = bitcoin::secp256k1::PublicKey::from_slice(&peer_bytes)
+            .map_err(|_| Status::invalid_argument("peer_pubkey_hex is not a valid secp256k1 key"))?;
+
+        if req.channel_value_sat == 0 {
+            return Err(Status::invalid_argument("channel_value_sat must be > 0"));
+        }
+
+        let (tx, rx) = oneshot::channel();
+        self.manager
+            .dispatch(
+                tenant_id,
+                NodeCmd::OpenChannelInit {
+                    peer,
+                    value_sat: req.channel_value_sat,
+                    push_msat: req.push_msat,
+                    timeout: OPEN_CHANNEL_INIT_TIMEOUT,
+                    resp: tx,
+                },
+            )
+            .await
+            .map_err(dispatch_error_to_status)?;
+
+        let (temp_id, pending) = rx
+            .await
+            .map_err(|_| Status::internal("node actor dropped the response channel"))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(OpenChannelInitResponse {
+            temp_channel_id: temp_id.0.to_vec(),
+            funding_output_script_hex: hex::encode(pending.output_script.as_bytes()),
+            channel_value_sat: pending.value_sat,
+        }))
+    }
+
+    async fn open_channel_finalize(
+        &self,
+        request: Request<OpenChannelFinalizeRequest>,
+    ) -> Result<Response<OpenChannelFinalizeResponse>, Status> {
+        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let req = request.into_inner();
+
+        if req.temp_channel_id.len() != 32 {
+            return Err(Status::invalid_argument("temp_channel_id must be 32 bytes"));
+        }
+        let mut tcid = [0u8; 32];
+        tcid.copy_from_slice(&req.temp_channel_id);
+        let temp_channel_id = lightning::ln::types::ChannelId(tcid);
+
+        let peer_bytes = hex::decode(&req.peer_pubkey_hex)
+            .map_err(|_| Status::invalid_argument("peer_pubkey_hex is not valid hex"))?;
+        let peer = bitcoin::secp256k1::PublicKey::from_slice(&peer_bytes)
+            .map_err(|_| Status::invalid_argument("peer_pubkey_hex is not a valid secp256k1 key"))?;
+
+        let tx_bytes = hex::decode(&req.funding_tx_hex)
+            .map_err(|_| Status::invalid_argument("funding_tx_hex is not valid hex"))?;
+        let funding_tx: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&tx_bytes).map_err(|e| {
+                Status::invalid_argument(format!("funding_tx_hex is not a valid bitcoin tx: {e}"))
+            })?;
+
+        let (tx, rx) = oneshot::channel();
+        self.manager
+            .dispatch(
+                tenant_id,
+                NodeCmd::OpenChannelFinalize {
+                    temp_channel_id,
+                    counterparty: peer,
+                    funding_tx,
+                    resp: tx,
+                },
+            )
+            .await
+            .map_err(dispatch_error_to_status)?;
+
+        rx.await
+            .map_err(|_| Status::internal("node actor dropped the response channel"))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(OpenChannelFinalizeResponse {}))
+    }
+
+    async fn list_channels(
+        &self,
+        request: Request<ListChannelsRequest>,
+    ) -> Result<Response<ListChannelsResponse>, Status> {
+        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+
+        let (tx, rx) = oneshot::channel();
+        self.manager
+            .dispatch(tenant_id, NodeCmd::ListChannels { resp: tx })
+            .await
+            .map_err(dispatch_error_to_status)?;
+
+        let channels = rx
+            .await
+            .map_err(|_| Status::internal("node actor dropped the response channel"))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let channels = channels
+            .into_iter()
+            .map(|c| PbChannelSummary {
+                channel_id: c.channel_id,
+                counterparty_pubkey_hex: hex::encode(c.counterparty.serialize()),
+                capacity_sat: c.capacity_sat,
+                outbound_capacity_msat: c.outbound_capacity_msat,
+                inbound_capacity_msat: c.inbound_capacity_msat,
+                is_usable: c.is_usable,
+            })
+            .collect();
+
+        Ok(Response::new(ListChannelsResponse { channels }))
     }
 }
 

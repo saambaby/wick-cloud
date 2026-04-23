@@ -16,7 +16,41 @@ default = ["std"]
 std = []
 ffi = []
 wasm = []
+# Regtest helpers — bitcoind JSON-RPC client + polling utilities for
+# local dev workflows. Off by default; never built into a production SDK.
+regtest = ["dep:bitcoincore-rpc"]
 
 [dependencies]
-wick-core = { workspace = true }
-thiserror = { workspace = true }
+wick-core      = { workspace = true }
+wick-proto     = { workspace = true }
+thiserror      = { workspace = true }
+tonic          = { workspace = true }
+prost          = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+hex            = { workspace = true }
+parking_lot    = { workspace = true }
+async-trait    = { workspace = true }
+
+# keys / BIP39
+bip39          = { workspace = true }
+bitcoin        = { workspace = true }
+secp256k1      = { workspace = true }
+zeroize        = { workspace = true }
+
+# on-chain wallet + chain
+bdk_wallet     = { workspace = true }
+bdk_esplora    = { workspace = true }
+esplora-client = { workspace = true }
+
+# optional — only enabled by the `regtest` feature
+bitcoincore-rpc = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process"] }
+rand  = { workspace = true }
+
+[[test]]
+name = "regtest_flow"
+path = "tests/regtest_flow.rs"
+required-features = ["regtest"]

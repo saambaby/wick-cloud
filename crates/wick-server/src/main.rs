@@ -1,6 +1,7 @@
 //! `wick-server` binary entry point.
 //!
-//! Phase 1: multi-tenant actor model.
+//! Phase 2: park/wake lifecycle — activity poller, memory evictor, and error
+//! recovery loops run in the background.
 //! Boots the `NodeManager`, gRPC server, and Prometheus metrics endpoint.
 //!
 //! All application logic lives in `lib.rs`; this file is a thin boot shim.
@@ -8,25 +9,21 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use tonic::transport::Server;
 use tracing::info;
-use wick_core::{config, metrics, tracing_init};
+use wick_core::{config, metrics, tracing_init, WickIdentity, WickNetwork};
 use wick_db::Pool;
 use wick_proto::wick::wallet_service_server::WalletServiceServer;
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use wick_lightning::{
-    from_seed, EsploraBroadcaster, EsploraChainClient, FeeEstimator, LocalKeysManager, NodeApi,
-    NodeBuilder, NodeDeps, TracingLogger,
-};
+use wick_lightning::{EsploraBroadcaster, EsploraChainClient, FeeEstimator, NodeDeps, TracingLogger};
+
 use wick_server::{
+    factory,
     grpc::WickGrpcService,
-    node::manager::{ManagerConfig, NodeFactory, NodeManager},
+    node::manager::{ManagerConfig, NodeManager},
 };
-use wick_core::TenantId;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -42,21 +39,102 @@ struct Config {
     /// Total memory budget for node actors (bytes). Default: 512 MiB.
     #[serde(default = "default_memory_budget_bytes")]
     memory_budget_bytes: usize,
-    /// Esplora HTTP endpoint. Regtest default is a local compose service.
-    #[serde(default = "default_esplora_url")]
-    esplora_url: String,
-    /// Bitcoin network (`mainnet` / `testnet` / `signet` / `regtest`).
-    #[serde(default = "default_network")]
-    network: String,
-    /// 32-byte hex master seed. The server derives per-tenant seeds as
-    /// `HMAC-SHA256(master_seed, tenant_id.to_string())` → the first 32
-    /// bytes of the output. Required — the binary refuses to boot without
-    /// it. Phase 4 replaces this with a remote VLS signer handle.
-    regtest_seed_hex: String,
+    /// Bitcoin network (`regtest` / `signet` / `mutinynet`). Default: `mutinynet`.
+    ///
+    /// Per-network defaults (Esplora URL, RGS URL, seed peers) are derived from
+    /// [`WickNetwork`] and can be overridden individually.
+    #[serde(default)]
+    network: WickNetwork,
+    /// Esplora HTTP endpoint. Omit to use the per-network default from
+    /// [`WickNetwork::default_esplora`].
+    #[serde(default)]
+    esplora_url: Option<String>,
+    /// BIP39 mnemonic for the server master seed (12 or 24 words).
+    ///
+    /// The master seed is the first 32 bytes of `mnemonic.to_seed("")`.
+    /// Phase 4 replaces this entirely with a remote VLS signer handle.
+    server_mnemonic: String,
     /// Base port for per-tenant P2P Lightning listeners. Each tenant binds
     /// `0.0.0.0:{base + tenant_id}`. `0` means let the OS pick a port.
     #[serde(default)]
     listen_port_base: Option<u16>,
+    /// Phase-2 park/wake tuning. All fields are optional; defaults in
+    /// [`ManagerConfig::default()`] are used for any omitted key.
+    #[serde(default)]
+    park_wake: ParkWakeConfig,
+}
+
+/// Phase-2 park/wake tuning knobs exposed through TOML. Maps 1-to-1 onto
+/// [`ManagerConfig`] fields; all are optional with sensible defaults.
+#[derive(Debug, Default, Deserialize)]
+struct ParkWakeConfig {
+    /// Maximum wall-clock duration for a single wake (seconds). Default: 2.
+    #[serde(default)]
+    wake_deadline_secs: Option<u64>,
+    /// Interval between activity-poller ticks (seconds). Default: 30.
+    #[serde(default)]
+    activity_poll_interval_secs: Option<u64>,
+    /// Minimum idle duration before a tenant becomes a park candidate (seconds). Default: 300.
+    #[serde(default)]
+    idle_threshold_secs: Option<u64>,
+    /// Max consecutive failed wakes before transitioning to ERROR. Default: 5.
+    #[serde(default)]
+    max_error_attempts: Option<u8>,
+    /// Interval between error-recovery probe ticks (seconds). Default: 60.
+    #[serde(default)]
+    error_recovery_interval_secs: Option<u64>,
+    /// Interval between memory-evictor ticks (seconds). Default: 10.
+    #[serde(default)]
+    memory_evictor_interval_secs: Option<u64>,
+    /// LRU eviction pressure threshold (0.0–1.0). Default: 0.80.
+    #[serde(default)]
+    lru_eviction_threshold: Option<f64>,
+    /// Emergency eviction pressure threshold (0.0–1.0). Default: 0.95.
+    #[serde(default)]
+    emergency_eviction_threshold: Option<f64>,
+    /// Target pressure the evictor aims for after a tick (0.0–1.0). Default: 0.70.
+    #[serde(default)]
+    evictor_target_pressure: Option<f64>,
+}
+
+impl ParkWakeConfig {
+    fn apply(&self, base: ManagerConfig, memory_budget_bytes: usize) -> ManagerConfig {
+        use std::time::Duration;
+        ManagerConfig {
+            memory_budget_bytes,
+            wake_deadline: self
+                .wake_deadline_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.wake_deadline),
+            activity_poll_interval: self
+                .activity_poll_interval_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.activity_poll_interval),
+            idle_threshold: self
+                .idle_threshold_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.idle_threshold),
+            max_error_attempts: self.max_error_attempts.unwrap_or(base.max_error_attempts),
+            error_recovery_interval: self
+                .error_recovery_interval_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.error_recovery_interval),
+            memory_evictor_interval: self
+                .memory_evictor_interval_secs
+                .map(Duration::from_secs)
+                .unwrap_or(base.memory_evictor_interval),
+            lru_eviction_threshold: self
+                .lru_eviction_threshold
+                .unwrap_or(base.lru_eviction_threshold),
+            emergency_eviction_threshold: self
+                .emergency_eviction_threshold
+                .unwrap_or(base.emergency_eviction_threshold),
+            evictor_target_pressure: self
+                .evictor_target_pressure
+                .unwrap_or(base.evictor_target_pressure),
+            ..base
+        }
+    }
 }
 
 fn default_max_db_connections() -> u32 {
@@ -77,46 +155,11 @@ fn default_memory_budget_bytes() -> usize {
     512 * 1024 * 1024 // 512 MiB
 }
 
-fn default_esplora_url() -> String {
-    "http://localhost:3002".to_owned()
-}
-
-fn default_network() -> String {
-    "regtest".to_owned()
-}
-
-/// Parse a hex-encoded 32-byte master seed.
-fn parse_master_seed(hex_str: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(hex_str.trim())
-        .map_err(|e| anyhow::anyhow!("regtest_seed_hex must be valid hex: {e}"))?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("regtest_seed_hex must decode to exactly 32 bytes"))
-}
-
-/// Derive a deterministic per-tenant 32-byte seed from a master seed.
-///
-/// Uses HMAC-SHA256 keyed on the master seed with the tenant id as
-/// message. The resulting tag is already 32 bytes, so we return it
-/// directly. Distinct tenants → distinct seeds → distinct Lightning node
-/// ids; same (master_seed, tenant_id) always reproduces the same signer,
-/// which is what lets `NodeBuilder`'s restart load path reattach to
-/// previously-persisted channel state.
-fn derive_tenant_seed(master_seed: &[u8; 32], tenant_id: TenantId) -> [u8; 32] {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(master_seed).expect("HMAC accepts any key length");
-    mac.update(tenant_id.to_string().as_bytes());
-    mac.finalize().into_bytes().into()
-}
-
-fn parse_network(s: &str) -> Result<bitcoin::Network> {
-    match s.to_lowercase().as_str() {
-        "mainnet" | "bitcoin" => Ok(bitcoin::Network::Bitcoin),
-        "testnet" => Ok(bitcoin::Network::Testnet),
-        "signet" => Ok(bitcoin::Network::Signet),
-        "regtest" => Ok(bitcoin::Network::Regtest),
-        other => Err(anyhow::anyhow!("unsupported network: {other}")),
-    }
+/// Resolve the 32-byte master seed from the configured BIP39 mnemonic.
+fn resolve_master_seed(cfg: &Config) -> Result<[u8; 32]> {
+    let identity = WickIdentity::from_phrase(&cfg.server_mnemonic, cfg.network)
+        .context("server_mnemonic is not a valid BIP39 phrase")?;
+    Ok(identity.seed)
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -137,19 +180,21 @@ async fn main() -> Result<()> {
 
     // Build the shared LDK dependencies once. Per-tenant nodes clone these
     // Arcs — see `wick_lightning::NodeDeps`.
-    let network = parse_network(&cfg.network)?;
-    let esplora = Arc::new(EsploraChainClient::new(&cfg.esplora_url, network)?);
+    let esplora_url = cfg.esplora_url
+        .as_deref()
+        .unwrap_or(cfg.network.default_esplora());
+    let esplora = Arc::new(EsploraChainClient::new(esplora_url, cfg.network)?);
     let broadcaster = Arc::new(EsploraBroadcaster::new(esplora.esplora()));
     let fee_estimator = Arc::new(FeeEstimator::new());
     let logger = Arc::new(TracingLogger);
 
-    // NOTE: `wick-lightning` no longer carries seed material. For regtest /
-    // staging the seed-to-signer construction happens at tenant provisioning
-    // via `wick-testkit::signer` (Phase-1 path) or a VLS signer in Phase-4.
-    // Any `regtest_seed_hex` field in config is now ignored at the server
-    // boundary — the seed flows through the provisioner, not the shared deps.
+    // `wick-lightning` no longer carries seed material. The master seed
+    // is resolved from `server_mnemonic` below and flows to the node
+    // factory, which derives per-tenant seeds; Phase 4 replaces the
+    // factory with a VLS-backed closure and removes seed-at-rest entirely.
     let deps = NodeDeps {
         pg_pool: pool.raw().clone(),
+        network: cfg.network,
         esplora,
         broadcaster,
         fee_estimator,
@@ -158,41 +203,29 @@ async fn main() -> Result<()> {
         listen_port_base: cfg.listen_port_base.unwrap_or(wick_lightning::DEFAULT_LISTEN_PORT_BASE),
     };
 
-    // Real LocalKeysManager-backed factory. Derives a per-tenant 32-byte
-    // seed via HMAC-SHA256(master_seed, tenant_id) so every tenant has a
-    // distinct, deterministic signer without the server persisting any
-    // per-tenant key material. Phase 4 flips this to a remote VLS signer
-    // factory — the `NodeFactory` closure shape is unchanged.
-    let master_seed = parse_master_seed(&cfg.regtest_seed_hex)?;
-    let factory: NodeFactory = Arc::new(move |tenant_id, deps| {
-        let tenant_seed = derive_tenant_seed(&master_seed, tenant_id);
-        Box::pin(async move {
-            let signer = Arc::new(from_seed(tenant_seed));
-            let node = NodeBuilder::<LocalKeysManager>::new(tenant_id, deps)
-                .with_signer(signer)
-                .build()
-                .await?;
-            let node: Arc<dyn NodeApi> = node;
-            Ok(node)
-        })
-    });
+    let master_seed = resolve_master_seed(&cfg)?;
+    let factory = factory::node_factory(master_seed, deps);
 
-    let manager = Arc::new(NodeManager::new(
-        ManagerConfig {
-            memory_budget_bytes: cfg.memory_budget_bytes,
-            ..ManagerConfig::default()
-        },
-        deps,
-        factory,
-    ));
-
-    let grpc_service = WickGrpcService::new(manager.clone(), pool.clone());
-
+    let manager_config = cfg.park_wake.apply(ManagerConfig::default(), cfg.memory_budget_bytes);
     info!(
         grpc = %cfg.grpc_addr,
         metrics = %cfg.metrics_addr,
-        "wick-server online (phase 1 — multi-tenant actor model)"
+        memory_budget_mib = manager_config.memory_budget_bytes / (1024 * 1024),
+        idle_threshold_secs = manager_config.idle_threshold.as_secs(),
+        wake_deadline_ms = manager_config.wake_deadline.as_millis(),
+        activity_poll_secs = manager_config.activity_poll_interval.as_secs(),
+        error_recovery_secs = manager_config.error_recovery_interval.as_secs(),
+        "wick-server online (phase 2 — park/wake lifecycle)"
     );
+
+    let manager = Arc::new(NodeManager::new(manager_config, factory));
+
+    // Phase-2 background loops. Retained so they can be aborted on shutdown.
+    let poller_handle = manager.clone().spawn_activity_poller();
+    let evictor_handle = manager.clone().spawn_memory_evictor();
+    let recovery_handle = manager.clone().spawn_error_recovery();
+
+    let grpc_service = WickGrpcService::new(manager.clone(), pool.clone());
 
     tokio::select! {
         result = Server::builder()
@@ -205,6 +238,11 @@ async fn main() -> Result<()> {
             info!("wick-server shutting down");
         }
     }
+
+    // Stop background loops before shutting down actors.
+    poller_handle.abort();
+    evictor_handle.abort();
+    recovery_handle.abort();
 
     manager.shutdown_all().await;
     info!("all node actors stopped — goodbye");

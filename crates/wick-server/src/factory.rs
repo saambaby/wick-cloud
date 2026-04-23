@@ -3,9 +3,15 @@
 //! The server holds a single 32-byte master seed (resolved from
 //! `server_mnemonic` in [`crate::main`]) and derives a per-tenant seed via
 //! `HMAC-SHA256(master, tenant_id)`. This is explicitly temporary: Phase 4
-//! replaces the master seed entirely with a remote VLS signer. The `NodeFactory`
-//! type alias and `node_factory` signature are unchanged; only the closure body
-//! differs at that point.
+//! replaces the master seed entirely with a remote VLS signer.
+//!
+//! The server is **not** custodial of channel-funding UTXOs. Channel opens
+//! use the two-phase `OpenChannelInit` / `OpenChannelFinalize` gRPC flow:
+//! the client builds + signs the funding tx on its own BDK wallet and
+//! hands it to the server, which passes it straight to LDK's
+//! `ChannelManager::funding_transaction_generated`. The node never holds
+//! on-chain keys beyond the LDK signing keys (`LocalKeysManager`) that
+//! Phase 4 VLS will move on-device.
 
 use std::sync::Arc;
 
@@ -29,7 +35,8 @@ fn derive_tenant_seed(master: &[u8; 32], tenant_id: TenantId) -> [u8; 32] {
 }
 
 /// Build a `NodeFactory` that derives per-tenant seeds from the server's
-/// BIP39-derived `master_seed` and captures the shared [`NodeDeps`] via closure.
+/// BIP39-derived `master_seed` and captures the shared [`NodeDeps`] via
+/// closure.
 ///
 /// Phase 4 replaces this entire factory with a VLS-backed closure — the
 /// server no longer holds seed material at that point. Callers pass the

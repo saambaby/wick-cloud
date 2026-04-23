@@ -1,0 +1,277 @@
+//! Top-level [`WickClient`] — composes identity, on-chain wallet, chain
+//! client, and Lightning gRPC client.
+//!
+//! Construction is one call: [`WickClient::new`] takes a BIP39 mnemonic
+//! plus a [`crate::WickConfig`] and does every derivation + dial in one
+//! go. [`WickClient::register`] then provisions a tenant on the server
+//! and stores the returned bearer token internally; subsequent RPC calls
+//! authenticate automatically via a tonic interceptor that reads the
+//! shared token cell on every request.
+//!
+//! `WickClient` is `Clone` — internals live behind `Arc`s. Clones share
+//! the same token cell, so a rotation via [`WickClient::with_token`] on
+//! any clone is visible to all.
+
+use std::sync::Arc;
+
+use bitcoin::secp256k1::PublicKey;
+use bitcoin::{Address, Transaction, Txid};
+use parking_lot::RwLock;
+
+use crate::chain::EsploraChain;
+use crate::config::WickConfig;
+use crate::error::Result;
+use crate::grpc::{empty_token, LightningClient, SharedToken};
+use crate::identity::Identity;
+use crate::types::{
+    Balance, ChannelSummary, CreateTenantOutcome, NodeInfo, PaymentRecord, PaymentResult,
+    ReceiveInvoice,
+};
+use crate::wallet::OnchainWallet;
+
+/// Canonical Wick Cloud client.
+#[derive(Debug, Clone)]
+pub struct WickClient {
+    inner: Arc<Inner>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    identity: Identity,
+    wallet: OnchainWallet,
+    chain: EsploraChain,
+    ln: LightningClient,
+    config: WickConfig,
+    token: SharedToken,
+    tenant_id: RwLock<Option<String>>,
+}
+
+impl WickClient {
+    /// Build a client from a BIP39 mnemonic.
+    ///
+    /// Hits the network once — to open the gRPC channel to
+    /// `config.server_endpoint`. Key derivation, wallet construction, and
+    /// Esplora client setup are offline.
+    pub async fn new(
+        mnemonic: &str,
+        passphrase: Option<&str>,
+        config: WickConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+
+        let identity = Identity::from_mnemonic(mnemonic, passphrase, config.network)?;
+        let wallet = OnchainWallet::from_xprv(identity.master_xprv(), &config)?;
+        let chain = EsploraChain::new(&config.esplora_url)?;
+
+        let token = empty_token();
+        let ln = LightningClient::connect(&config.server_endpoint, Arc::clone(&token)).await?;
+
+        Ok(Self {
+            inner: Arc::new(Inner {
+                identity,
+                wallet,
+                chain,
+                ln,
+                config,
+                token,
+                tenant_id: RwLock::new(None),
+            }),
+        })
+    }
+
+    // ── Identity ─────────────────────────────────────────────────────────────
+
+    /// 33-byte compressed secp256k1 identity pubkey.
+    #[must_use]
+    pub fn node_id(&self) -> PublicKey {
+        self.inner.identity.node_id()
+    }
+
+    /// 4-byte BIP32 master fingerprint.
+    #[must_use]
+    pub fn xpub_fingerprint(&self) -> [u8; 4] {
+        self.inner.identity.fingerprint()
+    }
+
+    /// Hex-encoded identity pubkey (as sent in `CreateTenantRequest`).
+    #[must_use]
+    pub fn node_id_hex(&self) -> String {
+        self.inner.identity.node_id_hex()
+    }
+
+    /// The tenant id returned by the server at [`Self::register`] time,
+    /// or `None` if the client has not yet registered.
+    #[must_use]
+    pub fn tenant_id(&self) -> Option<String> {
+        self.inner.tenant_id.read().clone()
+    }
+
+    // ── Server registration + Lightning RPCs ─────────────────────────────────
+
+    /// Provision a tenant on the server and attach the returned bearer token.
+    ///
+    /// Idempotent — the server rotates the token on re-register with the
+    /// same pubkey (upsert semantics). The SDK stores the new token and
+    /// overwrites any previous one.
+    pub async fn register(&self, plan_tier: impl Into<String>) -> Result<CreateTenantOutcome> {
+        let pubkey_hex = self.inner.identity.node_id_hex();
+        let outcome = self
+            .inner
+            .ln
+            .create_tenant(&pubkey_hex, &plan_tier.into())
+            .await?;
+        *self.inner.token.write() = Some(outcome.api_token.clone());
+        *self.inner.tenant_id.write() = Some(outcome.tenant_id.clone());
+        Ok(outcome)
+    }
+
+    /// Current Lightning + server-side on-chain balance.
+    pub async fn lightning_balance(&self) -> Result<Balance> {
+        self.inner.ln.get_balance().await
+    }
+
+    /// Pay a BOLT11 invoice.
+    pub async fn send_payment(&self, bolt11: &str) -> Result<PaymentResult> {
+        self.inner.ln.send_payment(bolt11).await
+    }
+
+    /// Issue a BOLT11 invoice. `amount_msat = None` produces an
+    /// any-amount invoice.
+    pub async fn receive_payment(
+        &self,
+        amount_msat: Option<u64>,
+        memo: impl Into<String>,
+    ) -> Result<ReceiveInvoice> {
+        self.inner.ln.receive_payment(amount_msat, &memo.into()).await
+    }
+
+    /// Paginated payment history, newest first.
+    pub async fn transactions(
+        &self,
+        limit: u32,
+        before_timestamp: Option<i64>,
+    ) -> Result<Vec<PaymentRecord>> {
+        self.inner.ln.get_transactions(limit, before_timestamp).await
+    }
+
+    /// Server-side Lightning node info — pubkey + P2P listen address.
+    /// Required so other clients can [`Self::connect_peer`] to this tenant.
+    pub async fn node_info(&self) -> Result<NodeInfo> {
+        self.inner.ln.get_node_info().await
+    }
+
+    /// Connect to a Lightning peer over P2P and persist it for reconnection.
+    pub async fn connect_peer(
+        &self,
+        peer: PublicKey,
+        host: &str,
+        port: u16,
+    ) -> Result<()> {
+        self.inner.ln.connect_peer(peer, host, port).await
+    }
+
+    /// Open an outbound channel to an already-connected peer, building and
+    /// signing the funding transaction on the **client's** BDK wallet.
+    ///
+    /// Two-phase self-custodial open:
+    /// 1. Ask the server to start the channel. Server returns the 2-of-2
+    ///    multisig `output_script` + exact `value` LDK wants.
+    /// 2. Build + sign a BDK transaction paying `value` to that script
+    ///    using the SDK's own on-chain wallet. The SDK's BDK wallet must
+    ///    have sufficient confirmed UTXOs — call
+    ///    [`Self::sync_onchain`] after funding to pick them up.
+    /// 3. Send the signed tx to the server, which hands it to LDK's
+    ///    `ChannelManager::funding_transaction_generated`.
+    ///
+    /// The server never touches on-chain funds. Phase 4 VLS moves the
+    /// LDK signing keys on-device too.
+    pub async fn open_channel(
+        &self,
+        peer: PublicKey,
+        channel_value_sat: u64,
+        push_msat: u64,
+    ) -> Result<[u8; 32]> {
+        let (temp_channel_id, output_script, value_sat) = self
+            .inner
+            .ln
+            .open_channel_init(peer, channel_value_sat, push_msat)
+            .await?;
+
+        let funding_tx = self
+            .inner
+            .wallet
+            .build_and_sign_funding(output_script, value_sat)?;
+
+        self.inner
+            .ln
+            .open_channel_finalize(temp_channel_id, peer, &funding_tx)
+            .await?;
+
+        Ok(temp_channel_id)
+    }
+
+    /// Snapshot of the tenant's current channels.
+    pub async fn list_channels(&self) -> Result<Vec<ChannelSummary>> {
+        self.inner.ln.list_channels().await
+    }
+
+    // ── On-chain (BDK + Esplora, bypasses the server) ────────────────────────
+
+    /// Sync both BIP84 and BIP86 descriptors against the configured
+    /// Esplora URL. `full_scan` on first call, incremental afterwards.
+    pub async fn sync_onchain(&self) -> Result<()> {
+        self.inner
+            .wallet
+            .sync(&self.inner.config.esplora_url, &self.inner.config)
+            .await
+    }
+
+    /// Next unused P2WPKH (BIP84) external address.
+    pub fn next_address_p2wpkh(&self) -> Result<Address> {
+        self.inner.wallet.next_address_p2wpkh()
+    }
+
+    /// Next unused P2TR (BIP86) external address.
+    pub fn next_address_p2tr(&self) -> Result<Address> {
+        self.inner.wallet.next_address_p2tr()
+    }
+
+    /// Device-side confirmed + trusted-pending balance, summed across
+    /// both descriptors. Call [`Self::sync_onchain`] first for fresh data.
+    pub fn onchain_spendable_sat(&self) -> Result<u64> {
+        self.inner.wallet.spendable_sat()
+    }
+
+    /// Broadcast a signed transaction via the public Esplora endpoint.
+    pub async fn broadcast_transaction(&self, tx: &Transaction) -> Result<()> {
+        self.inner.chain.broadcast(tx).await
+    }
+
+    /// Fetch a transaction by id via the public Esplora endpoint.
+    pub async fn get_transaction(&self, txid: Txid) -> Result<Option<Transaction>> {
+        self.inner.chain.get_tx(txid).await
+    }
+
+    /// Fee-rate estimates from the public Esplora endpoint, keyed by
+    /// block target (sat/vB).
+    pub async fn fee_estimates(&self) -> Result<std::collections::HashMap<u16, f64>> {
+        self.inner.chain.fee_estimates().await
+    }
+
+    // ── Escape hatches ───────────────────────────────────────────────────────
+
+    /// Manually attach a bearer token. Rotates in place on the shared
+    /// cell — all clones of this client see the new token on their next
+    /// RPC.
+    #[must_use]
+    pub fn with_token(self, token: impl Into<String>) -> Self {
+        *self.inner.token.write() = Some(token.into());
+        self
+    }
+
+    /// Clear the bearer token. The next RPC will be anonymous (and the
+    /// server will reject it with `UNAUTHENTICATED`).
+    pub fn clear_token(&self) {
+        *self.inner.token.write() = None;
+    }
+}

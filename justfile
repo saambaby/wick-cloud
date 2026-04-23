@@ -44,6 +44,7 @@ ci-local:
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --all-features
+    RUSTFLAGS="--cfg loom" cargo test -p wick-loom-models --release
     cargo deny check
     cargo audit
 
@@ -64,6 +65,12 @@ demo:
 # Boot server against mutinynet (default dev target — no local daemon needed, just postgres-up).
 mutinynet-dev:
     cargo run --bin wick-server -- --config deploy/docker/config.dev.toml
+
+# Phase 2 acceptance demo: park/wake concurrency + latency snapshot against
+# an in-process stub (no Postgres / LDK / Esplora). Prints p50/p95/p99 wake
+# latency for a concurrent wake storm and the final state breakdown.
+park-wake-demo:
+    cargo run --release --example park_wake_demo -p wick-server
 
 # Loom model: verify park/wake CAS + memory invariants under all interleavings.
 # Runs without the dev stack — pure in-process model checker.

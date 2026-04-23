@@ -24,6 +24,28 @@ service WalletService {
 
   // GetTransactions returns paginated payment history for a tenant.
   rpc GetTransactions(GetTransactionsRequest) returns (GetTransactionsResponse);
+
+  // GetNodeInfo returns the tenant's Lightning node pubkey and listen address.
+  // Required by other clients who want to ConnectPeer to this tenant.
+  rpc GetNodeInfo(GetNodeInfoRequest) returns (GetNodeInfoResponse);
+
+  // ConnectPeer establishes a persistent P2P connection to a Lightning peer.
+  rpc ConnectPeer(ConnectPeerRequest) returns (ConnectPeerResponse);
+
+  // OpenChannelInit starts an outbound channel open and returns the
+  // funding output script + channel value so the client can build a
+  // funding tx from its own BDK wallet. Two-phase self-custodial flow:
+  // call Init, build+sign tx on the client side, call Finalize with the
+  // signed tx.
+  rpc OpenChannelInit(OpenChannelInitRequest) returns (OpenChannelInitResponse);
+
+  // OpenChannelFinalize completes an outbound channel open by handing
+  // LDK a pre-signed funding transaction. The temp_channel_id must match
+  // the one returned from a prior OpenChannelInit.
+  rpc OpenChannelFinalize(OpenChannelFinalizeRequest) returns (OpenChannelFinalizeResponse);
+
+  // ListChannels returns a snapshot of the tenant's current channels.
+  rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
 }
 
 // ── CreateTenant ─────────────────────────────────────────────────────────────
@@ -139,4 +161,113 @@ message Payment {
 
   // Optional memo attached to the invoice.
   optional string memo = 7;
+}
+
+// ── GetNodeInfo ───────────────────────────────────────────────────────────────
+
+message GetNodeInfoRequest {
+  uint64 tenant_id = 1;  // unused — auth header carries identity
+}
+
+message GetNodeInfoResponse {
+  // 33-byte compressed SEC1 pubkey of the tenant's LDK node, hex-encoded.
+  string node_id_hex = 1;
+
+  // Host the P2P listener bound to (typically 127.0.0.1 on regtest).
+  string listen_host = 2;
+
+  // Port the P2P listener bound to. Zero means the node has no listener.
+  uint32 listen_port = 3;
+}
+
+// ── ConnectPeer ───────────────────────────────────────────────────────────────
+
+message ConnectPeerRequest {
+  uint64 tenant_id = 1;
+
+  // 33-byte compressed SEC1 pubkey of the peer, hex-encoded.
+  string peer_pubkey_hex = 2;
+
+  // Peer host (IP address or hostname).
+  string host = 3;
+
+  // Peer TCP port.
+  uint32 port = 4;
+}
+
+message ConnectPeerResponse {}
+
+// ── OpenChannelInit ───────────────────────────────────────────────────────────
+
+message OpenChannelInitRequest {
+  uint64 tenant_id = 1;
+
+  // Peer pubkey hex. Must already be connected via ConnectPeer.
+  string peer_pubkey_hex = 2;
+
+  // Channel capacity in satoshis.
+  uint64 channel_value_sat = 3;
+
+  // Amount pushed to the counterparty at open time (millisatoshis).
+  uint64 push_msat = 4;
+}
+
+message OpenChannelInitResponse {
+  // 32-byte temporary_channel_id — opaque handle for OpenChannelFinalize.
+  bytes temp_channel_id = 1;
+
+  // 2-of-2 multisig scriptPubKey the funding tx must pay to. Hex-encoded
+  // raw script bytes.
+  string funding_output_script_hex = 2;
+
+  // Exact amount (sats) the funding tx must pay to funding_output_script.
+  uint64 channel_value_sat = 3;
+}
+
+// ── OpenChannelFinalize ───────────────────────────────────────────────────────
+
+message OpenChannelFinalizeRequest {
+  uint64 tenant_id = 1;
+
+  // Temp channel id returned from OpenChannelInit.
+  bytes temp_channel_id = 2;
+
+  // Peer pubkey hex (same value passed to OpenChannelInit).
+  string peer_pubkey_hex = 3;
+
+  // Hex-encoded serialised bitcoin::Transaction paying `channel_value_sat`
+  // to the `funding_output_script` from the init response.
+  string funding_tx_hex = 4;
+}
+
+message OpenChannelFinalizeResponse {}
+
+// ── ListChannels ──────────────────────────────────────────────────────────────
+
+message ListChannelsRequest {
+  uint64 tenant_id = 1;
+}
+
+message ListChannelsResponse {
+  repeated ChannelSummary channels = 1;
+}
+
+message ChannelSummary {
+  // 32-byte channel id.
+  bytes channel_id = 1;
+
+  // 33-byte compressed SEC1 pubkey of the counterparty, hex-encoded.
+  string counterparty_pubkey_hex = 2;
+
+  // Total channel capacity in satoshis.
+  uint64 capacity_sat = 3;
+
+  // Local outbound capacity in millisatoshis.
+  uint64 outbound_capacity_msat = 4;
+
+  // Remote balance available to receive in millisatoshis.
+  uint64 inbound_capacity_msat = 5;
+
+  // `true` once the channel is funded, confirmed, and ready for payments.
+  bool is_usable = 6;
 }

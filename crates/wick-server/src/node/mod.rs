@@ -26,6 +26,7 @@
 
 pub mod actor;
 pub mod admission;
+pub mod event_buffer;
 pub mod manager;
 
 use std::sync::{ atomic::{ AtomicU64, AtomicU8 }, Arc, RwLock };

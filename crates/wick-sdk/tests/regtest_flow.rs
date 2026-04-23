@@ -1,0 +1,362 @@
+//! End-to-end SDK integration test against a real, out-of-process
+//! `wick-server` binary.
+//!
+//! Everything tenant-facing goes through [`wick_sdk::WickClient`] over
+//! gRPC against a subprocess server — no in-process server types.
+//!
+//! The test still needs to control the regtest chain (mine blocks, send
+//! coinbase to a server-side funding address). That lives in
+//! [`wick_sdk::regtest::RegtestRpc`], gated on the `regtest` cargo feature.
+//!
+//! ## Prerequisites
+//!
+//! ```sh
+//! just regtest-up   # docker stack: bitcoind + postgres + electrs
+//! cargo test -p wick-sdk --test full_flow --features regtest -- --ignored --nocapture
+//! ```
+//!
+//! The test spawns its own `wick-server` binary via
+//! `env!("CARGO_BIN_EXE_wick-server")` so no external server is required.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::net::TcpStream;
+use std::process::{ Command as StdCommand, Stdio };
+use std::time::{ Duration, Instant };
+
+use bitcoin::secp256k1::PublicKey;
+use wick_core::TenantId;
+use wick_sdk::regtest::{ wait_until_async, RegtestRpc };
+use wick_sdk::{ PaymentStatus, WickClient, WickConfig };
+
+// ── Fixed BIP39 test vectors ──────────────────────────────────────────────────
+//
+// These are the standard BIP39 test vectors. They are well-known and safe
+// to commit; never hold real mainnet funds on them.
+
+const ALICE_MNEMONIC: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+const BOB_MNEMONIC: &str =
+    "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+/// Amount paid from Alice → Bob. 10_000 sats — above the 2_000-sat channel
+/// reserve so Bob's `lightning_balance().lightning_msat` visibly grows.
+const PAYMENT_AMOUNT_MSAT: u64 = 10_000_000;
+
+/// Channel size Alice opens. 200k sats — enough headroom for the payment
+/// plus reserve + commit-fee reservation.
+const CHANNEL_VALUE_SAT: u64 = 200_000;
+
+/// Coinbase transfer to Alice's server-side wallet so she has UTXOs to
+/// fund a channel. 1M sats is 5× the channel value — plenty of headroom.
+const FUNDING_TRANSFER_SAT: u64 = 1_000_000;
+
+/// Integer Lightning + on-chain timeouts. Regtest is fast, but LDK's
+/// event loop and electrs indexer add latency that we can't sub-second.
+const LN_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+const ONCHAIN_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ── Server subprocess ─────────────────────────────────────────────────────────
+
+struct HostedServer {
+    child: std::process::Child,
+    endpoint: String,
+}
+
+impl HostedServer {
+    fn spawn() -> Self {
+        // Resolve the workspace root via CARGO_MANIFEST_DIR (points at
+        // wick-sdk); go up two levels to reach the workspace root, then
+        // run `cargo run --bin wick-server` against the regtest config.
+        //
+        // Using `cargo run` rather than a pre-built path keeps the test
+        // self-contained at the cost of one-time build latency on first
+        // invocation.
+        let workspace_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let config_path = format!("{workspace_root}/deploy/docker/config.regtest.toml");
+
+        let child = StdCommand::new("cargo")
+            .current_dir(&workspace_root)
+            .args(["run", "--quiet", "--bin", "wick-server", "--", "--config", &config_path])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn wick-server via cargo run");
+
+        // `config.regtest.toml` binds :50051.
+        let endpoint = "http://127.0.0.1:50051".to_owned();
+
+        // Block until the server's gRPC listener accepts connections.
+        // `cargo run` on a fresh workspace can take a while to build, so
+        // we allow a generous deadline.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if TcpStream::connect("127.0.0.1:50051").is_ok() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("wick-server did not bind :50051 within 120s");
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
+        Self { child, endpoint }
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+impl Drop for HostedServer {
+    fn drop(&mut self) {
+        // Best-effort SIGKILL. `kill` returns Err only if the process is
+        // already gone, which is fine.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// ── The test ─────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires just regtest-up + compiled wick-server binary"]
+async fn full_flow_two_clients_pay_and_reload() {
+    let server = HostedServer::spawn();
+
+    // Regtest chain controller (bitcoind RPC). Credentials come from
+    // `deploy/docker/docker-compose.yml` — fixed to `wick:wick`.
+    let rpc = RegtestRpc::connect("http://127.0.0.1:18443", "wick", "wick").expect(
+        "RegtestRpc::connect"
+    );
+
+    let config = || {
+        let mut cfg = WickConfig::for_network(bitcoin::Network::Regtest);
+        cfg.server_endpoint = server.endpoint().to_owned();
+        cfg.esplora_url = "http://127.0.0.1:3002".to_owned();
+        cfg
+    };
+
+    // ── Round 1: fresh registration, open channel, payment ────────────────
+
+    let alice = WickClient::new(ALICE_MNEMONIC, None, config()).await.expect(
+        "alice WickClient::new"
+    );
+    let bob = WickClient::new(BOB_MNEMONIC, None, config()).await.expect("bob WickClient::new");
+
+    let alice_tenant_outcome = alice.register("free").await.expect("alice register");
+    let bob_tenant_outcome = bob.register("free").await.expect("bob register");
+    assert!(!alice_tenant_outcome.api_token.is_empty());
+    assert!(!bob_tenant_outcome.api_token.is_empty());
+
+    // tenant_id is deterministic: UUID-v5 over the compressed pubkey.
+    let expected_alice_tid = TenantId::from_pubkey(&alice.node_id().serialize())
+        .as_uuid()
+        .to_string();
+    let expected_bob_tid = TenantId::from_pubkey(&bob.node_id().serialize()).as_uuid().to_string();
+    assert_eq!(alice_tenant_outcome.tenant_id, expected_alice_tid);
+    assert_eq!(bob_tenant_outcome.tenant_id, expected_bob_tid);
+
+    // Fund Alice's **client-side** BDK wallet via bitcoind: mine 101
+    // blocks so the first coinbase matures, send 1M sats to Alice's
+    // next client-side P2WPKH address, mine 1 block to confirm.
+    //
+    // The SDK owns the funding UTXOs — the server never touches on-chain
+    // funds in the new two-phase `OpenChannel` flow. Alice's SDK will
+    // build+sign the funding tx from this wallet when `open_channel` is
+    // called below.
+    let alice_client_addr = alice.next_address_p2wpkh().expect("alice client addr");
+    rpc.mine(101).expect("mine coinbase maturation");
+    rpc.send_to_address(&alice_client_addr, FUNDING_TRANSFER_SAT).expect("send_to_address");
+    rpc.mine(1).expect("mine funding conf");
+
+    // Wait for electrs to index the funding block, then sync the SDK's
+    // client-side BDK so it sees the new UTXO.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    wait_until_async("alice client-side BDK sees funding UTXO", ONCHAIN_SYNC_TIMEOUT, || {
+        let a = alice.clone();
+        async move {
+            if a.sync_onchain().await.is_err() {
+                return false;
+            }
+            a.onchain_spendable_sat()
+                .map(|s| s >= FUNDING_TRANSFER_SAT - 10_000)
+                .unwrap_or(false)
+        }
+    }).await;
+
+    // Alice tells Bob which peer to be / where to reach him. Since this
+    // is a same-server setup, the listen_host the server reports may be
+    // 0.0.0.0 — rewrite to 127.0.0.1 for dial-ability on this machine.
+    let bob_info = bob.node_info().await.expect("bob node_info");
+    let dial_host = match bob_info.host.as_str() {
+        "0.0.0.0" | "" => "127.0.0.1".to_owned(),
+        other => other.to_owned(),
+    };
+
+    alice
+        .connect_peer(bob_info.pubkey, &dial_host, bob_info.port).await
+        .expect("alice connect_peer");
+
+    alice.open_channel(bob_info.pubkey, CHANNEL_VALUE_SAT, 0).await.expect("alice open_channel");
+
+    // LDK's broadcaster is fire-and-forget; wait for bitcoind to see the
+    // funding tx before mining, otherwise blocks land before the tx
+    // reaches the mempool and the channel gets stranded.
+    rpc.wait_for_mempool_size(1, Duration::from_secs(10)).await.expect("funding tx in mempool");
+    rpc.mine(10).expect("mine funding confs");
+
+    // Wait for the channel to reach routable capacity. `is_usable` alone
+    // isn't enough — LDK's scorer needs a moment to mark the channel as
+    // routable for a specific amount.
+    wait_until_async("channel routable for payment", LN_POLL_TIMEOUT, || {
+        let a = alice.clone();
+        async move {
+            a.list_channels().await
+                .map(|chs| {
+                    chs.iter().any(|c| {
+                        c.is_usable && c.outbound_capacity_msat >= PAYMENT_AMOUNT_MSAT
+                    })
+                })
+                .unwrap_or(false)
+        }
+    }).await;
+
+    // Bob issues a 10k-sat invoice; Alice pays it.
+    let invoice = bob
+        .receive_payment(Some(PAYMENT_AMOUNT_MSAT), "full-flow").await
+        .expect("bob receive_payment");
+    assert!(!invoice.bolt11.is_empty());
+    let payment_hash = invoice.payment_hash;
+
+    let send = alice.send_payment(&invoice.bolt11).await.expect("alice send_payment");
+    assert_eq!(send.status, PaymentStatus::Pending);
+    assert_eq!(send.payment_hash, payment_hash);
+
+    // Poll both sides for the terminal Succeeded status.
+    let hash_hex = hex::encode(payment_hash);
+    {
+        let a = alice.clone();
+        let h = hash_hex.clone();
+        wait_until_async("alice sees outbound Succeeded", LN_POLL_TIMEOUT, move || {
+            let a = a.clone();
+            let h = h.clone();
+            async move {
+                a.transactions(20, None).await
+                    .map(|rows| {
+                        rows.iter().any(|p| {
+                            hex::encode(p.payment_hash) == h &&
+                                p.is_outbound &&
+                                p.status == PaymentStatus::Succeeded
+                        })
+                    })
+                    .unwrap_or(false)
+            }
+        }).await;
+    }
+    {
+        let b = bob.clone();
+        let h = hash_hex.clone();
+        wait_until_async("bob sees inbound Succeeded", LN_POLL_TIMEOUT, move || {
+            let b = b.clone();
+            let h = h.clone();
+            async move {
+                b.transactions(20, None).await
+                    .map(|rows| {
+                        rows.iter().any(|p| {
+                            hex::encode(p.payment_hash) == h &&
+                                !p.is_outbound &&
+                                p.status == PaymentStatus::Succeeded
+                        })
+                    })
+                    .unwrap_or(false)
+            }
+        }).await;
+    }
+
+    // Verify the funds actually moved to Bob's side of the channel. On a
+    // fresh channel Bob starts with 0 outbound (push_msat=0); after a
+    // 10k-sat payment his outbound should be close to 10k sats minus
+    // the reserve (~2k sats).
+    let bob_bal_round_1 = bob
+        .lightning_balance().await
+        .expect("bob lightning_balance after payment");
+    assert!(
+        bob_bal_round_1.lightning_msat >= 7_000_000,
+        "bob's outbound capacity should reflect ~{PAYMENT_AMOUNT_MSAT} msat minus channel reserve, got {}",
+        bob_bal_round_1.lightning_msat
+    );
+
+    let alice_bal_round_1 = alice
+        .lightning_balance().await
+        .expect("alice lightning_balance after payment");
+    assert!(
+        alice_bal_round_1.lightning_msat > 0,
+        "alice should still have outbound capacity; got {}",
+        alice_bal_round_1.lightning_msat
+    );
+
+    // ── Round 2: drop clients, recreate from the same mnemonics ────────────
+    //
+    // Simulates a client process restart. Server state (tenant row,
+    // channel state, payment history, balances) is all in Postgres + LDK
+    // persistence — the fresh clients should observe it unchanged.
+
+    let alice_node_id: PublicKey = alice.node_id();
+    let bob_node_id: PublicKey = bob.node_id();
+    drop(alice);
+    drop(bob);
+
+    let alice2 = WickClient::new(ALICE_MNEMONIC, None, config()).await.expect(
+        "alice2 WickClient::new"
+    );
+    let bob2 = WickClient::new(BOB_MNEMONIC, None, config()).await.expect("bob2 WickClient::new");
+
+    // Identity is a pure function of the mnemonic, so pubkeys must match.
+    assert_eq!(alice2.node_id(), alice_node_id);
+    assert_eq!(bob2.node_id(), bob_node_id);
+
+    // Re-register. Server path is idempotent: same tenant_id (UUID-v5 of
+    // the pubkey), freshly-rotated api_token.
+    let alice_out_2 = alice2.register("free").await.expect("alice2 register");
+    let bob_out_2 = bob2.register("free").await.expect("bob2 register");
+
+    assert_eq!(alice_out_2.tenant_id, alice_tenant_outcome.tenant_id);
+    assert_eq!(bob_out_2.tenant_id, bob_tenant_outcome.tenant_id);
+    assert_ne!(
+        alice_out_2.api_token,
+        alice_tenant_outcome.api_token,
+        "re-register must rotate the api_token"
+    );
+    assert_ne!(bob_out_2.api_token, bob_tenant_outcome.api_token);
+
+    // Transactions persist — fresh client sees the same payment history.
+    let alice_txs = alice2.transactions(20, None).await.expect("alice2 transactions");
+    let bob_txs = bob2.transactions(20, None).await.expect("bob2 transactions");
+
+    let alice_outbound = alice_txs
+        .iter()
+        .find(|p| p.is_outbound && p.status == PaymentStatus::Succeeded)
+        .expect("prior outbound payment must persist across client recreation");
+    assert_eq!(alice_outbound.payment_hash, payment_hash);
+    assert_eq!(alice_outbound.amount_msat, PAYMENT_AMOUNT_MSAT);
+
+    let bob_inbound = bob_txs
+        .iter()
+        .find(|p| !p.is_outbound && p.status == PaymentStatus::Succeeded)
+        .expect("prior inbound payment must persist across client recreation");
+    assert_eq!(bob_inbound.payment_hash, payment_hash);
+    assert_eq!(bob_inbound.amount_msat, PAYMENT_AMOUNT_MSAT);
+    eprint!("alice transactions: {:#?}", alice_txs);
+    eprint!("bob transactions: {:#?}", bob_txs);
+    // Balances also persist — they're server-held state, unchanged by
+    // a client restart.
+    let bob_bal_round_2 = bob2.lightning_balance().await.expect("bob2 lightning_balance");
+    assert_eq!(
+        bob_bal_round_2.lightning_msat,
+        bob_bal_round_1.lightning_msat,
+        "balance must persist across client recreation"
+    );
+
+    let _ = server; // keep alive until end; Drop kills the subprocess
+}
