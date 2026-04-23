@@ -19,10 +19,18 @@ regtest-up:
 regtest-down:
     docker compose -f deploy/docker/docker-compose.yml down -v
 
-# Apply global schema migrations.
+# Apply global schema migrations via the containerised `psql`.
+# No host-side sqlx CLI required. Integration tests also apply these
+# automatically on `Harness::bootstrap`, so invoking this recipe is only
+# necessary for ad-hoc `psql` use or running the server binary directly.
 migrate:
-    DATABASE_URL=postgres://wick:wick@localhost:5432/wick \
-        sqlx migrate run --source migrations/global
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for f in migrations/global/*.sql; do
+        echo "applying $f"
+        docker exec -i wick-postgres psql -v ON_ERROR_STOP=1 -q \
+            -U wick -d wick < "$f"
+    done
 
 # Provision a new tenant schema (requires TENANT_ID env var).
 # Example: TENANT_ID=1 just migrate-tenant
@@ -47,23 +55,41 @@ build:
 test:
     cargo test --workspace --all-features
 
-# Run only the multi-tenant isolation tests.
-test-multi-tenant:
-    cargo test --package wick-server --test multi_tenant -- --nocapture
-
 # --- phase demos ---
 
-# Phase 0: boot server (single-tenant stub).
+# Boot server against local regtest docker-compose stack (requires just regtest-up).
 demo:
+    cargo run --bin wick-server -- --config deploy/docker/config.regtest.toml
+
+# Boot server against mutinynet (default dev target — no local daemon needed, just postgres-up).
+mutinynet-dev:
     cargo run --bin wick-server -- --config deploy/docker/config.dev.toml
 
-# Phase 1: run multi-tenant isolation tests with verbose output.
-multi-tenant-demo:
-    @echo "=== Phase 1: Multi-tenant actor model demo ==="
-    @echo "Running isolation tests across 5 tenants..."
-    cargo test --package wick-server --test multi_tenant -- --nocapture
-    @echo ""
-    @echo "=== Demo complete. All tenants isolated. ==="
+# Loom model: verify park/wake CAS + memory invariants under all interleavings.
+# Runs without the dev stack — pure in-process model checker.
+# `wick-loom-models` has no tokio dep so --cfg loom doesn't break concurrent-queue.
+loom:
+    RUSTFLAGS="--cfg loom" cargo test -p wick-loom-models --release
+
+# --- signet / mutinynet ---
+
+# Start only Postgres (for signet/mutinynet where local bitcoind is not needed).
+postgres-up:
+    docker compose -f deploy/docker/docker-compose.yml up -d postgres
+    @echo "Waiting for Postgres..."
+    sleep 3
+    just migrate
+
+# Run wick-server against the default signet network (mempool.space Esplora, no local node needed).
+# Set a real 32-byte hex seed in deploy/docker/config.signet.toml before running.
+# Generate one with: openssl rand -hex 32
+signet-run:
+    cargo run --bin wick-server -- --config deploy/docker/config.signet.toml
+
+# Run wick-server against mutinynet (custom signet, 30-second blocks, mutinynet.com Esplora).
+# Set a real 32-byte hex seed in deploy/docker/config.mutinynet.toml before running.
+mutinynet-run:
+    cargo run --bin wick-server -- --config deploy/docker/config.mutinynet.toml
 
 # --- housekeeping ---
 

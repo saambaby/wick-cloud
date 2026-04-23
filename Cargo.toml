@@ -16,7 +16,6 @@ members = [
     "crates/wick-nwc",
     "crates/wick-sdk-ffi",
     "crates/wick-sdk-wasm",
-    "crates/wick-testkit",
     "crates/wick-loom-models",
 ]
 
@@ -81,6 +80,13 @@ reqwest                        = { version = "0.12", default-features = false, f
 secp256k1                      = { version = "0.29", features = ["rand-std"] }
 hex                            = "0.4"
 
+# on-chain wallet (BDK 1.x)
+bdk_wallet                     = "1.0"
+bdk_esplora                    = { version = "0.20", features = ["async-https-rustls", "tokio"] }
+
+# bitcoind JSON-RPC — used by wick-sdk's optional regtest feature (RegtestRpc helper).
+bitcoincore-rpc                = "0.19"
+
 # grpc
 tonic = "0.12"
 prost = "0.13"
@@ -100,7 +106,6 @@ wick-vls = { path = "crates/wick-vls" }
 wick-noise = { path = "crates/wick-noise" }
 wick-nwc = { path = "crates/wick-nwc" }
 wick-lightning = { path = "crates/wick-lightning" }
-wick-testkit = { path = "crates/wick-testkit" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

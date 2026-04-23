@@ -4139,8 +4139,25 @@ dependencies = [
 name = "wick-sdk"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bdk_esplora",
+ "bdk_wallet",
+ "bip39",
+ "bitcoin",
+ "bitcoincore-rpc",
+ "esplora-client 0.12.3",
+ "hex",
+ "parking_lot",
+ "prost",
+ "rand 0.8.5",
+ "secp256k1",
  "thiserror 1.0.69",
+ "tokio",
+ "tonic",
+ "tracing",
  "wick-core",
+ "wick-proto",
+ "zeroize",
 ]
 
 [[package]]
@@ -4185,38 +4202,6 @@ dependencies = [
  "wick-db",
  "wick-lightning",
  "wick-proto",
-]
-
-[[package]]
-name = "wick-testkit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bdk_esplora",
- "bdk_wallet",
- "bip39",
- "bitcoin",
- "bitcoincore-rpc",
- "esplora-client 0.12.3",
- "futures",
- "hex",
- "lightning",
- "lightning-invoice",
- "rand 0.8.5",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "wick-core",
- "wick-db",
- "wick-lightning",
- "wick-proto",
- "wick-server",
 ]
 
 [[package]]
