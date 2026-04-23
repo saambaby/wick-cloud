@@ -1141,6 +1141,18 @@ impl NodeManager {
     value       BYTEA NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 )"#
+            ),
+            // Phase 2 scaffold: events that arrive while the tenant is parked
+            // are buffered here by Phase 3's LSP event loop and drained on
+            // the next wake. `id BIGSERIAL` gives per-tenant insertion order;
+            // `payload BYTEA` is opaque to this layer (Phase 3 defines the
+            // serialization format). See `node::event_buffer::PendingEventStore`.
+            format!(
+                r#"CREATE TABLE IF NOT EXISTS "{schema}".pending_events (
+    id          BIGSERIAL PRIMARY KEY,
+    payload     BYTEA NOT NULL,
+    enqueued_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)"#
             )
         ]
     }
