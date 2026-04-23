@@ -66,3 +66,19 @@ CREATE TABLE IF NOT EXISTS "{{SCHEMA}}".vss_objects (
     value           BYTEA NOT NULL,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Durable backing for the two-phase channel-open flow. Rows are written
+-- by the LDK event handler on `FundingGenerationReady` and deleted when
+-- the client finalises the open. Rows that survive a crash are
+-- rehydrated on the next boot; anything older than ~1h is swept as
+-- unrecoverable.
+CREATE TABLE IF NOT EXISTS "{{SCHEMA}}".pending_funding (
+    temp_channel_id BYTEA PRIMARY KEY,
+    counterparty    BYTEA NOT NULL,
+    value_sat       BIGINT NOT NULL,
+    output_script   BYTEA NOT NULL,
+    parked_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS pending_funding_parked_at_idx
+    ON "{{SCHEMA}}".pending_funding(parked_at);

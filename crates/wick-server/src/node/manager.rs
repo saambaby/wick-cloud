@@ -39,6 +39,18 @@ pub enum ProvisionError {
     /// Tenant is already registered with this manager.
     #[error("tenant {0} is already provisioned")]
     AlreadyProvisioned(TenantId),
+    /// Persisted LDK state (ChannelManager or ChannelMonitor bytes) failed
+    /// to decode — the node has quarantined the bytes and cannot start
+    /// without operator intervention. Distinct from `Other` so the gRPC
+    /// layer can return `FAILED_PRECONDITION` instead of `INTERNAL`,
+    /// signalling that the caller retrying won't help.
+    #[error("tenant {tenant} has corrupt persisted state: {detail}")]
+    CorruptState {
+        /// Tenant whose state failed to decode.
+        tenant: TenantId,
+        /// The underlying `WickLightningError::PersistenceDecode` message.
+        detail: String,
+    },
     /// Any other failure during provisioning — schema DDL, factory build,
     /// memory admission, etc.
     #[error(transparent)]
@@ -283,7 +295,23 @@ impl NodeManager {
 
         // Immediately activate — builds the node via factory and brings the
         // tenant to ACTIVE. Returns an error if the factory fails.
-        self.wake(tenant_id).await.context("initial node activation")?;
+        //
+        // Distinguish corrupt-state failures from generic wake errors so
+        // the gRPC layer can return `FAILED_PRECONDITION` (don't retry;
+        // operator intervention required) instead of `INTERNAL` (transient).
+        // The factory bubbles `WickLightningError::PersistenceDecode`'s
+        // Display ("persistence decode failed …") through `anyhow::Error`.
+        self.wake(tenant_id).await.map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("persistence decode failed") {
+                ProvisionError::CorruptState {
+                    tenant: tenant_id,
+                    detail: msg,
+                }
+            } else {
+                ProvisionError::Other(e.context("initial node activation"))
+            }
+        })?;
 
         info!(tenant = %tenant_id, "node provisioned and active");
         Ok(())
@@ -1153,6 +1181,26 @@ impl NodeManager {
     payload     BYTEA NOT NULL,
     enqueued_at TIMESTAMPTZ NOT NULL DEFAULT now()
 )"#
+            ),
+            // Durable backing for the two-phase channel-open flow's
+            // `PendingFundingRegistry`. A row is inserted by the LDK
+            // event handler on `FundingGenerationReady` and deleted when
+            // the client calls `OpenChannelFinalize`. Rows surviving a
+            // crash are rehydrated by `PendingFundingRegistry::rehydrate_from_store`
+            // on the next boot; rows older than FUNDING_TTL (1h) are
+            // swept at the same time.
+            format!(
+                r#"CREATE TABLE IF NOT EXISTS "{schema}".pending_funding (
+    temp_channel_id BYTEA PRIMARY KEY,
+    counterparty    BYTEA NOT NULL,
+    value_sat       BIGINT NOT NULL,
+    output_script   BYTEA NOT NULL,
+    parked_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+)"#
+            ),
+            format!(
+                r#"CREATE INDEX IF NOT EXISTS pending_funding_parked_at_idx
+   ON "{schema}".pending_funding(parked_at)"#
             )
         ]
     }

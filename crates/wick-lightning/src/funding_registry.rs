@@ -30,6 +30,8 @@ use dashmap::DashMap;
 use lightning::ln::types::ChannelId;
 use tokio::sync::oneshot;
 
+use crate::funding_store::FundingStore;
+
 /// A parked channel-funding request.
 #[derive(Debug, Clone)]
 pub struct PendingFunding {
@@ -63,6 +65,12 @@ pub struct PendingFundingRegistry {
     /// Senders installed by active `take` waiters. `park` prefers
     /// delivering via these rather than stashing in `ready`.
     waiters: DashMap<ChannelId, oneshot::Sender<PendingFunding>>,
+    /// Optional durable backing. When `Some`, `park`/`take` mirror
+    /// their in-memory work to Postgres so a crash between the two
+    /// leaves a rehydratable row. When `None` (unit tests without a
+    /// Postgres pool), the registry is pure in-memory — the crash
+    /// recovery guarantee is forfeit.
+    store: Option<Arc<FundingStore>>,
 }
 
 impl fmt::Debug for PendingFundingRegistry {
@@ -70,21 +78,95 @@ impl fmt::Debug for PendingFundingRegistry {
         f.debug_struct("PendingFundingRegistry")
             .field("ready_count", &self.ready.len())
             .field("waiter_count", &self.waiters.len())
+            .field("durable", &self.store.is_some())
             .finish()
     }
 }
 
 impl PendingFundingRegistry {
-    /// Construct an empty registry.
+    /// Construct an in-memory-only registry. Used by unit tests and by
+    /// any builder path that doesn't have a Postgres pool on hand.
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
+    /// Construct a registry with a durable backing. Call
+    /// [`Self::rehydrate_from_store`] once after construction to
+    /// re-populate `ready` from any rows left over from a previous
+    /// boot.
+    #[must_use]
+    pub fn with_store(store: Arc<FundingStore>) -> Arc<Self> {
+        Arc::new(Self {
+            ready: DashMap::new(),
+            waiters: DashMap::new(),
+            store: Some(store),
+        })
+    }
+
+    /// Pull every surviving row from Postgres into the in-memory
+    /// `ready` map. Call exactly once, right after `with_store`, before
+    /// the node is allowed to accept dispatches.
+    ///
+    /// A failed rehydrate is logged and treated as "no rows" — the
+    /// node still boots; the cost is that any genuinely parked request
+    /// stays stuck until its TTL expires. The alternative — blocking
+    /// boot on Postgres transients — is worse.
+    pub async fn rehydrate_from_store(&self) {
+        let Some(ref store) = self.store else {
+            return;
+        };
+        match store.rehydrate().await {
+            Ok(rows) => {
+                let n = rows.len();
+                for row in rows {
+                    self.ready.insert(row.temp_channel_id, row.request);
+                }
+                if n > 0 {
+                    tracing::info!(
+                        target: "wick_lightning",
+                        count = n,
+                        "funding_registry: rehydrated parked funding requests from Postgres"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "wick_lightning",
+                    error = %e,
+                    "funding_registry: rehydrate failed; booting without durable rows"
+                );
+            }
+        }
+    }
+
     /// Park `req` against `temp_id`. Delivers directly to an active
     /// `take` waiter if one is installed; otherwise stashes for later.
     /// Called from the event handler on `FundingGenerationReady`.
+    ///
+    /// The durable insert is best-effort: an insert failure is logged
+    /// but does not stop the in-memory delivery. Losing durability on
+    /// one request is preferable to failing an LDK event handler.
     pub fn park(&self, temp_id: ChannelId, req: PendingFunding) {
+        if let Some(ref store) = self.store {
+            // LDK's event handler runs in a Tokio context, so we can
+            // spawn the insert as a fire-and-forget task. Keeping park
+            // synchronous preserves the current call shape in
+            // `EventHandler::handle_funding_generation_ready`.
+            let store = store.clone();
+            let temp_id_copy = temp_id;
+            let req_copy = req.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store.insert(temp_id_copy, &req_copy).await {
+                    tracing::warn!(
+                        target: "wick_lightning",
+                        error = %e,
+                        "funding_registry: durable insert failed"
+                    );
+                }
+            });
+        }
+
         if let Some((_, tx)) = self.waiters.remove(&temp_id) {
             // There's already a waiter — hand the request over directly.
             // The oneshot receiver unblocks `take` immediately.
@@ -104,6 +186,7 @@ impl PendingFundingRegistry {
     pub async fn take(&self, temp_id: ChannelId, timeout: Duration) -> Option<PendingFunding> {
         // Fast path: `park` already ran, the request is stashed.
         if let Some((_, req)) = self.ready.remove(&temp_id) {
+            self.delete_from_store(temp_id).await;
             return Some(req);
         }
 
@@ -115,15 +198,34 @@ impl PendingFundingRegistry {
         self.waiters.insert(temp_id, tx);
         if let Some((_, req)) = self.ready.remove(&temp_id) {
             self.waiters.remove(&temp_id);
+            self.delete_from_store(temp_id).await;
             return Some(req);
         }
 
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(req)) => Some(req),
+            Ok(Ok(req)) => {
+                self.delete_from_store(temp_id).await;
+                Some(req)
+            }
             Ok(Err(_)) => None,
             Err(_) => {
                 self.waiters.remove(&temp_id);
                 None
+            }
+        }
+    }
+
+    /// Remove the durable row for `temp_id`, if a store is configured.
+    /// Logs but does not surface errors — the in-memory state is
+    /// authoritative.
+    async fn delete_from_store(&self, temp_id: ChannelId) {
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.remove(temp_id).await {
+                tracing::warn!(
+                    target: "wick_lightning",
+                    error = %e,
+                    "funding_registry: durable remove failed"
+                );
             }
         }
     }

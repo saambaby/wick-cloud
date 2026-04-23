@@ -164,6 +164,17 @@ impl WalletService for WickGrpcService {
             Err(ProvisionError::AlreadyProvisioned(_)) => {
                 info!(%tenant_id, "tenant already provisioned — re-register rotated token only");
             }
+            Err(ProvisionError::CorruptState { tenant, detail }) => {
+                // Persisted LDK state is undecodable — the node has
+                // quarantined the bytes. The caller retrying will not
+                // help; an operator must inspect the `quarantine/*`
+                // namespace in the tenant's Postgres schema and either
+                // restore from backup or manually clear the row.
+                warn!(%tenant, %detail, "create_tenant: tenant has corrupt state");
+                return Err(Status::failed_precondition(
+                    "tenant has corrupt persisted state — operator intervention required",
+                ));
+            }
             Err(ProvisionError::Other(e)) => {
                 warn!(?e, %tenant_id, "create_tenant: provision failed");
                 return Err(Status::internal("failed to provision tenant"));

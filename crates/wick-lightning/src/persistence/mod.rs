@@ -126,6 +126,39 @@ ON CONFLICT (key) DO UPDATE
         Ok(())
     }
 
+    /// Move a value whose bytes failed to decode into a quarantine slot so
+    /// an operator can inspect it later without the boot path tripping on
+    /// the same row on every restart attempt.
+    ///
+    /// Writes `bytes` to `quarantine/<rfc3339_ts>/<original_key>`. Does
+    /// **not** delete the original — the caller decides whether the
+    /// corrupt row should be overwritten or left intact for forensics. In
+    /// practice `wick-lightning::builder` returns `PersistenceDecode`
+    /// immediately after quarantining, so the tenant stays in ERROR until
+    /// manual intervention; the original row is kept so a matching pair
+    /// (live row + quarantine row) survives in Postgres.
+    ///
+    /// The timestamp in the secondary namespace means repeated quarantine
+    /// attempts (rare, but possible if the operator restarts the node
+    /// several times before clearing state) don't clobber each other.
+    pub fn quarantine(&self, original_key: &str, bytes: Vec<u8>) -> Result<(), io::Error> {
+        use lightning::util::persist::KVStoreSync;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let secondary = ts.to_string();
+        tracing::error!(
+            target: "wick_lightning",
+            schema = %self.schema,
+            original_key,
+            quarantine_ts = secondary,
+            bytes_len = bytes.len(),
+            "quarantining undecodable LDK state — operator intervention required"
+        );
+        self.write("quarantine", &secondary, original_key, bytes)
+    }
+
     async fn list_async(&self, prefix: &str) -> Result<Vec<String>, io::Error> {
         let sql = format!(
             r#"SELECT key FROM "{}".vss_objects WHERE key LIKE $1"#,

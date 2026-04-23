@@ -16,7 +16,6 @@ use std::io::Cursor;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use bitcoin::Network;
 use lightning::routing::gossip::NetworkGraph;
 use lightning::routing::scoring::{
     ProbabilisticScorer, ProbabilisticScoringDecayParameters,
@@ -25,6 +24,7 @@ use lightning::util::ser::{ReadableArgs, Writeable};
 use lightning_rapid_gossip_sync::RapidGossipSync;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use wick_core::WickNetwork;
 
 use crate::logger::TracingLogger;
 use crate::node::{LnNetworkGraph, LnScorer};
@@ -39,17 +39,70 @@ const GRAPH_KEY: &str = "network_graph";
 const LAST_SYNC_KEY: &str = "last_sync_ts";
 const SCORER_KEY: &str = "scorer";
 
-/// How often to re-apply an RGS delta snapshot.
+/// How often to re-apply an RGS delta snapshot when the previous apply
+/// succeeded.
 const RGS_INTERVAL: Duration = Duration::from_secs(86_400); // 24 h
 /// How often to persist the scorer to Postgres.
 const SCORER_INTERVAL: Duration = Duration::from_secs(600); // 10 min
+
+/// Back-off schedule when an RGS fetch or apply fails. After the last
+/// entry the loop falls back to the normal [`RGS_INTERVAL`] cadence —
+/// at that point the failure has persisted long enough that more
+/// aggressive retries are just wasted requests on a broken endpoint.
+/// Each entry is the delay *after* the corresponding failure count
+/// (`0`-indexed: first failure → wait `RGS_BACKOFF[0]`).
+const RGS_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(60),        // 1 min
+    Duration::from_secs(5 * 60),    // 5 min
+    Duration::from_secs(30 * 60),   // 30 min
+    Duration::from_secs(2 * 3_600), // 2 h
+];
+
+// ── Decay tuning ──────────────────────────────────────────────────────────────
+
+/// Per-network [`ProbabilisticScoringDecayParameters`].
+///
+/// LDK's defaults (30 min / 14 days) are tuned for Bitcoin mainnet's
+/// ~10-minute block interval and slow-moving payment graphs. Signet
+/// matches that cadence closely enough to reuse defaults, but regtest
+/// (sub-second blocks) and mutinynet (30-second blocks) churn their
+/// graphs fast enough that 30-minute liquidity decay and 14-day
+/// historical decay hold onto wrong answers for far too long —
+/// throughput tests run against stale probes and pathfind around
+/// channels that no longer exist.
+///
+/// **Regtest** → 5 min / 30 min. Tests are over in seconds; anything
+/// beyond the last couple of minutes is noise.
+///
+/// **Mutinynet** → 10 min / 2 days. The 30-second block cadence is
+/// roughly 20× faster than mainnet, so decay is roughly 3× faster than
+/// default. Not 20× — mutinynet's graph is small and relatively stable
+/// once a node has warm peers, so the historical learning window
+/// shouldn't collapse entirely.
+///
+/// **Signet** → LDK defaults. Public signet mirrors mainnet block
+/// cadence; the conservative defaults are still the right call.
+#[must_use]
+pub fn decay_params_for(network: WickNetwork) -> ProbabilisticScoringDecayParameters {
+    match network {
+        WickNetwork::Regtest => ProbabilisticScoringDecayParameters {
+            liquidity_offset_half_life: Duration::from_secs(5 * 60),
+            historical_no_updates_half_life: Duration::from_secs(30 * 60),
+        },
+        WickNetwork::Mutinynet => ProbabilisticScoringDecayParameters {
+            liquidity_offset_half_life: Duration::from_secs(10 * 60),
+            historical_no_updates_half_life: Duration::from_secs(2 * 24 * 60 * 60),
+        },
+        WickNetwork::Signet => ProbabilisticScoringDecayParameters::default(),
+    }
+}
 
 // ── Graph ─────────────────────────────────────────────────────────────────────
 
 /// Load a persisted `NetworkGraph` from `kv_store`, or construct a fresh one.
 pub fn load_or_init_graph(
     kv_store: &PgKvStore,
-    network: Network,
+    network: bitcoin::Network,
     logger: Arc<TracingLogger>,
 ) -> Arc<LnNetworkGraph> {
     use lightning::io::ErrorKind;
@@ -140,15 +193,21 @@ fn persist_last_sync_ts(kv_store: &PgKvStore, ts: u32) {
 // ── Scorer ────────────────────────────────────────────────────────────────────
 
 /// Load a persisted `ProbabilisticScorer`, or construct a fresh one.
+///
+/// `network` picks the per-network decay parameters — see
+/// [`decay_params_for`] for the rationale. The same parameters are
+/// passed to `ProbabilisticScorer::read` when rehydrating a persisted
+/// scorer, which is required by LDK's deserialisation API.
 pub fn load_or_init_scorer(
     kv_store: &PgKvStore,
     graph: Arc<LnNetworkGraph>,
+    network: WickNetwork,
     logger: Arc<TracingLogger>,
 ) -> LnScorer {
     use lightning::io::ErrorKind;
     use lightning::util::persist::KVStoreSync;
 
-    let decay = ProbabilisticScoringDecayParameters::default();
+    let decay = decay_params_for(network);
     match kv_store.read(SCORER_NS, "", SCORER_KEY) {
         Ok(bytes) => {
             let args = (decay, graph.clone(), logger.clone());
@@ -296,18 +355,37 @@ pub fn spawn_gossip_tasks(
     mut stop_rx: watch::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut rgs_interval = tokio::time::interval(RGS_INTERVAL);
-        rgs_interval.tick().await; // skip the immediate first tick
         let mut scorer_interval = tokio::time::interval(SCORER_INTERVAL);
         scorer_interval.tick().await;
 
+        // Consecutive RGS failures drive the back-off schedule. A single
+        // success resets it so transient blips don't permanently slow
+        // the cadence.
+        let mut rgs_failures: u32 = 0;
+        let rgs_sleep = tokio::time::sleep(RGS_INTERVAL);
+        tokio::pin!(rgs_sleep);
+
         loop {
             tokio::select! {
-                _ = rgs_interval.tick() => {
+                _ = &mut rgs_sleep => {
                     if let Some(ref url) = rgs_url {
                         let ts = load_last_sync_ts(kv_store.as_ref());
-                        apply_rgs(url, ts, graph.clone(), kv_store.as_ref(), logger.clone()).await;
+                        let applied = apply_rgs(
+                            url,
+                            ts,
+                            graph.clone(),
+                            kv_store.as_ref(),
+                            logger.clone(),
+                        )
+                        .await;
+                        if applied.is_some() {
+                            rgs_failures = 0;
+                        } else {
+                            rgs_failures = rgs_failures.saturating_add(1);
+                        }
                     }
+                    let next = rgs_next_delay(rgs_failures, rgs_url.is_some());
+                    rgs_sleep.as_mut().reset(tokio::time::Instant::now() + next);
                 }
                 _ = scorer_interval.tick() => {
                     persist_scorer(kv_store.as_ref(), &scorer);
@@ -321,6 +399,62 @@ pub fn spawn_gossip_tasks(
     })
 }
 
+/// Choose the delay before the next RGS attempt.
+///
+/// `failures == 0` → the normal 24 h cadence (the last attempt
+/// succeeded, or there have been no attempts yet).
+///
+/// `failures >= 1` → step through [`RGS_BACKOFF`]. Beyond the last
+/// entry we fall back to the normal cadence so we don't spin forever
+/// retrying against a permanently broken endpoint.
+///
+/// If `rgs_enabled` is false (e.g. regtest with no RGS URL), the
+/// caller still needs *some* delay so the select loop keeps running
+/// without busy-waiting — [`RGS_INTERVAL`] is as good as any.
+fn rgs_next_delay(failures: u32, rgs_enabled: bool) -> Duration {
+    if !rgs_enabled || failures == 0 {
+        return RGS_INTERVAL;
+    }
+    let idx = (failures as usize).saturating_sub(1);
+    if idx < RGS_BACKOFF.len() {
+        RGS_BACKOFF[idx]
+    } else {
+        RGS_INTERVAL
+    }
+}
+
+#[cfg(test)]
+mod rgs_backoff_tests {
+    use super::*;
+
+    #[test]
+    fn success_uses_normal_cadence() {
+        assert_eq!(rgs_next_delay(0, true), RGS_INTERVAL);
+    }
+
+    #[test]
+    fn failures_step_through_backoff() {
+        assert_eq!(rgs_next_delay(1, true), RGS_BACKOFF[0]);
+        assert_eq!(rgs_next_delay(2, true), RGS_BACKOFF[1]);
+        assert_eq!(rgs_next_delay(3, true), RGS_BACKOFF[2]);
+        assert_eq!(rgs_next_delay(4, true), RGS_BACKOFF[3]);
+    }
+
+    #[test]
+    fn beyond_backoff_falls_back_to_normal() {
+        assert_eq!(rgs_next_delay(5, true), RGS_INTERVAL);
+        assert_eq!(rgs_next_delay(u32::MAX, true), RGS_INTERVAL);
+    }
+
+    #[test]
+    fn disabled_rgs_uses_normal_cadence() {
+        // Regtest: no URL, still want the select loop to idle at a
+        // sensible cadence rather than busy-waiting.
+        assert_eq!(rgs_next_delay(0, false), RGS_INTERVAL);
+        assert_eq!(rgs_next_delay(3, false), RGS_INTERVAL);
+    }
+}
+
 // ── Startup helper ────────────────────────────────────────────────────────────
 
 /// Build and initialise the gossip layer for a node boot:
@@ -331,12 +465,17 @@ pub fn spawn_gossip_tasks(
 /// Returns `(graph, scorer)` ready for use by `DefaultRouter`.
 pub async fn init_gossip(
     kv_store: Arc<PgKvStore>,
-    network: Network,
+    network: WickNetwork,
     rgs_url: Option<&str>,
     logger: Arc<TracingLogger>,
 ) -> (Arc<LnNetworkGraph>, LnScorer) {
-    let graph = load_or_init_graph(kv_store.as_ref(), network, logger.clone());
-    let scorer = load_or_init_scorer(kv_store.as_ref(), graph.clone(), logger.clone());
+    let graph = load_or_init_graph(kv_store.as_ref(), network.into(), logger.clone());
+    let scorer = load_or_init_scorer(
+        kv_store.as_ref(),
+        graph.clone(),
+        network,
+        logger.clone(),
+    );
 
     if let Some(url) = rgs_url {
         let ts = load_last_sync_ts(kv_store.as_ref());

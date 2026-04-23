@@ -211,7 +211,7 @@ impl<S> NodeBuilder<S>
         let rgs_url = deps.network.default_rgs().map(ToOwned::to_owned);
         let (network_graph, scorer) = gossip::init_gossip(
             kv_store.clone(),
-            deps.network.into(),
+            deps.network,
             rgs_url.as_deref(),
             deps.logger.clone()
         ).await;
@@ -252,9 +252,25 @@ impl<S> NodeBuilder<S>
             kv_store.clone(),
             signer.clone(),
             signer.clone()
-        ).map_err(|e| WickLightningError::PersistenceDecode {
-            what: "monitors",
-            err: format!("{e}"),
+        ).map_err(|e| {
+            // Monitors are the most dangerous thing to lose — without them
+            // the node can't claim on-chain outputs from its channels. Any
+            // undecodable monitor bytes must stop boot dead; an operator
+            // should restore from backup before the node is allowed to
+            // reconstruct channel state.
+            //
+            // `read_channel_monitors` reads raw bytes under
+            // (MONITORS_PERSISTENCE_PRIMARY_NAMESPACE, "", "<monitor_name>");
+            // on decode failure we don't have the individual bytes handy
+            // (the helper already consumed them), so quarantine is best
+            // effort via a marker row describing the failure for the
+            // operator to investigate.
+            let marker = format!("monitor decode failed: {e}").into_bytes();
+            let _ = kv_store.quarantine("monitors/<read_channel_monitors>", marker);
+            WickLightningError::PersistenceDecode {
+                what: "monitors",
+                err: format!("{e}"),
+            }
         })?;
 
         let manager_bytes = match
@@ -267,6 +283,9 @@ impl<S> NodeBuilder<S>
             Ok(b) => Some(b),
             Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => None,
             Err(e) => {
+                // Read error (not NotFound) — transient Postgres failure
+                // or schema issue. Don't quarantine (no bytes to save);
+                // just fail loud and let the recovery loop retry.
                 return Err(WickLightningError::PersistenceDecode {
                     what: "channel_manager",
                     err: format!("{e}"),
@@ -304,12 +323,25 @@ impl<S> NodeBuilder<S>
                 monitor_refs
             );
             let mut cursor = Cursor::new(&bytes);
-            let (manager_block_hash, cm) = <(bitcoin::BlockHash, Arc<LnChannelManager<S>>)>
+            let (manager_block_hash, cm) = match <(bitcoin::BlockHash, Arc<LnChannelManager<S>>)>
                 ::read(&mut cursor, args)
-                .map_err(|e| WickLightningError::PersistenceDecode {
-                    what: "channel_manager",
-                    err: format!("{e:?}"),
-                })?;
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    // Bytes exist but don't decode — typically an LDK
+                    // version mismatch or real corruption. Preserve the
+                    // original bytes in quarantine before bailing so an
+                    // operator can diff them against a known-good backup.
+                    let _ = kv_store.quarantine(
+                        CHANNEL_MANAGER_PERSISTENCE_KEY,
+                        bytes.clone(),
+                    );
+                    return Err(WickLightningError::PersistenceDecode {
+                        what: "channel_manager",
+                        err: format!("{e:?}"),
+                    });
+                }
+            };
             // `args` is dropped here; the `&ChannelMonitor` borrows it held
             // expire, so we can now move the owned monitors out of
             // `loaded_monitors`.
@@ -470,8 +502,16 @@ impl<S> NodeBuilder<S>
         // Registry that parks FundingGenerationReady events for the
         // self-custodial two-phase channel-open flow. Shared between the
         // Node<S> (NodeApi::open_channel_init reads from it) and the
-        // EventHandler (FundingGenerationReady writes to it).
-        let funding_registry = crate::funding_registry::PendingFundingRegistry::new();
+        // EventHandler (FundingGenerationReady writes to it). Backed by
+        // Postgres so an actor crash between park and take leaves a
+        // rehydratable row.
+        let funding_store = Arc::new(crate::funding_store::FundingStore::new(
+            tenant_id,
+            deps.pg_pool.clone(),
+        ));
+        let funding_registry =
+            crate::funding_registry::PendingFundingRegistry::with_store(funding_store);
+        funding_registry.rehydrate_from_store().await;
 
         // ── Bind P2P listener ────────────────────────────────────────────────
         let listen_bind = deps.listen_addr_for(tenant_id);
