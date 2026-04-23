@@ -2,20 +2,11 @@
 //! transaction for LDK's `Event::FundingGenerationReady`.
 //!
 //! Wick is self-custodial: the server's Lightning node holds no on-chain
-//! coins. The on-chain wallet lives on the user's device (Flutter / WASM
-//! SDK) or — in regtest integration tests — in a local BDK wallet provided
-//! by `wick-testkit`. This trait is the seam between the two: LDK asks for
-//! "pay `output_script` exactly `channel_value_sats`", the [`FundingSource`]
-//! impl returns the signed tx, and [`crate::EventHandler`] forwards it to
+//! coins. The on-chain wallet lives on the user's device (Flutter / WASM SDK).
+//! This trait is the seam between the two: LDK asks for "pay `output_script`
+//! exactly `channel_value_sats`", the [`FundingSource`] impl returns the signed
+//! tx, and [`crate::EventHandler`] forwards it to
 //! `ChannelManager::funding_transaction_generated`.
-//!
-//! ## Phase mapping
-//!
-//! - Regtest / dev (Phase 1–3): [`wick_testkit::WickKitWallet`] implements this
-//!   trait against BDK 1.x with bitcoind RPC sync.
-//! - Production (Phase 5+): the SDK implements this over a Noise_KK channel
-//!   — the server forwards the request to the user's device, which signs
-//!   there and returns the tx.
 //!
 //! The output script must be satisfied exactly; `channel_value_sats` is the
 //! channel capacity LDK is about to commit to. Funds sent to a different
@@ -30,8 +21,7 @@ use bitcoin::{ ScriptBuf, Transaction };
 ///
 /// Called synchronously from inside the LDK event processing task; impls
 /// that need to await should use an internal runtime handle or
-/// `block_in_place` — the `wick-testkit` impl is synchronous (BDK's signer
-/// is sync) so that's a non-issue for the regtest path.
+/// `block_in_place`.
 pub trait FundingSource: Send + Sync + Debug + 'static {
     /// Produce a fully-signed transaction that pays `output_script` exactly
     /// `channel_value_sats` in a single output. LDK will broadcast it via

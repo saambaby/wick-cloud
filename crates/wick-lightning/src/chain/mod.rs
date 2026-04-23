@@ -9,8 +9,7 @@
 //! | [`FeeEstimator`] | `lightning::chain::chaininterface::FeeEstimator` |
 //!
 //! All three are network-agnostic — they work identically against mainnet,
-//! testnet, signet, or regtest. Test-only helpers (bitcoind RPC mining, funding)
-//! belong in the separate `wick-testkit` crate.
+//! testnet, signet, or regtest.
 
 mod broadcaster;
 mod esplora;

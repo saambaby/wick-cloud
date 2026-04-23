@@ -231,6 +231,10 @@ where
     /// `payment_hash → sent_at_ms` — inserted by `send_payment`, consumed by
     /// the event handler on `PaymentSent` for latency metrics.
     pub(crate) pending_sent_at: Arc<DashMap<[u8; 32], u64>>,
+    /// Parks `FundingGenerationReady` events for the self-custodial
+    /// two-phase channel-open flow. Populated by the event handler;
+    /// drained by [`NodeApi::open_channel_init`](crate::api::NodeApi::open_channel_init).
+    pub(crate) funding_registry: Arc<crate::funding_registry::PendingFundingRegistry>,
 }
 
 impl<S> std::fmt::Debug for Node<S>
@@ -471,6 +475,55 @@ where
         self.channel_manager
             .create_channel(peer_id, channel_value_sat, push_msat, 0, None, None)
             .map_err(|e| anyhow::anyhow!("create_channel: {e:?}"))?;
+        Ok(())
+    }
+
+    async fn open_channel_init(
+        &self,
+        peer_id: PublicKey,
+        channel_value_sat: u64,
+        push_msat: u64,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(ChannelId, crate::PendingFunding)> {
+        if !self.is_running() {
+            anyhow::bail!("node is not running");
+        }
+
+        // `create_channel` returns the temporary_channel_id LDK will use in
+        // the later FundingGenerationReady event, so we know which key to
+        // poll for in the registry.
+        let temp_id = self
+            .channel_manager
+            .create_channel(peer_id, channel_value_sat, push_msat, 0, None, None)
+            .map_err(|e| anyhow::anyhow!("create_channel: {e:?}"))?;
+
+        // FundingGenerationReady fires asynchronously after the peer accepts
+        // the open_channel message. `take` polls the registry (which the
+        // event handler writes into) up to `timeout`.
+        let pending = self
+            .funding_registry
+            .take(temp_id, timeout)
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "timed out waiting for FundingGenerationReady for temp_id {temp_id:?}"
+                )
+            })?;
+        Ok((temp_id, pending))
+    }
+
+    async fn open_channel_finalize(
+        &self,
+        temp_channel_id: &ChannelId,
+        counterparty: &PublicKey,
+        funding_tx: bitcoin::Transaction,
+    ) -> anyhow::Result<()> {
+        if !self.is_running() {
+            anyhow::bail!("node is not running");
+        }
+        self.channel_manager
+            .funding_transaction_generated(*temp_channel_id, *counterparty, funding_tx)
+            .map_err(|e| anyhow::anyhow!("funding_transaction_generated: {e:?}"))?;
         Ok(())
     }
 

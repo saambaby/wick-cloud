@@ -23,6 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::channel_store::{ChannelState, ChannelStore, ChannelUpsert};
 use crate::funding::FundingSource;
+use crate::funding_registry::{PendingFunding, PendingFundingRegistry};
 use crate::payment_store::{Direction, PaymentStatus, PaymentStore, PaymentWrite};
 
 /// Capability contract for components the event handler reaches back into.
@@ -167,6 +168,11 @@ pub struct EventHandler {
     runtime: Handle,
     ops: Arc<dyn EventRuntimeOps>,
     funding: Option<Arc<dyn FundingSource>>,
+    /// If `funding` is `None`, `FundingGenerationReady` events are parked
+    /// here instead, so an out-of-band caller (typically a gRPC handler
+    /// invoking the two-phase `OpenChannelInit` / `OpenChannelFinalize`
+    /// flow) can pick them up and supply a client-signed funding tx.
+    funding_registry: Arc<PendingFundingRegistry>,
     /// Fire-and-forget channel for `ConnectionNeeded` dispatches.
     /// A background task in `NodeBuilder` consumes this and calls
     /// `lightning_net_tokio::connect_outbound`.
@@ -188,6 +194,7 @@ impl EventHandler {
         channels: Arc<ChannelStore>,
         runtime: Handle,
         ops: Arc<dyn EventRuntimeOps>,
+        funding_registry: Arc<PendingFundingRegistry>,
     ) -> Self {
         Self {
             payments,
@@ -195,6 +202,7 @@ impl EventHandler {
             runtime,
             ops,
             funding: None,
+            funding_registry,
             connection_tx: None,
         }
     }
@@ -341,47 +349,61 @@ impl LdkEventHandler for EventHandler {
                 output_script,
                 ..
             } => {
-                let Some(funding) = self.funding.as_ref() else {
-                    warn!(
-                        target: "wick_lightning",
-                        temp_id = ?temporary_channel_id,
-                        "FundingGenerationReady received but no FundingSource bound — \
-                         channel will time out"
-                    );
-                    // Don't replay — nothing changes by replaying without a funder.
-                    return Ok(());
-                };
-                match funding.fund_channel(output_script, channel_value_satoshis) {
-                    Ok(tx) => {
-                        info!(
-                            target: "wick_lightning",
-                            temp_id = ?temporary_channel_id,
-                            counterparty = %counterparty_node_id,
-                            value_sats = channel_value_satoshis,
-                            txid = %tx.compute_txid(),
-                            "funding tx signed; handing to ChannelManager"
-                        );
-                        if let Err(e) = self.ops.funding_transaction_generated(
-                            temporary_channel_id,
-                            counterparty_node_id,
-                            tx,
-                        ) {
+                if let Some(funding) = self.funding.as_ref() {
+                    // Server-side `FundingSource` is bound; produce a signed
+                    // tx synchronously and hand it back to LDK.
+                    match funding.fund_channel(output_script, channel_value_satoshis) {
+                        Ok(tx) => {
+                            info!(
+                                target: "wick_lightning",
+                                temp_id = ?temporary_channel_id,
+                                counterparty = %counterparty_node_id,
+                                value_sats = channel_value_satoshis,
+                                txid = %tx.compute_txid(),
+                                "funding tx signed; handing to ChannelManager"
+                            );
+                            if let Err(e) = self.ops.funding_transaction_generated(
+                                temporary_channel_id,
+                                counterparty_node_id,
+                                tx,
+                            ) {
+                                error!(
+                                    target: "wick_lightning",
+                                    error = %e,
+                                    temp_id = ?temporary_channel_id,
+                                    "funding_transaction_generated rejected"
+                                );
+                            }
+                        }
+                        Err(e) => {
                             error!(
                                 target: "wick_lightning",
                                 error = %e,
                                 temp_id = ?temporary_channel_id,
-                                "funding_transaction_generated rejected"
+                                "FundingSource::fund_channel failed — channel will be abandoned"
                             );
                         }
                     }
-                    Err(e) => {
-                        error!(
-                            target: "wick_lightning",
-                            error = %e,
-                            temp_id = ?temporary_channel_id,
-                            "FundingSource::fund_channel failed — channel will be abandoned"
-                        );
-                    }
+                } else {
+                    // Self-custodial path: park the request so an external
+                    // caller (gRPC `OpenChannelInit` handler) can pick it
+                    // up and supply a client-signed funding tx via
+                    // `NodeApi::open_channel_finalize`.
+                    info!(
+                        target: "wick_lightning",
+                        temp_id = ?temporary_channel_id,
+                        counterparty = %counterparty_node_id,
+                        value_sats = channel_value_satoshis,
+                        "FundingGenerationReady — parking request for client-supplied funding"
+                    );
+                    self.funding_registry.park(
+                        temporary_channel_id,
+                        PendingFunding {
+                            counterparty: counterparty_node_id,
+                            value_sat: channel_value_satoshis,
+                            output_script,
+                        },
+                    );
                 }
             }
 

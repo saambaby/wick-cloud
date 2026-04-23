@@ -130,8 +130,7 @@ impl<S> NodeBuilder<S>
         }
     }
 
-    /// Bind the signer. Phase 1: a `LocalKeysManager` built by
-    /// `wick-testkit::signer::from_seed`. Phase 4: a remote VLS signer.
+    /// Bind the signer. Phase 1: a `LocalKeysManager`. Phase 4: a remote VLS signer.
     #[must_use]
     pub fn with_signer<S2: WickSigner>(self, signer: Arc<S2>) -> NodeBuilder<S2>
         where <S2 as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync
@@ -468,6 +467,11 @@ impl<S> NodeBuilder<S>
             (bitcoin::secp256k1::PublicKey, std::net::SocketAddr)
         >();
         let pending_sent_at: Arc<DashMap<[u8; 32], u64>> = Arc::new(DashMap::new());
+        // Registry that parks FundingGenerationReady events for the
+        // self-custodial two-phase channel-open flow. Shared between the
+        // Node<S> (NodeApi::open_channel_init reads from it) and the
+        // EventHandler (FundingGenerationReady writes to it).
+        let funding_registry = crate::funding_registry::PendingFundingRegistry::new();
 
         // ── Bind P2P listener ────────────────────────────────────────────────
         let listen_bind = deps.listen_addr_for(tenant_id);
@@ -504,6 +508,7 @@ impl<S> NodeBuilder<S>
             stopped: AtomicBool::new(false),
             bg_handles: Mutex::new(Vec::new()),
             pending_sent_at: pending_sent_at.clone(),
+            funding_registry: funding_registry.clone(),
         });
 
         // ── Spawn tasks ──────────────────────────────────────────────────────
@@ -554,7 +559,8 @@ impl<S> NodeBuilder<S>
             payments.clone(),
             channels.clone(),
             deps.runtime.clone(),
-            Arc::new(crate::event::ChannelManagerRuntimeOps(channel_manager.clone()))
+            Arc::new(crate::event::ChannelManagerRuntimeOps(channel_manager.clone())),
+            funding_registry.clone()
         ).with_connection_dispatch(conn_tx);
         if let Some(f) = funding {
             event_handler = event_handler.with_funding_source(f);

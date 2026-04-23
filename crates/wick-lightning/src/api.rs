@@ -6,8 +6,7 @@
 //! because `lightning::sign::SignerProvider` has an associated type
 //! (`EcdsaSigner`) that dynamic dispatch cannot name.
 //!
-//! Both production and tests bind [`crate::Node<S>`]; tests use
-//! `S = LocalKeysManager` constructed via the `wick-testkit` harness.
+//! Both production and tests bind [`crate::Node<S>`] with `S = LocalKeysManager`.
 //! Phase 4's VLS flip changes only which `S` is bound at construction — the
 //! actor side never sees it.
 //!
@@ -68,11 +67,58 @@ pub trait NodeApi: Send + Sync + Debug + 'static {
     async fn connect_peer(&self, node_id: PublicKey, host: &str, port: u16) -> anyhow::Result<()>;
 
     /// Open an outbound channel to an already-connected peer.
+    ///
+    /// Legacy one-shot path: works only if the node was built with a
+    /// [`crate::FundingSource`] bound. LDK's `Event::FundingGenerationReady`
+    /// is consumed by the bound source, which produces + signs the funding
+    /// transaction synchronously. Used by testkit's in-process tests where
+    /// the same process holds both the LDK node and the funding wallet.
+    ///
+    /// Self-custodial callers should use the two-phase
+    /// [`Self::open_channel_init`] + [`Self::open_channel_finalize`] pair
+    /// instead, so the funding tx is built + signed by the **client's**
+    /// BDK wallet and the server-side node is never custodial of the
+    /// funding UTXOs.
     async fn open_channel(
         &self,
         peer_id: PublicKey,
         channel_value_sat: u64,
         push_msat: u64,
+    ) -> anyhow::Result<()>;
+
+    /// Start an outbound channel open and wait for LDK to ask for its
+    /// funding transaction.
+    ///
+    /// Calls `ChannelManager::create_channel` (which returns the
+    /// `temporary_channel_id` LDK will use), then blocks on the node's
+    /// pending-funding registry for up to `timeout`, waiting for the
+    /// matching `Event::FundingGenerationReady` to fire. Returns the
+    /// `(temporary_channel_id, PendingFunding)` pair — `PendingFunding`
+    /// carries the `output_script` and exact `value_sat` the funding tx
+    /// must pay.
+    ///
+    /// Complete the open by calling [`Self::open_channel_finalize`] with
+    /// the signed tx.
+    async fn open_channel_init(
+        &self,
+        peer_id: PublicKey,
+        channel_value_sat: u64,
+        push_msat: u64,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<(ChannelId, crate::PendingFunding)>;
+
+    /// Complete an outbound channel open by handing LDK a pre-signed
+    /// funding transaction.
+    ///
+    /// `temp_channel_id` must match the value LDK returned from the
+    /// matching [`Self::open_channel_init`] call. `funding_tx` must pay
+    /// the exact `channel_value_sat` to the `output_script` from that same
+    /// pending request.
+    async fn open_channel_finalize(
+        &self,
+        temp_channel_id: &ChannelId,
+        counterparty: &PublicKey,
+        funding_tx: bitcoin::Transaction,
     ) -> anyhow::Result<()>;
 
     /// Cooperatively close a channel.
