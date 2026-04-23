@@ -27,7 +27,7 @@ use std::time::{ Duration, Instant };
 use bitcoin::secp256k1::PublicKey;
 use wick_core::TenantId;
 use wick_sdk::regtest::{ wait_until_async, RegtestRpc };
-use wick_sdk::{ PaymentStatus, WickClient, WickConfig };
+use wick_sdk::{ PaymentStatus, WickClient, WickConfig, WickNetwork };
 
 // ── Fixed BIP39 test vectors ──────────────────────────────────────────────────
 //
@@ -131,7 +131,7 @@ async fn full_flow_two_clients_pay_and_reload() {
     );
 
     let config = || {
-        let mut cfg = WickConfig::for_network(bitcoin::Network::Regtest);
+        let mut cfg = WickConfig::for_network(WickNetwork::Regtest);
         cfg.server_endpoint = server.endpoint().to_owned();
         cfg.esplora_url = "http://127.0.0.1:3002".to_owned();
         cfg
@@ -347,8 +347,6 @@ async fn full_flow_two_clients_pay_and_reload() {
         .expect("prior inbound payment must persist across client recreation");
     assert_eq!(bob_inbound.payment_hash, payment_hash);
     assert_eq!(bob_inbound.amount_msat, PAYMENT_AMOUNT_MSAT);
-    eprint!("alice transactions: {:#?}", alice_txs);
-    eprint!("bob transactions: {:#?}", bob_txs);
     // Balances also persist — they're server-held state, unchanged by
     // a client restart.
     let bob_bal_round_2 = bob2.lightning_balance().await.expect("bob2 lightning_balance");
@@ -357,6 +355,7 @@ async fn full_flow_two_clients_pay_and_reload() {
         bob_bal_round_1.lightning_msat,
         "balance must persist across client recreation"
     );
+    eprint!("bob balance after restart: {} msat\n", bob_bal_round_2.lightning_msat);
 
     let _ = server; // keep alive until end; Drop kills the subprocess
 }

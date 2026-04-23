@@ -16,19 +16,15 @@
 
 use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
-use bitcoin::Network;
+use wick_core::WickNetwork;
 use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
 
 /// BIP84 first external receive path parameterised by `coin_type`.
 /// See the module doc — must stay in lockstep with `wick-core`.
-fn identity_path(network: Network) -> String {
-    let coin = match network {
-        Network::Bitcoin => 0,
-        _ => 1,
-    };
-    format!("m/84'/{coin}'/0'/0/0")
+fn identity_path(network: WickNetwork) -> String {
+    format!("m/84'/{}'/0'/0/0", network.bip84_coin_type())
 }
 
 /// Device identity derived from a BIP39 mnemonic.
@@ -62,12 +58,12 @@ impl Identity {
     pub(crate) fn from_mnemonic(
         mnemonic: &str,
         passphrase: Option<&str>,
-        network: Network,
+        network: WickNetwork,
     ) -> Result<Self> {
         let parsed = bip39::Mnemonic::parse(mnemonic)
             .map_err(|e| Error::Identity(format!("bip39 parse: {e}")))?;
         let seed = parsed.to_seed(passphrase.unwrap_or(""));
-        let xprv = Xpriv::new_master(network, &seed)
+        let xprv = Xpriv::new_master(bitcoin::Network::from(network), &seed)
             .map_err(|e| Error::Identity(format!("xpriv master: {e}")))?;
 
         let secp = Secp256k1::new();

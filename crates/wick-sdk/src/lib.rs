@@ -42,3 +42,4 @@ pub use types::{
     Balance, ChannelSummary, CreateTenantOutcome, NodeInfo, PaymentRecord, PaymentResult,
     PaymentStatus, ReceiveInvoice,
 };
+pub use wick_core::WickNetwork;

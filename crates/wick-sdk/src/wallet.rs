@@ -49,12 +49,13 @@ impl OnchainWallet {
         let (wpkh_ext, wpkh_int) = descriptors_bip84(master, coin);
         let (tr_ext, tr_int) = descriptors_bip86(master, coin);
 
+        let bitcoin_network = config.bitcoin_network();
         let p2wpkh = Wallet::create(wpkh_ext, wpkh_int)
-            .network(config.network)
+            .network(bitcoin_network)
             .create_wallet_no_persist()
             .map_err(|e| Error::Wallet(format!("create BIP84 wallet: {e}")))?;
         let p2tr = Wallet::create(tr_ext, tr_int)
-            .network(config.network)
+            .network(bitcoin_network)
             .create_wallet_no_persist()
             .map_err(|e| Error::Wallet(format!("create BIP86 wallet: {e}")))?;
 
@@ -62,7 +63,7 @@ impl OnchainWallet {
             p2wpkh: Mutex::new(p2wpkh),
             p2tr: Mutex::new(p2tr),
             full_scan_done: AtomicBool::new(false),
-            network: config.network,
+            network: bitcoin_network,
         })
     }
 
