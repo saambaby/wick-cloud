@@ -5,7 +5,7 @@
 //! faucet, seed peers) so every crate derives them from one place rather than
 //! scattering magic strings.
 
-use serde::{ Deserialize, Serialize };
+use serde::{Deserialize, Serialize};
 
 /// Networks supported by Wick Cloud.
 ///
@@ -89,22 +89,47 @@ impl WickNetwork {
     pub const fn seed_peers(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::Regtest => &[],
-            Self::Signet =>
-                &[
-                    // ACINQ signet node
-                    (
-                        "0364913d18a19c664bb4802c61fd7bbd915498e5c8a4a2fcb9e9ddd80a5e5a1d96",
-                        "13.248.222.197:9735",
-                    ),
-                ],
-            Self::Mutinynet =>
-                &[
-                    // Mutiny hub node — primary routing peer for mutinynet
-                    (
-                        "02465ed5be53d04fde66c9418ff14a5f2267723810176c9212b722e542dc1afb1b",
-                        "45.79.52.207:9735",
-                    ),
-                ],
+            Self::Signet => &[
+                // ACINQ signet node
+                (
+                    "0364913d18a19c664bb4802c61fd7bbd915498e5c8a4a2fcb9e9ddd80a5e5a1d96",
+                    "13.248.222.197:9735",
+                ),
+            ],
+            Self::Mutinynet => &[
+                // Mutiny hub node — primary routing peer for mutinynet
+                (
+                    "02465ed5be53d04fde66c9418ff14a5f2267723810176c9212b722e542dc1afb1b",
+                    "45.79.52.207:9735",
+                ),
+            ],
+        }
+    }
+
+    /// Default upstream routing peer for *our* operator-mode LSP, as
+    /// `(pubkey_hex, host:port)`.
+    ///
+    /// On signet/mutinynet our LSP runs in-process alongside tenants but
+    /// still needs at least one well-connected upstream so payments can
+    /// traverse the wider Lightning network. The chosen peer is the same
+    /// hub used as a `seed_peer` for tenants — keeping connectivity
+    /// converged simplifies routing.
+    ///
+    /// Returns `None` on regtest (no public network to peer with) — in
+    /// that mode either don't enable the LSP, or the operator wires an
+    /// explicit peer through the `[lsp].upstream_peer` config key.
+    #[must_use]
+    pub const fn default_lsp_upstream(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Regtest => None,
+            Self::Signet => Some((
+                "0364913d18a19c664bb4802c61fd7bbd915498e5c8a4a2fcb9e9ddd80a5e5a1d96",
+                "13.248.222.197:9735",
+            )),
+            Self::Mutinynet => Some((
+                "02465ed5be53d04fde66c9418ff14a5f2267723810176c9212b722e542dc1afb1b",
+                "45.79.52.207:9735",
+            )),
         }
     }
 }
@@ -120,6 +145,7 @@ impl std::fmt::Display for WickNetwork {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -137,9 +163,10 @@ mod tests {
             ("\"signet\"", WickNetwork::Signet),
             ("\"mutinynet\"", WickNetwork::Mutinynet),
         ] {
-            let de: WickNetwork = serde_json::from_str(s).unwrap();
+            let de: WickNetwork =
+                serde_json::from_str(s).expect("hard-coded literal deserializes");
             assert_eq!(de, net);
-            let ser = serde_json::to_string(&net).unwrap();
+            let ser = serde_json::to_string(&net).expect("WickNetwork always serializes");
             assert_eq!(ser, s);
         }
     }

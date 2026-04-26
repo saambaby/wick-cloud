@@ -9,6 +9,7 @@
 pub mod config;
 pub mod error;
 pub mod identity;
+pub mod lsp_config;
 pub mod metrics;
 pub mod network;
 pub mod tenant;
@@ -16,5 +17,6 @@ pub mod tracing_init;
 
 pub use error::{Result, WickError};
 pub use identity::WickIdentity;
+pub use lsp_config::LspConfig;
 pub use network::WickNetwork;
 pub use tenant::TenantId;

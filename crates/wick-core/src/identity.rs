@@ -23,13 +23,13 @@
 //! `coin` follows SLIP-44: `0'` on mainnet, `1'` on all test networks
 //! (regtest / signet / mutinynet).
 
-use bitcoin::bip32::{ DerivationPath, Xpriv, Xpub };
-use bitcoin::secp256k1::{ PublicKey, Secp256k1 };
 use bip39::Mnemonic;
+use bitcoin::bip32::{DerivationPath, Xpriv, Xpub};
+use bitcoin::secp256k1::{PublicKey, Secp256k1};
 
 use crate::network::WickNetwork;
 use crate::tenant::TenantId;
-use crate::{ Result, WickError };
+use crate::{Result, WickError};
 
 /// Derived participant identity — one mnemonic owns the Lightning seed,
 /// the on-chain BDK wallet descriptor, and the tenant registration pubkey.
@@ -70,9 +70,8 @@ impl WickIdentity {
         let btc_network: bitcoin::Network = network.into();
         let secp = Secp256k1::new();
 
-        let master = Xpriv::new_master(btc_network, &seed_64).map_err(|e|
-            WickError::KeyDerivation(format!("new_master: {e}"))
-        )?;
+        let master = Xpriv::new_master(btc_network, &seed_64)
+            .map_err(|e| WickError::KeyDerivation(format!("new_master: {e}")))?;
 
         let coin = network.bip84_coin_type();
         let path: DerivationPath = format!("m/84'/{coin}'/0'/0/0")
@@ -102,9 +101,8 @@ impl WickIdentity {
     /// Returns [`WickError::KeyDerivation`] if the phrase is invalid BIP39
     /// or if key derivation fails (see [`from_mnemonic`](Self::from_mnemonic)).
     pub fn from_phrase(phrase: &str, network: WickNetwork) -> Result<Self> {
-        let mnemonic = Mnemonic::parse(phrase).map_err(|e|
-            WickError::KeyDerivation(format!("mnemonic parse: {e}"))
-        )?;
+        let mnemonic = Mnemonic::parse(phrase)
+            .map_err(|e| WickError::KeyDerivation(format!("mnemonic parse: {e}")))?;
         Self::from_mnemonic(mnemonic, network)
     }
 }
