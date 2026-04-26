@@ -9,8 +9,8 @@ use wick_proto::wick as pb;
 
 use crate::error::{Error, Result};
 use crate::types::{
-    Balance, ChannelSummary, CreateTenantOutcome, NodeInfo, PaymentRecord, PaymentResult,
-    PaymentStatus, ReceiveInvoice,
+    Balance, ChannelSummary, CreateTenantOutcome, JitInvoice, JitQuote, LspInfo, NodeInfo,
+    PaymentRecord, PaymentResult, PaymentStatus, ReceiveInvoice,
 };
 
 pub(crate) fn parse_payment_hash(raw: &[u8]) -> Result<[u8; 32]> {
@@ -88,8 +88,9 @@ impl TryFrom<pb::GetNodeInfoResponse> for NodeInfo {
 
     fn try_from(r: pb::GetNodeInfoResponse) -> Result<Self> {
         let pubkey = parse_pubkey_hex(&r.node_id_hex, "node_id_hex")?;
-        let port = u16::try_from(r.listen_port)
-            .map_err(|_| Error::InvalidResponse(format!("listen_port {} exceeds u16", r.listen_port)))?;
+        let port = u16::try_from(r.listen_port).map_err(|_| {
+            Error::InvalidResponse(format!("listen_port {} exceeds u16", r.listen_port))
+        })?;
         Ok(Self {
             pubkey,
             host: r.listen_host,
@@ -114,6 +115,51 @@ impl TryFrom<pb::ChannelSummary> for ChannelSummary {
             outbound_capacity_msat: c.outbound_capacity_msat,
             inbound_capacity_msat: c.inbound_capacity_msat,
             is_usable: c.is_usable,
+        })
+    }
+}
+
+impl TryFrom<pb::GetLspInfoResponse> for LspInfo {
+    type Error = Error;
+
+    fn try_from(r: pb::GetLspInfoResponse) -> Result<Self> {
+        let pubkey = if r.lsp_pubkey_hex.is_empty() {
+            None
+        } else {
+            Some(parse_pubkey_hex(&r.lsp_pubkey_hex, "lsp_pubkey_hex")?)
+        };
+        Ok(Self {
+            pubkey,
+            address: r.lsp_address,
+            ready: r.ready,
+        })
+    }
+}
+
+impl TryFrom<pb::Lsps2GetInfoResponse> for JitQuote {
+    type Error = Error;
+
+    fn try_from(r: pb::Lsps2GetInfoResponse) -> Result<Self> {
+        Ok(Self {
+            lsp_pubkey: parse_pubkey_hex(&r.lsp_pubkey_hex, "lsp_pubkey_hex")?,
+            min_fee_msat: r.min_fee_msat,
+            proportional_ppm: r.proportional_ppm,
+            min_payment_size_msat: r.min_payment_size_msat,
+            max_payment_size_msat: r.max_payment_size_msat,
+            valid_until_unix: r.valid_until_unix,
+        })
+    }
+}
+
+impl TryFrom<pb::GetJitInvoiceResponse> for JitInvoice {
+    type Error = Error;
+
+    fn try_from(r: pb::GetJitInvoiceResponse) -> Result<Self> {
+        Ok(Self {
+            bolt11: r.bolt11,
+            payment_hash: parse_payment_hash(&r.payment_hash)?,
+            jit_fee_msat_quote: r.jit_fee_msat_quote,
+            lsp_pubkey: parse_pubkey_hex(&r.lsp_pubkey_hex, "lsp_pubkey_hex")?,
         })
     }
 }

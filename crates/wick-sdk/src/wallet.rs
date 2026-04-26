@@ -37,7 +37,10 @@ impl std::fmt::Debug for OnchainWallet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OnchainWallet")
             .field("network", &self.network)
-            .field("full_scan_done", &self.full_scan_done.load(Ordering::Relaxed))
+            .field(
+                "full_scan_done",
+                &self.full_scan_done.load(Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
     }
 }

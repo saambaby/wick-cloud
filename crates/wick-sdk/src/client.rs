@@ -24,8 +24,8 @@ use crate::error::Result;
 use crate::grpc::{empty_token, LightningClient, SharedToken};
 use crate::identity::Identity;
 use crate::types::{
-    Balance, ChannelSummary, CreateTenantOutcome, NodeInfo, PaymentRecord, PaymentResult,
-    ReceiveInvoice,
+    Balance, ChannelSummary, CreateTenantOutcome, JitInvoice, JitQuote, LspInfo, NodeInfo,
+    PaymentRecord, PaymentResult, ReceiveInvoice,
 };
 use crate::wallet::OnchainWallet;
 
@@ -52,11 +52,7 @@ impl WickClient {
     /// Hits the network once — to open the gRPC channel to
     /// `config.server_endpoint`. Key derivation, wallet construction, and
     /// Esplora client setup are offline.
-    pub async fn new(
-        mnemonic: &str,
-        passphrase: Option<&str>,
-        config: WickConfig,
-    ) -> Result<Self> {
+    pub async fn new(mnemonic: &str, passphrase: Option<&str>, config: WickConfig) -> Result<Self> {
         config.validate()?;
 
         let identity = Identity::from_mnemonic(mnemonic, passphrase, config.network)?;
@@ -142,7 +138,10 @@ impl WickClient {
         amount_msat: Option<u64>,
         memo: impl Into<String>,
     ) -> Result<ReceiveInvoice> {
-        self.inner.ln.receive_payment(amount_msat, &memo.into()).await
+        self.inner
+            .ln
+            .receive_payment(amount_msat, &memo.into())
+            .await
     }
 
     /// Paginated payment history, newest first.
@@ -151,7 +150,10 @@ impl WickClient {
         limit: u32,
         before_timestamp: Option<i64>,
     ) -> Result<Vec<PaymentRecord>> {
-        self.inner.ln.get_transactions(limit, before_timestamp).await
+        self.inner
+            .ln
+            .get_transactions(limit, before_timestamp)
+            .await
     }
 
     /// Server-side Lightning node info — pubkey + P2P listen address.
@@ -161,12 +163,7 @@ impl WickClient {
     }
 
     /// Connect to a Lightning peer over P2P and persist it for reconnection.
-    pub async fn connect_peer(
-        &self,
-        peer: PublicKey,
-        host: &str,
-        port: u16,
-    ) -> Result<()> {
+    pub async fn connect_peer(&self, peer: PublicKey, host: &str, port: u16) -> Result<()> {
         self.inner.ln.connect_peer(peer, host, port).await
     }
 
@@ -213,6 +210,45 @@ impl WickClient {
     /// Snapshot of the tenant's current channels.
     pub async fn list_channels(&self) -> Result<Vec<ChannelSummary>> {
         self.inner.ln.list_channels().await
+    }
+
+    // ── LSP / LSPS2 (Phase 3) ────────────────────────────────────────────────
+
+    /// Server-side LSP identity. Returns `LspInfo { pubkey: None, ... }`
+    /// when the server has no operator-mode LSP enabled — JIT calls
+    /// will fail in that configuration.
+    ///
+    /// Public RPC: does not require [`Self::register`] to have been
+    /// called first. Use it on first launch to decide whether to surface
+    /// a "JIT receive" UI option.
+    pub async fn lsp_info(&self) -> Result<LspInfo> {
+        self.inner.ln.get_lsp_info().await
+    }
+
+    /// Negotiate `lsps2.get_info` with the server's LSP and return a
+    /// fee quote. Use to display a fee preview before committing to a
+    /// JIT invoice via [`Self::receive_payment_jit`].
+    pub async fn lsps2_get_info(&self, amount_msat: Option<u64>) -> Result<JitQuote> {
+        self.inner.ln.lsps2_get_info(amount_msat).await
+    }
+
+    /// Issue a JIT-enabled BOLT11 invoice. End-to-end LSPS2 negotiation:
+    /// `get_info` + `buy` against the configured LSP, then a BOLT11 with
+    /// the LSP's intercept SCID embedded as a private route hint.
+    ///
+    /// `amount_msat` is required (LSPS2 buy quotes against a payment
+    /// size). Pays of this exact size — minus the quoted opening fee —
+    /// will route through the LSP, which opens a 0-conf channel to the
+    /// tenant before forwarding.
+    pub async fn receive_payment_jit(
+        &self,
+        amount_msat: u64,
+        memo: impl Into<String>,
+    ) -> Result<JitInvoice> {
+        self.inner
+            .ln
+            .get_jit_invoice(amount_msat, &memo.into())
+            .await
     }
 
     // ── On-chain (BDK + Esplora, bypasses the server) ────────────────────────

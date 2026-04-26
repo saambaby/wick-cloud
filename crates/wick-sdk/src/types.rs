@@ -140,3 +140,54 @@ pub struct ChannelSummary {
     /// payments.
     pub is_usable: bool,
 }
+
+/// Information about the in-process operator-mode LSP.
+///
+/// Returned by [`crate::WickClient::lsp_info`]. `pubkey` is `None` when
+/// the server has no LSP enabled — JIT-related calls will fail in that
+/// configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspInfo {
+    /// 33-byte compressed pubkey of the LSP node, or `None` when LSP is
+    /// disabled on this server.
+    pub pubkey: Option<bitcoin::secp256k1::PublicKey>,
+    /// LSP `host:port` listen address. Empty string when LSP is disabled.
+    pub address: String,
+    /// `true` when the LSP daemon is connected to its upstream and has
+    /// liquidity available.
+    pub ready: bool,
+}
+
+/// LSPS2 fee quote returned by [`crate::WickClient::lsps2_get_info`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JitQuote {
+    /// LSP node pubkey that issued the quote.
+    pub lsp_pubkey: bitcoin::secp256k1::PublicKey,
+    /// Floor opening fee in millisatoshis.
+    pub min_fee_msat: u64,
+    /// Proportional fee in parts-per-million of the JIT payment size.
+    pub proportional_ppm: u32,
+    /// Minimum payment size (msat) the LSP will accept.
+    pub min_payment_size_msat: u64,
+    /// Maximum payment size (msat) the LSP will accept.
+    pub max_payment_size_msat: u64,
+    /// Quote expiry as Unix seconds. After this, the SDK must
+    /// re-request before issuing an invoice.
+    pub valid_until_unix: i64,
+}
+
+/// JIT-enabled BOLT11 invoice produced by
+/// [`crate::WickClient::receive_payment_jit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JitInvoice {
+    /// BOLT11 invoice string carrying the LSP intercept SCID as a
+    /// private route hint.
+    pub bolt11: String,
+    /// 32-byte payment hash embedded in the invoice.
+    pub payment_hash: [u8; 32],
+    /// Quoted opening fee (msat) the LSP will deduct from the first
+    /// inbound payment routed against the intercept SCID.
+    pub jit_fee_msat_quote: u64,
+    /// 33-byte LSP pubkey that will open the JIT channel.
+    pub lsp_pubkey: bitcoin::secp256k1::PublicKey,
+}

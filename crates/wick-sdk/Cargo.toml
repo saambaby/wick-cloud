@@ -27,6 +27,7 @@ thiserror      = { workspace = true }
 tonic          = { workspace = true }
 prost          = { workspace = true }
 tokio          = { workspace = true }
+tokio-stream   = { workspace = true }
 tracing        = { workspace = true }
 hex            = { workspace = true }
 parking_lot    = { workspace = true }
@@ -47,10 +48,20 @@ esplora-client = { workspace = true }
 bitcoincore-rpc = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process"] }
-rand  = { workspace = true }
+tokio             = { workspace = true, features = ["macros", "rt-multi-thread", "process"] }
+rand              = { workspace = true }
+lightning         = { workspace = true }
+lightning-invoice = { workspace = true }
+# Parity test verifies SDK's offline LSP-pubkey derivation matches
+# `wick_lightning::from_seed` server-side (see `operator::tests`).
+wick-lightning    = { workspace = true }
 
 [[test]]
 name = "regtest_flow"
 path = "tests/regtest_flow.rs"
+required-features = ["regtest"]
+
+[[test]]
+name = "jit_flow"
+path = "tests/jit_flow.rs"
 required-features = ["regtest"]

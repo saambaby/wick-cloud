@@ -14,7 +14,7 @@
 //! Today this is purely an identity handle — signing keys are still on the
 //! server (custodial pre-Phase-4).
 
-use bitcoin::bip32::{DerivationPath, Xpriv};
+use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
 use wick_core::WickNetwork;
 use zeroize::Zeroize;
@@ -106,6 +106,34 @@ impl Identity {
         hex::encode(self.node_id.serialize())
     }
 
+    /// Derive the 32-byte LSP Lightning seed used by the operator's
+    /// `RegisterLspIdentity` admin RPC.
+    ///
+    /// Uses a domain-separated BIP32 path (`m/13037'/{coin}'/0'`) so
+    /// this seed is independent of the operator's on-chain BIP84
+    /// receive addresses and of the on-device tenant identity. The
+    /// resulting 32 bytes are the `private_key` of the derived xpriv —
+    /// same shape `wick_lightning::from_seed` consumes today.
+    ///
+    /// Phase 4 swaps this for a remote-signer handle on the device;
+    /// the seed never crosses the wire then.
+    pub(crate) fn lsp_lightning_seed(&self, network: WickNetwork) -> Result<[u8; 32]> {
+        let secp = Secp256k1::new();
+        let coin = network.bip84_coin_type();
+        let path = DerivationPath::from(vec![
+            ChildNumber::from_hardened_idx(13037)
+                .map_err(|e| Error::Identity(format!("lsp path 13037': {e}")))?,
+            ChildNumber::from_hardened_idx(coin)
+                .map_err(|e| Error::Identity(format!("lsp path coin': {e}")))?,
+            ChildNumber::from_hardened_idx(0)
+                .map_err(|e| Error::Identity(format!("lsp path 0': {e}")))?,
+        ]);
+        let derived = self
+            .xprv
+            .derive_priv(&secp, &path)
+            .map_err(|e| Error::Identity(format!("derive lsp seed: {e}")))?;
+        Ok(derived.private_key.secret_bytes())
+    }
 }
 
 impl Drop for Identity {

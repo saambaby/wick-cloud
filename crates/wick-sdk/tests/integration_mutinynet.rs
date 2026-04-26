@@ -478,7 +478,9 @@ async fn run_funding_and_open_path(
                 .await
                 .expect("bob usable");
         }
-        (false, false) => unreachable!("run_funding_and_open_path called with no tenants needing it"),
+        (false, false) => {
+            unreachable!("run_funding_and_open_path called with no tenants needing it")
+        }
     }
 }
 
@@ -495,11 +497,7 @@ async fn register_client(mnemonic: &str, label: &str) -> WickClient {
     client
 }
 
-async fn wait_for_usable(
-    client: &WickClient,
-    label: &str,
-    budget: Duration,
-) -> Result<(), String> {
+async fn wait_for_usable(client: &WickClient, label: &str, budget: Duration) -> Result<(), String> {
     let deadline = Instant::now() + budget;
     loop {
         if Instant::now() >= deadline {

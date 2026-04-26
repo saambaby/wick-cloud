@@ -21,13 +21,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::net::TcpStream;
-use std::process::{ Command as StdCommand, Stdio };
-use std::time::{ Duration, Instant };
+use std::process::{Command as StdCommand, Stdio};
+use std::time::{Duration, Instant};
 
 use bitcoin::secp256k1::PublicKey;
 use wick_core::TenantId;
-use wick_sdk::regtest::{ wait_until_async, RegtestRpc };
-use wick_sdk::{ PaymentStatus, WickClient, WickConfig, WickNetwork };
+use wick_sdk::regtest::{wait_until_async, RegtestRpc};
+use wick_sdk::{PaymentStatus, WickClient, WickConfig, WickNetwork};
 
 // ── Fixed BIP39 test vectors ──────────────────────────────────────────────────
 //
@@ -77,7 +77,15 @@ impl HostedServer {
 
         let child = StdCommand::new("cargo")
             .current_dir(&workspace_root)
-            .args(["run", "--quiet", "--bin", "wick-server", "--", "--config", &config_path])
+            .args([
+                "run",
+                "--quiet",
+                "--bin",
+                "wick-server",
+                "--",
+                "--config",
+                &config_path,
+            ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
@@ -126,9 +134,8 @@ async fn full_flow_two_clients_pay_and_reload() {
 
     // Regtest chain controller (bitcoind RPC). Credentials come from
     // `deploy/docker/docker-compose.yml` — fixed to `wick:wick`.
-    let rpc = RegtestRpc::connect("http://127.0.0.1:18443", "wick", "wick").expect(
-        "RegtestRpc::connect"
-    );
+    let rpc =
+        RegtestRpc::connect("http://127.0.0.1:18443", "wick", "wick").expect("RegtestRpc::connect");
 
     let config = || {
         let mut cfg = WickConfig::for_network(WickNetwork::Regtest);
@@ -139,10 +146,12 @@ async fn full_flow_two_clients_pay_and_reload() {
 
     // ── Round 1: fresh registration, open channel, payment ────────────────
 
-    let alice = WickClient::new(ALICE_MNEMONIC, None, config()).await.expect(
-        "alice WickClient::new"
-    );
-    let bob = WickClient::new(BOB_MNEMONIC, None, config()).await.expect("bob WickClient::new");
+    let alice = WickClient::new(ALICE_MNEMONIC, None, config())
+        .await
+        .expect("alice WickClient::new");
+    let bob = WickClient::new(BOB_MNEMONIC, None, config())
+        .await
+        .expect("bob WickClient::new");
 
     let alice_tenant_outcome = alice.register("free").await.expect("alice register");
     let bob_tenant_outcome = bob.register("free").await.expect("bob register");
@@ -153,7 +162,9 @@ async fn full_flow_two_clients_pay_and_reload() {
     let expected_alice_tid = TenantId::from_pubkey(&alice.node_id().serialize())
         .as_uuid()
         .to_string();
-    let expected_bob_tid = TenantId::from_pubkey(&bob.node_id().serialize()).as_uuid().to_string();
+    let expected_bob_tid = TenantId::from_pubkey(&bob.node_id().serialize())
+        .as_uuid()
+        .to_string();
     assert_eq!(alice_tenant_outcome.tenant_id, expected_alice_tid);
     assert_eq!(bob_tenant_outcome.tenant_id, expected_bob_tid);
 
@@ -167,23 +178,29 @@ async fn full_flow_two_clients_pay_and_reload() {
     // called below.
     let alice_client_addr = alice.next_address_p2wpkh().expect("alice client addr");
     rpc.mine(101).expect("mine coinbase maturation");
-    rpc.send_to_address(&alice_client_addr, FUNDING_TRANSFER_SAT).expect("send_to_address");
+    rpc.send_to_address(&alice_client_addr, FUNDING_TRANSFER_SAT)
+        .expect("send_to_address");
     rpc.mine(1).expect("mine funding conf");
 
     // Wait for electrs to index the funding block, then sync the SDK's
     // client-side BDK so it sees the new UTXO.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    wait_until_async("alice client-side BDK sees funding UTXO", ONCHAIN_SYNC_TIMEOUT, || {
-        let a = alice.clone();
-        async move {
-            if a.sync_onchain().await.is_err() {
-                return false;
+    wait_until_async(
+        "alice client-side BDK sees funding UTXO",
+        ONCHAIN_SYNC_TIMEOUT,
+        || {
+            let a = alice.clone();
+            async move {
+                if a.sync_onchain().await.is_err() {
+                    return false;
+                }
+                a.onchain_spendable_sat()
+                    .map(|s| s >= FUNDING_TRANSFER_SAT - 10_000)
+                    .unwrap_or(false)
             }
-            a.onchain_spendable_sat()
-                .map(|s| s >= FUNDING_TRANSFER_SAT - 10_000)
-                .unwrap_or(false)
-        }
-    }).await;
+        },
+    )
+    .await;
 
     // Alice tells Bob which peer to be / where to reach him. Since this
     // is a same-server setup, the listen_host the server reports may be
@@ -195,15 +212,21 @@ async fn full_flow_two_clients_pay_and_reload() {
     };
 
     alice
-        .connect_peer(bob_info.pubkey, &dial_host, bob_info.port).await
+        .connect_peer(bob_info.pubkey, &dial_host, bob_info.port)
+        .await
         .expect("alice connect_peer");
 
-    alice.open_channel(bob_info.pubkey, CHANNEL_VALUE_SAT, 0).await.expect("alice open_channel");
+    alice
+        .open_channel(bob_info.pubkey, CHANNEL_VALUE_SAT, 0)
+        .await
+        .expect("alice open_channel");
 
     // LDK's broadcaster is fire-and-forget; wait for bitcoind to see the
     // funding tx before mining, otherwise blocks land before the tx
     // reaches the mempool and the channel gets stranded.
-    rpc.wait_for_mempool_size(1, Duration::from_secs(10)).await.expect("funding tx in mempool");
+    rpc.wait_for_mempool_size(1, Duration::from_secs(10))
+        .await
+        .expect("funding tx in mempool");
     rpc.mine(10).expect("mine funding confs");
 
     // Wait for the channel to reach routable capacity. `is_usable` alone
@@ -212,24 +235,29 @@ async fn full_flow_two_clients_pay_and_reload() {
     wait_until_async("channel routable for payment", LN_POLL_TIMEOUT, || {
         let a = alice.clone();
         async move {
-            a.list_channels().await
+            a.list_channels()
+                .await
                 .map(|chs| {
-                    chs.iter().any(|c| {
-                        c.is_usable && c.outbound_capacity_msat >= PAYMENT_AMOUNT_MSAT
-                    })
+                    chs.iter()
+                        .any(|c| c.is_usable && c.outbound_capacity_msat >= PAYMENT_AMOUNT_MSAT)
                 })
                 .unwrap_or(false)
         }
-    }).await;
+    })
+    .await;
 
     // Bob issues a 10k-sat invoice; Alice pays it.
     let invoice = bob
-        .receive_payment(Some(PAYMENT_AMOUNT_MSAT), "full-flow").await
+        .receive_payment(Some(PAYMENT_AMOUNT_MSAT), "full-flow")
+        .await
         .expect("bob receive_payment");
     assert!(!invoice.bolt11.is_empty());
     let payment_hash = invoice.payment_hash;
 
-    let send = alice.send_payment(&invoice.bolt11).await.expect("alice send_payment");
+    let send = alice
+        .send_payment(&invoice.bolt11)
+        .await
+        .expect("alice send_payment");
     assert_eq!(send.status, PaymentStatus::Pending);
     assert_eq!(send.payment_hash, payment_hash);
 
@@ -238,21 +266,27 @@ async fn full_flow_two_clients_pay_and_reload() {
     {
         let a = alice.clone();
         let h = hash_hex.clone();
-        wait_until_async("alice sees outbound Succeeded", LN_POLL_TIMEOUT, move || {
-            let a = a.clone();
-            let h = h.clone();
-            async move {
-                a.transactions(20, None).await
-                    .map(|rows| {
-                        rows.iter().any(|p| {
-                            hex::encode(p.payment_hash) == h &&
-                                p.is_outbound &&
-                                p.status == PaymentStatus::Succeeded
+        wait_until_async(
+            "alice sees outbound Succeeded",
+            LN_POLL_TIMEOUT,
+            move || {
+                let a = a.clone();
+                let h = h.clone();
+                async move {
+                    a.transactions(20, None)
+                        .await
+                        .map(|rows| {
+                            rows.iter().any(|p| {
+                                hex::encode(p.payment_hash) == h
+                                    && p.is_outbound
+                                    && p.status == PaymentStatus::Succeeded
+                            })
                         })
-                    })
-                    .unwrap_or(false)
-            }
-        }).await;
+                        .unwrap_or(false)
+                }
+            },
+        )
+        .await;
     }
     {
         let b = bob.clone();
@@ -261,17 +295,19 @@ async fn full_flow_two_clients_pay_and_reload() {
             let b = b.clone();
             let h = h.clone();
             async move {
-                b.transactions(20, None).await
+                b.transactions(20, None)
+                    .await
                     .map(|rows| {
                         rows.iter().any(|p| {
-                            hex::encode(p.payment_hash) == h &&
-                                !p.is_outbound &&
-                                p.status == PaymentStatus::Succeeded
+                            hex::encode(p.payment_hash) == h
+                                && !p.is_outbound
+                                && p.status == PaymentStatus::Succeeded
                         })
                     })
                     .unwrap_or(false)
             }
-        }).await;
+        })
+        .await;
     }
 
     // Verify the funds actually moved to Bob's side of the channel. On a
@@ -279,7 +315,8 @@ async fn full_flow_two_clients_pay_and_reload() {
     // 10k-sat payment his outbound should be close to 10k sats minus
     // the reserve (~2k sats).
     let bob_bal_round_1 = bob
-        .lightning_balance().await
+        .lightning_balance()
+        .await
         .expect("bob lightning_balance after payment");
     assert!(
         bob_bal_round_1.lightning_msat >= 7_000_000,
@@ -288,7 +325,8 @@ async fn full_flow_two_clients_pay_and_reload() {
     );
 
     let alice_bal_round_1 = alice
-        .lightning_balance().await
+        .lightning_balance()
+        .await
         .expect("alice lightning_balance after payment");
     assert!(
         alice_bal_round_1.lightning_msat > 0,
@@ -307,10 +345,12 @@ async fn full_flow_two_clients_pay_and_reload() {
     drop(alice);
     drop(bob);
 
-    let alice2 = WickClient::new(ALICE_MNEMONIC, None, config()).await.expect(
-        "alice2 WickClient::new"
-    );
-    let bob2 = WickClient::new(BOB_MNEMONIC, None, config()).await.expect("bob2 WickClient::new");
+    let alice2 = WickClient::new(ALICE_MNEMONIC, None, config())
+        .await
+        .expect("alice2 WickClient::new");
+    let bob2 = WickClient::new(BOB_MNEMONIC, None, config())
+        .await
+        .expect("bob2 WickClient::new");
 
     // Identity is a pure function of the mnemonic, so pubkeys must match.
     assert_eq!(alice2.node_id(), alice_node_id);
@@ -324,15 +364,20 @@ async fn full_flow_two_clients_pay_and_reload() {
     assert_eq!(alice_out_2.tenant_id, alice_tenant_outcome.tenant_id);
     assert_eq!(bob_out_2.tenant_id, bob_tenant_outcome.tenant_id);
     assert_ne!(
-        alice_out_2.api_token,
-        alice_tenant_outcome.api_token,
+        alice_out_2.api_token, alice_tenant_outcome.api_token,
         "re-register must rotate the api_token"
     );
     assert_ne!(bob_out_2.api_token, bob_tenant_outcome.api_token);
 
     // Transactions persist — fresh client sees the same payment history.
-    let alice_txs = alice2.transactions(20, None).await.expect("alice2 transactions");
-    let bob_txs = bob2.transactions(20, None).await.expect("bob2 transactions");
+    let alice_txs = alice2
+        .transactions(20, None)
+        .await
+        .expect("alice2 transactions");
+    let bob_txs = bob2
+        .transactions(20, None)
+        .await
+        .expect("bob2 transactions");
 
     let alice_outbound = alice_txs
         .iter()
@@ -349,13 +394,18 @@ async fn full_flow_two_clients_pay_and_reload() {
     assert_eq!(bob_inbound.amount_msat, PAYMENT_AMOUNT_MSAT);
     // Balances also persist — they're server-held state, unchanged by
     // a client restart.
-    let bob_bal_round_2 = bob2.lightning_balance().await.expect("bob2 lightning_balance");
+    let bob_bal_round_2 = bob2
+        .lightning_balance()
+        .await
+        .expect("bob2 lightning_balance");
     assert_eq!(
-        bob_bal_round_2.lightning_msat,
-        bob_bal_round_1.lightning_msat,
+        bob_bal_round_2.lightning_msat, bob_bal_round_1.lightning_msat,
         "balance must persist across client recreation"
     );
-    eprint!("bob balance after restart: {} msat\n", bob_bal_round_2.lightning_msat);
+    eprint!(
+        "bob balance after restart: {} msat\n",
+        bob_bal_round_2.lightning_msat
+    );
 
     let _ = server; // keep alive until end; Drop kills the subprocess
 }

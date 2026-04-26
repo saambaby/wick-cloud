@@ -29,6 +29,7 @@ mod config;
 mod error;
 mod grpc;
 mod identity;
+mod operator;
 mod types;
 mod wallet;
 
@@ -38,8 +39,11 @@ pub mod regtest;
 pub use client::WickClient;
 pub use config::WickConfig;
 pub use error::{Error, Result};
+pub use operator::{
+    compute_operator_lsp_pubkey, run_funding_loop, OperatorClient, PendingFundingEvent,
+};
 pub use types::{
-    Balance, ChannelSummary, CreateTenantOutcome, NodeInfo, PaymentRecord, PaymentResult,
-    PaymentStatus, ReceiveInvoice,
+    Balance, ChannelSummary, CreateTenantOutcome, JitInvoice, JitQuote, LspInfo, NodeInfo,
+    PaymentRecord, PaymentResult, PaymentStatus, ReceiveInvoice,
 };
 pub use wick_core::WickNetwork;

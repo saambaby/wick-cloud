@@ -66,10 +66,16 @@ impl RegtestRpc {
         // Switch to the wallet-scoped endpoint so subsequent calls
         // (`send_to_address`, `get_new_address`) target it explicitly.
         let wallet_url = format!("{}/wallet/{}", url.trim_end_matches('/'), wallet_name);
-        let client = Client::new(&wallet_url, Auth::UserPass(user.to_owned(), pass.to_owned()))
-            .map_err(|e| Error::Chain(format!("bitcoincore-rpc wallet connect: {e}")))?;
+        let client = Client::new(
+            &wallet_url,
+            Auth::UserPass(user.to_owned(), pass.to_owned()),
+        )
+        .map_err(|e| Error::Chain(format!("bitcoincore-rpc wallet connect: {e}")))?;
 
-        Ok(Self { client, wallet_name })
+        Ok(Self {
+            client,
+            wallet_name,
+        })
     }
 
     /// Current chain tip height.
