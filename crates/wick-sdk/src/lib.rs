@@ -30,8 +30,14 @@ mod error;
 mod grpc;
 mod identity;
 mod operator;
+pub mod signer;
 mod types;
 mod wallet;
+
+/// Bound on the in-flight outbound mpsc inside [`signer::SignerLoop`].
+/// Sized to absorb a burst from the hottest path (every HTLC sig on a
+/// commitment update) without back-pressuring the VLS handler.
+pub const SIGNER_OUTBOUND_CAPACITY: usize = 256;
 
 #[cfg(feature = "regtest")]
 pub mod regtest;

@@ -27,6 +27,7 @@ use crate::types::{
     Balance, ChannelSummary, CreateTenantOutcome, JitInvoice, JitQuote, LspInfo, NodeInfo,
     PaymentRecord, PaymentResult, ReceiveInvoice,
 };
+use crate::signer::SignerLoop;
 use crate::wallet::OnchainWallet;
 
 /// Canonical Wick Cloud client.
@@ -118,6 +119,27 @@ impl WickClient {
             .await?;
         *self.inner.token.write() = Some(outcome.api_token.clone());
         *self.inner.tenant_id.write() = Some(outcome.tenant_id.clone());
+
+        // Phase-4: spawn the on-device signer loop on a background task as
+        // soon as we have a bearer token. The server's per-tenant
+        // `wick_vls::SignerSession` resolves the live SDK side of this
+        // bidi stream on every LDK signer-trait call. Without this, the
+        // tenant's `Node` cannot sign anything (parked).
+        let seed = self
+            .inner
+            .identity
+            .tenant_lightning_seed(self.inner.config.network)?;
+        let xprv = *self.inner.identity.master_xprv();
+        let endpoint = self.inner.config.server_endpoint.clone();
+        let token = Arc::clone(&self.inner.token);
+        let network = self.inner.config.network;
+        tokio::spawn(async move {
+            let loop_inst = SignerLoop::new(endpoint, token, seed, xprv, network);
+            if let Err(e) = loop_inst.run().await {
+                tracing::warn!(target: "wick_sdk::client", %e, "signer loop terminated");
+            }
+        });
+
         Ok(outcome)
     }
 

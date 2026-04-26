@@ -117,6 +117,35 @@ impl Identity {
     ///
     /// Phase 4 swaps this for a remote-signer handle on the device;
     /// the seed never crosses the wire then.
+    /// Derive the 32-byte tenant Lightning seed used by the Phase-4 SDK
+    /// signer loop ([`crate::signer::SignerLoop`]).
+    ///
+    /// Domain-separated from both the BIP84 on-chain identity path
+    /// (`m/84'/{coin}'/0'/0/0`) and the operator's LSP Lightning seed
+    /// (`m/13037'/{coin}'/0'`) by a fresh hardened path
+    /// (`m/13038'/{coin}'/0'`), so the tenant's Lightning identity is
+    /// independent of every other key the SDK derives. The 32 bytes are
+    /// the `private_key` of the derived xpriv — the same shape
+    /// `vls_protocol_signer::handler::HandlerBuilder::new(_, _, _, seed)`
+    /// consumes.
+    pub(crate) fn tenant_lightning_seed(&self, network: WickNetwork) -> Result<[u8; 32]> {
+        let secp = Secp256k1::new();
+        let coin = network.bip84_coin_type();
+        let path = DerivationPath::from(vec![
+            ChildNumber::from_hardened_idx(13038)
+                .map_err(|e| Error::Identity(format!("tenant path 13038': {e}")))?,
+            ChildNumber::from_hardened_idx(coin)
+                .map_err(|e| Error::Identity(format!("tenant path coin': {e}")))?,
+            ChildNumber::from_hardened_idx(0)
+                .map_err(|e| Error::Identity(format!("tenant path 0': {e}")))?,
+        ]);
+        let derived = self
+            .xprv
+            .derive_priv(&secp, &path)
+            .map_err(|e| Error::Identity(format!("derive tenant seed: {e}")))?;
+        Ok(derived.private_key.secret_bytes())
+    }
+
     pub(crate) fn lsp_lightning_seed(&self, network: WickNetwork) -> Result<[u8; 32]> {
         let secp = Secp256k1::new();
         let coin = network.bip84_coin_type();

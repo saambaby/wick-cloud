@@ -44,6 +44,17 @@ bdk_wallet     = { workspace = true }
 bdk_esplora    = { workspace = true }
 esplora-client = { workspace = true }
 
+# remote-signer loop. vls-protocol-signer pulls in `lightning = "0.1.x"` via
+# `vls-core`, which is fine here because wick-sdk has NO direct lightning
+# dep — the two trees coexist as separate crates from cargo's perspective.
+vls-protocol        = "0.14.0"
+vls-protocol-signer = "0.14.0"
+futures             = { workspace = true }
+hmac                = { workspace = true }
+sha2                = { workspace = true }
+anyhow              = { workspace = true }
+rand                = { workspace = true }
+
 # optional — only enabled by the `regtest` feature
 bitcoincore-rpc = { workspace = true, optional = true }
 

@@ -1,0 +1,503 @@
+//! Phase-4 SDK signer loop.
+//!
+//! Opens a long-lived `SignerService.Attach` bidi gRPC stream against the
+//! Wick server, consumes wire-encoded VLS frames, dispatches each to either
+//! the local [`vls_protocol_signer`] handler chain or one of the five Wick
+//! extension RPCs (`0xFD01–0xFD05`), and streams the response back. The
+//! tenant Lightning seed lives exclusively here.
+//!
+//! ## Wire layout (recap — see `wick_vls::SignerConnection`)
+//!
+//! Outbound (server → SDK), unwrapped from `SignerOutbound::vls_call`:
+//!
+//! - Node call:    `[4B req_id BE][0x01][3B reserved][type:u16 BE][data]`
+//! - Channel call: `[4B req_id BE][0x02][3B reserved][8B dbid BE][33B peer_id][type:u16 BE][data]`
+//!
+//! Inbound (SDK → server), wrapped in `SignerInbound::vls_response`:
+//!
+//! - `[4B req_id BE][1B status][body]` — `status=0x00` OK / `0x01` UTF-8 error.
+//!
+//! ## Extension RPCs
+//!
+//! Five custom request types live above the standard VLS namespace. The
+//! type byte (`u16 BE` at offset 0 of the inner payload) selects the
+//! dispatch:
+//!
+//! - `0xFD01` `GetLdkNodeKeys` — derive the three LDK-only node keys
+//!   (peer-storage / inbound-payment / receive-auth) from the master
+//!   Lightning seed via domain-separated HKDF-SHA256.
+//! - `0xFD02` `VssEncrypt` — not implemented; returns an error frame.
+//! - `0xFD03` `VssDecrypt` — not implemented; returns an error frame.
+//! - `0xFD04` `GetSpliceNewFundingPubkey` — not implemented; returns an
+//!   error frame. Splicing is out of scope for the initial Phase-4 cut.
+//! - `0xFD05` `GetWalletAddress` — derive a P2WPKH address at the requested
+//!   BIP32 index from the master xprv (matches the on-chain wallet).
+
+use std::sync::Arc;
+
+use bitcoin::bip32::{ ChildNumber, DerivationPath, Xpriv };
+use bitcoin::secp256k1::Secp256k1;
+use futures::StreamExt;
+use hmac::{ Hmac, Mac };
+use parking_lot::Mutex;
+use sha2::Sha256;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::{ Channel, Endpoint };
+use tonic::Request;
+use vls_protocol::msgs::{ self as vls_msgs, Message, SerBolt };
+use vls_protocol::model::{ ExtKey, PubKey };
+use vls_protocol_signer::approver::PositiveApprover;
+use vls_protocol_signer::handler::{ Handler, HandlerBuilder, InitHandler, RootHandler };
+use vls_protocol_signer::lightning_signer;
+use wick_core::WickNetwork;
+use wick_proto::wick::signer_service_client::SignerServiceClient;
+use wick_proto::wick::{ signer_inbound, signer_outbound, SignerInbound };
+
+use crate::error::{ Error, Result };
+use crate::grpc::SharedToken;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// The tenant signer loop. Construct with [`SignerLoop::new`] and drive
+/// with [`SignerLoop::run`]. Drops the loop cleanly when the underlying
+/// stream ends; the caller is responsible for re-spawning on auth refresh.
+pub struct SignerLoop {
+    endpoint: String,
+    token: SharedToken,
+    seed: [u8; 32],
+    xprv: Xpriv,
+    network: WickNetwork,
+}
+
+impl std::fmt::Debug for SignerLoop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignerLoop")
+            .field("endpoint", &self.endpoint)
+            .field("network", &self.network)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SignerLoop {
+    /// Build a loop for the given `(endpoint, token, seed, xprv, network)`.
+    /// The seed is the 32-byte tenant Lightning seed
+    /// ([`crate::identity::Identity::tenant_lightning_seed`]); `xprv` is
+    /// the master xpriv used for `0xFD05` wallet address derivation.
+    #[must_use]
+    pub fn new(
+        endpoint: String,
+        token: SharedToken,
+        seed: [u8; 32],
+        xprv: Xpriv,
+        network: WickNetwork
+    ) -> Self {
+        Self {
+            endpoint,
+            token,
+            seed,
+            xprv,
+            network,
+        }
+    }
+
+    /// Connect, attach, and process frames until the stream ends or errors.
+    /// Returns `Ok(())` on a clean stream-end, `Err` on transport/auth
+    /// failure. Intended to run on a dedicated background task.
+    pub async fn run(self) -> Result<()> {
+        let ep = Endpoint::from_shared(self.endpoint.clone()).map_err(|e|
+            Error::Config(format!("invalid signer endpoint: {e}"))
+        )?;
+        let channel: Channel = ep
+            .connect().await
+            .map_err(|e| Error::Config(format!("signer connect: {e}")))?;
+
+        let mut client = SignerServiceClient::new(channel);
+
+        // Outbound channel: this SDK's responses → server.
+        let (resp_tx, resp_rx) = mpsc::channel::<SignerInbound>(crate::SIGNER_OUTBOUND_CAPACITY);
+        let outbound_stream = ReceiverStream::new(resp_rx);
+
+        // Attach the bearer token via request metadata. tonic only invokes
+        // unary interceptors; for streaming RPCs we attach manually.
+        let mut attach_req = Request::new(outbound_stream);
+        let token_value = self.token
+            .read()
+            .clone()
+            .ok_or_else(|| Error::Config("signer loop requires bearer token".to_owned()))?;
+        attach_req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token_value}")
+                .parse()
+                .map_err(|e| Error::Config(format!("invalid auth metadata: {e}")))?
+        );
+        let mut inbound = client
+            .attach(attach_req).await
+            .map_err(|e| Error::Config(format!("signer attach: {e}")))?
+            .into_inner();
+
+        // VLS handler state machine — Init → Ready on `done = true` from
+        // `InitHandler::handle`.
+        let state = Arc::new(Mutex::new(SignerState::new(self.seed, self.network.into())?));
+
+        while let Some(item) = inbound.next().await {
+            let msg = match item {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::info!(target: "wick_sdk::signer", %e, "signer stream errored");
+                    break;
+                }
+            };
+            let Some(signer_outbound::Kind::VlsCall(encoded)) = msg.kind else {
+                tracing::warn!(target: "wick_sdk::signer", "SignerOutbound with empty kind — skipping");
+                continue;
+            };
+
+            let response = match
+                handle_frame(&state, &self.xprv, &self.seed, self.network, encoded)
+            {
+                Ok((req_id, body)) => encode_success(req_id, body),
+                Err((req_id, err)) => {
+                    tracing::warn!(target: "wick_sdk::signer", req_id, %err, "signer call failed");
+                    encode_error(req_id, &err)
+                }
+            };
+
+            if
+                resp_tx
+                    .send(SignerInbound {
+                        kind: Some(signer_inbound::Kind::VlsResponse(response)),
+                    }).await
+                    .is_err()
+            {
+                tracing::info!(target: "wick_sdk::signer", "outbound channel closed; ending loop");
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+// ── VLS handler state machine ─────────────────────────────────────────────────
+
+enum SignerState {
+    Init(InitHandler),
+    Ready(RootHandler),
+}
+
+impl SignerState {
+    fn new(seed: [u8; 32], network: bitcoin::Network) -> Result<Self> {
+        let persister: Arc<dyn lightning_signer::persist::Persist> = Arc::new(
+            lightning_signer::persist::DummyPersister {}
+        );
+        let validator_factory = Arc::new(
+            lightning_signer::policy::simple_validator::SimpleValidatorFactory::new()
+        );
+        let starting_time_factory = lightning_signer::signer::ClockStartingTimeFactory::new();
+        let clock = Arc::new(lightning_signer::util::clock::StandardClock());
+        let services = lightning_signer::node::NodeServices {
+            validator_factory,
+            starting_time_factory,
+            persister,
+            clock,
+            trusted_oracle_pubkeys: vec![],
+        };
+        let init = HandlerBuilder::new(network, 0, services, seed)
+            .approver(Arc::new(PositiveApprover()))
+            .build()
+            .map_err(|e| Error::Config(format!("VLS InitHandler build: {e:?}")))?;
+        Ok(Self::Init(init))
+    }
+
+    fn handle_node(&mut self, message: Message) -> std::result::Result<Vec<u8>, String> {
+        match self {
+            SignerState::Init(init_handler) => {
+                let (done, reply) = init_handler
+                    .handle(message)
+                    .map_err(|e| format!("init handler error: {e:?}"))?;
+                let body = reply.map(|r| r.as_vec()).unwrap_or_default();
+                if done {
+                    let root: RootHandler = init_handler.clone().into();
+                    *self = SignerState::Ready(root);
+                }
+                Ok(body)
+            }
+            SignerState::Ready(root_handler) =>
+                match message {
+                    // Re-init after wick-server restart: keep returning the same
+                    // node identity rather than panicking the loop.
+                    Message::HsmdInit2(_) => {
+                        let bip32 = root_handler.node().get_account_extended_pubkey().encode();
+                        let node_id = root_handler.node().get_id().serialize();
+                        let bolt12 = root_handler.node().get_bolt12_pubkey().serialize();
+                        let reply = vls_msgs::HsmdInit2Reply {
+                            node_id: PubKey(node_id),
+                            bip32: ExtKey(bip32),
+                            bolt12: PubKey(bolt12),
+                        };
+                        Ok(reply.as_vec())
+                    }
+                    // GetChannelBasepoints can race a NewChannel — retry once
+                    // after creating the channel if the signer says it's
+                    // unknown.
+                    Message::GetChannelBasepoints(m) => {
+                        let node_id = m.node_id.clone();
+                        let dbid = m.dbid;
+                        let req = Message::GetChannelBasepoints(vls_msgs::GetChannelBasepoints {
+                            node_id: node_id.clone(),
+                            dbid,
+                        });
+                        match root_handler.handle(req) {
+                            Ok(reply) => Ok(reply.as_vec()),
+                            Err(err) => {
+                                let msg = format!("{err:?}");
+                                if msg.contains("no such channel") {
+                                    let _ = root_handler.handle(
+                                        Message::NewChannel(vls_msgs::NewChannel {
+                                            peer_id: node_id.clone(),
+                                            dbid,
+                                        })
+                                    );
+                                    let retry = Message::GetChannelBasepoints(
+                                        vls_msgs::GetChannelBasepoints { node_id, dbid }
+                                    );
+                                    root_handler
+                                        .handle(retry)
+                                        .map(|reply| reply.as_vec())
+                                        .map_err(|e| format!("root handler retry error: {e:?}"))
+                                } else {
+                                    Err(format!("root handler error: {err:?}"))
+                                }
+                            }
+                        }
+                    }
+                    other =>
+                        root_handler
+                            .handle(other)
+                            .map(|reply| reply.as_vec())
+                            .map_err(|e| format!("root handler error: {e:?}")),
+                }
+        }
+    }
+
+    fn handle_channel(
+        &self,
+        dbid: u64,
+        peer_id: [u8; 33],
+        payload: &[u8]
+    ) -> std::result::Result<Vec<u8>, String> {
+        let SignerState::Ready(root_handler) = self else {
+            return Err("channel request received before signer init".to_owned());
+        };
+        let message = vls_msgs
+            ::from_vec(payload.to_vec())
+            .map_err(|e| format!("channel decode message: {e:?}"))?;
+        let handler = root_handler.for_new_client(0, PubKey(peer_id), dbid);
+        match handler.handle(message) {
+            Ok(reply) => Ok(reply.as_vec()),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                if !msg.contains("no such channel") {
+                    return Err(format!("channel handler error: {e:?}"));
+                }
+                root_handler
+                    .handle(
+                        Message::NewChannel(vls_msgs::NewChannel {
+                            peer_id: PubKey(peer_id),
+                            dbid,
+                        })
+                    )
+                    .map_err(|e2| format!("NewChannel after missing channel: {e2:?}"))?;
+                let message = vls_msgs
+                    ::from_vec(payload.to_vec())
+                    .map_err(|e| format!("channel decode retry: {e:?}"))?;
+                let handler2 = root_handler.for_new_client(0, PubKey(peer_id), dbid);
+                handler2
+                    .handle(message)
+                    .map(|reply| reply.as_vec())
+                    .map_err(|e| format!("channel handler retry error: {e:?}"))
+            }
+        }
+    }
+}
+
+// ── Frame dispatch ────────────────────────────────────────────────────────────
+
+fn handle_frame(
+    state: &Arc<Mutex<SignerState>>,
+    xprv: &Xpriv,
+    seed: &[u8; 32],
+    network: WickNetwork,
+    encoded: Vec<u8>
+) -> std::result::Result<(u32, Vec<u8>), (u32, String)> {
+    if encoded.len() < 8 {
+        return Err((0, format!("frame too short: {} bytes", encoded.len())));
+    }
+    let req_id = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+    let kind = encoded[4];
+
+    match kind {
+        0x01 => {
+            // Node call: [8B header][type:u16 BE][data].
+            let payload = &encoded[8..];
+            if payload.len() < 2 {
+                return Err((req_id, "node payload too short".to_owned()));
+            }
+            let type_be = u16::from_be_bytes([payload[0], payload[1]]);
+            // Wick extension RPCs live above the standard VLS namespace.
+            if (0xfd01..=0xfd05).contains(&type_be) {
+                handle_extension(req_id, type_be, &payload[2..], xprv, seed, network)
+            } else {
+                let msg = vls_msgs
+                    ::from_vec(payload.to_vec())
+                    .map_err(|e| (req_id, format!("decode VLS message: {e:?}")))?;
+                let body = state
+                    .lock()
+                    .handle_node(msg)
+                    .map_err(|e| (req_id, e))?;
+                Ok((req_id, body))
+            }
+        }
+        0x02 => {
+            // Channel call: [8B header][8B dbid BE][33B peer_id][...payload].
+            if encoded.len() < 49 {
+                return Err((req_id, format!("channel frame too short: {} bytes", encoded.len())));
+            }
+            let dbid = u64::from_be_bytes(
+                encoded[8..16].try_into().map_err(|e| (req_id, format!("dbid slice: {e}")))?
+            );
+            let mut peer_id = [0u8; 33];
+            peer_id.copy_from_slice(&encoded[16..49]);
+            let body = state
+                .lock()
+                .handle_channel(dbid, peer_id, &encoded[49..])
+                .map_err(|e| (req_id, e))?;
+            Ok((req_id, body))
+        }
+        other => Err((req_id, format!("unknown frame kind: 0x{other:02x}"))),
+    }
+}
+
+// ── Wick extension RPCs ───────────────────────────────────────────────────────
+
+fn handle_extension(
+    req_id: u32,
+    type_be: u16,
+    payload: &[u8],
+    xprv: &Xpriv,
+    seed: &[u8; 32],
+    network: WickNetwork
+) -> std::result::Result<(u32, Vec<u8>), (u32, String)> {
+    match type_be {
+        0xfd01 => handle_get_ldk_node_keys(req_id, payload, seed),
+        0xfd05 => handle_get_wallet_address(req_id, payload, xprv, network),
+        0xfd02 => Err((req_id, "VssEncrypt extension not implemented".to_owned())),
+        0xfd03 => Err((req_id, "VssDecrypt extension not implemented".to_owned())),
+        0xfd04 => Err((req_id, "GetSpliceNewFundingPubkey extension not implemented".to_owned())),
+        _ => unreachable!("type_be is in [0xFD01, 0xFD05]"),
+    }
+}
+
+/// Wire — request:  `[u8 version=1]`
+/// Wire — response: `[32B peer_storage_key][32B inbound_payment_key][32B receive_auth_key]`
+///
+/// Each key is `HKDF-SHA256(seed, info=<domain-separated tag>)` — the
+/// implementation is `HMAC(seed, info)` truncated to 32 bytes, which is
+/// equivalent to a single HKDF-Expand step with empty salt.
+fn handle_get_ldk_node_keys(
+    req_id: u32,
+    payload: &[u8],
+    seed: &[u8; 32]
+) -> std::result::Result<(u32, Vec<u8>), (u32, String)> {
+    if payload.first().copied() != Some(1) {
+        return Err((req_id, "GetLdkNodeKeys: unsupported version".to_owned()));
+    }
+    let derive = |info: &[u8]| -> std::result::Result<[u8; 32], (u32, String)> {
+        let mut mac = HmacSha256::new_from_slice(seed).map_err(|e| (
+            req_id,
+            format!("hmac init: {e}"),
+        ))?;
+        mac.update(info);
+        let bytes = mac.finalize().into_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    };
+    let peer_storage = derive(b"ldk/peer_storage/v1")?;
+    let inbound_payment = derive(b"ldk/inbound_payment/v1")?;
+    let receive_auth = derive(b"ldk/receive_auth/v1")?;
+
+    let mut body = Vec::with_capacity(96);
+    body.extend_from_slice(&peer_storage);
+    body.extend_from_slice(&inbound_payment);
+    body.extend_from_slice(&receive_auth);
+    Ok((req_id, body))
+}
+
+/// Wire — request:  `[u8 version=1][u32 LE index]`
+/// Wire — response: `[u16 LE addr_len][addr_bytes][script_pubkey]`
+fn handle_get_wallet_address(
+    req_id: u32,
+    payload: &[u8],
+    xprv: &Xpriv,
+    network: WickNetwork,
+) -> std::result::Result<(u32, Vec<u8>), (u32, String)> {
+    if payload.len() < 5 {
+        return Err((req_id, "GetWalletAddress: payload too short".to_owned()));
+    }
+    if payload[0] != 1 {
+        return Err((req_id, "GetWalletAddress: unsupported version".to_owned()));
+    }
+    let index = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+
+    let secp = Secp256k1::new();
+    let path = DerivationPath::from(
+        vec![
+            ChildNumber::from_normal_idx(index).map_err(|e| (
+                req_id,
+                format!("derive index {index}: {e}"),
+            ))?
+        ]
+    );
+    let derived = xprv
+        .derive_priv(&secp, &path)
+        .map_err(|e| (req_id, format!("derive priv: {e}")))?;
+    let pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &derived.private_key);
+
+    use bitcoin::hashes::{ hash160, Hash as _ };
+    let hash = hash160::Hash::hash(&pubkey.serialize());
+    let wpubkey_hash = bitcoin::WPubkeyHash::from_raw_hash(hash);
+    let address = bitcoin::Address::p2wpkh(
+        &bitcoin::CompressedPublicKey(pubkey),
+        bitcoin::Network::from(network)
+    );
+    let script_pubkey = bitcoin::ScriptBuf::new_p2wpkh(&wpubkey_hash);
+
+    let addr_str = address.to_string();
+    let addr_bytes = addr_str.as_bytes();
+    let mut body = Vec::with_capacity(2 + addr_bytes.len() + script_pubkey.len());
+    let len = u16::try_from(addr_bytes.len()).map_err(|_| (req_id, "address too long".to_owned()))?;
+    body.extend_from_slice(&len.to_le_bytes());
+    body.extend_from_slice(addr_bytes);
+    body.extend_from_slice(script_pubkey.as_bytes());
+    Ok((req_id, body))
+}
+
+// ── Wire encoders ─────────────────────────────────────────────────────────────
+
+fn encode_success(req_id: u32, body: Vec<u8>) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + body.len());
+    frame.extend_from_slice(&req_id.to_be_bytes());
+    frame.push(0x00);
+    frame.extend_from_slice(&body);
+    frame
+}
+
+fn encode_error(req_id: u32, err: &str) -> Vec<u8> {
+    let bytes = err.as_bytes();
+    let mut frame = Vec::with_capacity(5 + bytes.len());
+    frame.extend_from_slice(&req_id.to_be_bytes());
+    frame.push(0x01);
+    frame.extend_from_slice(bytes);
+    frame
+}
