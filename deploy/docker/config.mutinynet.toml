@@ -44,3 +44,41 @@ server_mnemonic     = "abandon abandon abandon abandon abandon abandon abandon a
 # lru_eviction_threshold          = 0.80   # pressure to start LRU eviction
 # emergency_eviction_threshold    = 0.95   # pressure for force-park
 # evictor_target_pressure         = 0.70   # pressure target after eviction
+
+# ── Phase-3 LSP daemon (operator role) ──────────────────────────────────────
+# Disabled by default. Self-custodial design: the server holds NO
+# on-chain seed and NO LSP Lightning seed. All seed material lives in
+# the operator's SDK process running on a trusted machine.
+#
+# To enable:
+#   1. Set lsp.enabled = true below.
+#   2. From the operator's machine, derive the LSP pubkey offline using
+#      the *same* BIP39 mnemonic that backs the operator's BDK wallet
+#      (domain-separated BIP32 path `m/13037'/coin'/0'` keeps it
+#      independent of the on-chain receive descriptors):
+#         use wick_sdk::compute_operator_lsp_pubkey;
+#         let pk = compute_operator_lsp_pubkey(MNEMONIC, None, WickNetwork::Mutinynet)?;
+#         println!("[lsp].pubkey_hex = {}", pk);
+#      Paste the result into `pubkey_hex` below.
+#   3. Set `WICK_ADMIN_SECRET=<random>` on the server side. The operator
+#      SDK passes the same secret as the `x-wick-admin-secret` header.
+#   4. Top up the operator's BDK wallet via the mutinynet faucet so JIT
+#      channels can be funded:
+#         operator.next_funding_address()  // BIP84 P2WPKH
+#   5. After the server boots, the operator runs:
+#         operator.register_lsp().await?;       // installs seed in-memory
+#         wick_sdk::run_funding_loop(&mut operator).await?;
+#
+# [lsp]
+# enabled              = true
+# listen_addr          = "0.0.0.0:19836"
+# upstream_peer        = ""                   # empty = WickNetwork::default_lsp_upstream (Mutiny hub)
+# min_fee_msat         = 2000
+# proportional_ppm     = 7000
+# reorg_reserve_sats   = 1000000
+# max_jit_channel_sats = 5000000
+# min_payment_size_msat = 100000
+# max_payment_size_msat = 100000000000
+# cltv_expiry_delta    = 144
+# jit_fulfil_timeout_blocks = 40
+# pubkey_hex           = "<33-byte hex>"      # output of compute_operator_lsp_pubkey(...)

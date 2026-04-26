@@ -98,6 +98,41 @@ signet-run:
 mutinynet-run:
     cargo run --bin wick-server -- --config deploy/docker/config.mutinynet.toml
 
+# --- phase 3 LSPS2 JIT (self-custodial operator + tenant-side) ---
+
+# Phase 3 hermetic regtest JIT flow (slice 3.3a). Three-role test:
+# Operator (`wick_sdk::OperatorClient`, signs LSP funding txs from a
+# local BDK wallet), Alice (JIT receiver), Bob (payer). The operator
+# installs the LSP Lightning seed at runtime via the admin
+# `RegisterLspIdentity` RPC; the server holds no on-chain seed.
+# Requires `just regtest-up` to be running.
+jit-demo:
+    cargo test -p wick-sdk --test jit_flow --features regtest \
+        -- --ignored --nocapture
+
+# Live JIT receive flow against Mutiny's hub on mutinynet. The LSP
+# Lightning seed is derived from the operator's BIP39 mnemonic (same
+# mnemonic as the operator's BDK wallet, domain-separated derivation
+# path `m/13037'/coin'/0'`). The operator's SDK process must:
+#   1. Compute the LSP pubkey offline via
+#      `wick_sdk::compute_operator_lsp_pubkey(...)` and place it in
+#      `[lsp].pubkey_hex` of `deploy/docker/config.mutinynet.toml`.
+#   2. After the server is up, call `OperatorClient::register_lsp()` to
+#      install the seed in-memory (never persisted server-side).
+#   3. Drive `wick_sdk::run_funding_loop()` to sign each parked
+#      `FundingGenerationReady` from the operator's BDK wallet (top up
+#      via https://faucet.mutinynet.com).
+jit-mutinynet-demo:
+    cargo test -p wick-sdk --test integration_mutinynet jit_receive \
+        --features regtest -- --ignored --nocapture
+
+# Live JIT receive flow against ACINQ on signet (or whatever is
+# configured under [lsp].upstream_peer). Same operator workflow as
+# `jit-mutinynet-demo` — see that recipe's comment for details.
+jit-signet-demo:
+    cargo test -p wick-sdk --test integration_signet jit_receive \
+        --features regtest -- --ignored --nocapture
+
 # --- housekeeping ---
 
 # Tidy up generated artefacts.

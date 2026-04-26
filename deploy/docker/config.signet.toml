@@ -44,3 +44,24 @@ server_mnemonic     = "abandon abandon abandon abandon abandon abandon abandon a
 # lru_eviction_threshold          = 0.80   # pressure to start LRU eviction
 # emergency_eviction_threshold    = 0.95   # pressure for force-park
 # evictor_target_pressure         = 0.70   # pressure target after eviction
+
+# ── Phase-3 LSP daemon (operator role) ──────────────────────────────────────
+# Disabled by default. See `config.mutinynet.toml` for the full block;
+# only the per-network upstream changes for signet (defaults to ACINQ
+# signet node via WickNetwork::default_lsp_upstream).
+#
+# Self-custodial: the server holds NO on-chain seed and NO LSP Lightning
+# seed. `pubkey_hex` is public material the operator publishes here so
+# tenants know which counterparty to expect LSPS2 messages from. The
+# matching seed is supplied at runtime by the operator's SDK
+# (`wick_sdk::OperatorClient::register_lsp`).
+#
+# [lsp]
+# enabled              = true
+# listen_addr          = "0.0.0.0:19836"
+# upstream_peer        = ""                   # empty = ACINQ signet node
+# min_fee_msat         = 2000
+# proportional_ppm     = 7000
+# reorg_reserve_sats   = 1000000
+# max_jit_channel_sats = 5000000
+# pubkey_hex           = "<33-byte hex>"      # output of compute_operator_lsp_pubkey(operator_mnemonic, ..., Signet)
