@@ -24,6 +24,8 @@ pub mod funding;
 pub mod funding_registry;
 pub mod funding_store;
 pub mod gossip;
+pub mod jit_registry;
+pub mod liquidity_hook;
 pub mod logger;
 pub mod node;
 pub mod payment_store;
@@ -35,7 +37,6 @@ pub mod signer;
 pub use api::NodeApi;
 pub use builder::NodeBuilder;
 pub use chain::{EsploraBroadcaster, EsploraChainClient, FeeEstimator};
-pub use wick_core::WickNetwork;
 pub use channel_store::{ChannelState, ChannelStore, ChannelUpsert};
 pub use deps::{NodeDeps, DEFAULT_LISTEN_PORT_BASE};
 pub use error::{Result, WickLightningError};
@@ -43,9 +44,15 @@ pub use event::{ChannelManagerOps, ChannelManagerRuntimeOps, EventHandler, Event
 pub use funding::FundingSource;
 pub use funding_registry::{PendingFunding, PendingFundingRegistry};
 pub use funding_store::{FundingStore, StoredFunding, FUNDING_TTL};
+pub use jit_registry::{JitResponse, PendingJitRegistry};
+pub use liquidity_hook::LspServiceEventHandler;
 pub use logger::TracingLogger;
-pub use node::{Balance, ChannelSummary, Node, PaymentRecord, PaymentResult};
+pub use node::{
+    Balance, ChannelSummary, JitInvoice, JitQuote, LiquidityFilter, LnLiquidityManager, Node,
+    PaymentRecord, PaymentResult,
+};
 pub use payment_store::{Direction, PaymentStatus, PaymentStore, PaymentWrite};
 pub use peer_store::{PeerInfo, PeerStore};
 pub use persistence::PgKvStore;
 pub use signer::{from_seed, LocalKeysManager, WickSigner};
+pub use wick_core::WickNetwork;

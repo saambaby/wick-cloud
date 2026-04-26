@@ -15,7 +15,7 @@
 
 use std::fmt::Debug;
 
-use bitcoin::{ ScriptBuf, Transaction };
+use bitcoin::{ScriptBuf, Transaction};
 
 /// Callback that produces a signed on-chain funding tx.
 ///
@@ -34,6 +34,6 @@ pub trait FundingSource: Send + Sync + Debug + 'static {
     fn fund_channel(
         &self,
         output_script: ScriptBuf,
-        channel_value_sats: u64
+        channel_value_sats: u64,
     ) -> anyhow::Result<Transaction>;
 }

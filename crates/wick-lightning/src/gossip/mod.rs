@@ -17,9 +17,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use lightning::routing::gossip::NetworkGraph;
-use lightning::routing::scoring::{
-    ProbabilisticScorer, ProbabilisticScoringDecayParameters,
-};
+use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringDecayParameters};
 use lightning::util::ser::{ReadableArgs, Writeable};
 use lightning_rapid_gossip_sync::RapidGossipSync;
 use tokio::sync::watch;
@@ -109,21 +107,19 @@ pub fn load_or_init_graph(
     use lightning::util::persist::KVStoreSync;
 
     match kv_store.read(GOSSIP_NS, "", GRAPH_KEY) {
-        Ok(bytes) => {
-            match NetworkGraph::read(&mut Cursor::new(bytes), logger.clone()) {
-                Ok(g) => {
-                    tracing::info!(target: "wick_lightning", "loaded persisted NetworkGraph");
-                    return Arc::new(g);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "wick_lightning",
-                        error = ?e,
-                        "persisted NetworkGraph failed to decode; starting fresh"
-                    );
-                }
+        Ok(bytes) => match NetworkGraph::read(&mut Cursor::new(bytes), logger.clone()) {
+            Ok(g) => {
+                tracing::info!(target: "wick_lightning", "loaded persisted NetworkGraph");
+                return Arc::new(g);
             }
-        }
+            Err(e) => {
+                tracing::warn!(
+                    target: "wick_lightning",
+                    error = ?e,
+                    "persisted NetworkGraph failed to decode; starting fresh"
+                );
+            }
+        },
         Err(ref e) if e.kind() == ErrorKind::NotFound => {
             tracing::info!(target: "wick_lightning", "no persisted NetworkGraph; starting fresh");
         }
@@ -237,11 +233,7 @@ pub fn load_or_init_scorer(
         }
     }
 
-    Arc::new(RwLock::new(ProbabilisticScorer::new(
-        decay,
-        graph,
-        logger,
-    )))
+    Arc::new(RwLock::new(ProbabilisticScorer::new(decay, graph, logger)))
 }
 
 pub fn persist_scorer(kv_store: &PgKvStore, scorer: &LnScorer) {
@@ -470,12 +462,7 @@ pub async fn init_gossip(
     logger: Arc<TracingLogger>,
 ) -> (Arc<LnNetworkGraph>, LnScorer) {
     let graph = load_or_init_graph(kv_store.as_ref(), network.into(), logger.clone());
-    let scorer = load_or_init_scorer(
-        kv_store.as_ref(),
-        graph.clone(),
-        network,
-        logger.clone(),
-    );
+    let scorer = load_or_init_scorer(kv_store.as_ref(), graph.clone(), network, logger.clone());
 
     if let Some(url) = rgs_url {
         let ts = load_last_sync_ts(kv_store.as_ref());

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use esplora_client::Utxo;
-use lightning_block_sync::{ BlockData, BlockHeaderData, BlockSource, BlockSourceError };
+use lightning_block_sync::{BlockData, BlockHeaderData, BlockSource, BlockSourceError};
 use wick_core::WickNetwork;
 
 /// Esplora-backed chain source.
@@ -34,12 +34,14 @@ impl EsploraChainClient {
     /// Returns an error if the Esplora client builder rejects the URL.
     pub fn new(esplora_url: &str, wick_network: WickNetwork) -> anyhow::Result<Self> {
         let esplora = Arc::new(
-            esplora_client::Builder
-                ::new(esplora_url)
+            esplora_client::Builder::new(esplora_url)
                 .build_async()
-                .map_err(|e| anyhow::anyhow!("esplora client: {e:?}"))?
+                .map_err(|e| anyhow::anyhow!("esplora client: {e:?}"))?,
         );
-        Ok(Self { esplora, wick_network })
+        Ok(Self {
+            esplora,
+            wick_network,
+        })
     }
 
     /// Wick-layer network enum (includes mutinynet distinction from signet).
@@ -69,10 +71,11 @@ impl EsploraChainClient {
     /// Propagates the underlying `esplora-client` error.
     pub async fn get_address_utxos(
         &self,
-        address: &::bitcoin::Address
+        address: &::bitcoin::Address,
     ) -> anyhow::Result<Vec<Utxo>> {
         self.esplora
-            .get_address_utxos(address).await
+            .get_address_utxos(address)
+            .await
             .map_err(|e| anyhow::anyhow!("esplora get_address_utxos: {e}"))
     }
 
@@ -85,7 +88,8 @@ impl EsploraChainClient {
     /// Propagates the underlying `esplora-client` error.
     pub async fn fetch_fee_estimates(&self) -> anyhow::Result<HashMap<u16, f64>> {
         self.esplora
-            .get_fee_estimates().await
+            .get_fee_estimates()
+            .await
             .map_err(|e| anyhow::anyhow!("esplora get_fee_estimates: {e}"))
     }
 }
@@ -96,16 +100,18 @@ impl BlockSource for EsploraChainClient {
     fn get_header<'a>(
         &'a self,
         header_hash: &'a ::bitcoin::BlockHash,
-        _height_hint: Option<u32>
+        _height_hint: Option<u32>,
     ) -> lightning_block_sync::AsyncBlockSourceResult<'a, BlockHeaderData> {
         let esplora = self.esplora.clone();
         let hash = *header_hash;
         Box::pin(async move {
             let header = esplora
-                .get_header_by_hash(&hash).await
+                .get_header_by_hash(&hash)
+                .await
                 .map_err(|e| BlockSourceError::transient(e.to_string()))?;
             let info = esplora
-                .get_block_info(&hash).await
+                .get_block_info(&hash)
+                .await
                 .map_err(|e| BlockSourceError::transient(e.to_string()))?;
             if header.block_hash() != hash {
                 return Err(BlockSourceError::transient("header hash mismatch"));
@@ -124,7 +130,7 @@ impl BlockSource for EsploraChainClient {
             let per_block_lo = u128::from_be_bytes(
                 per_block_bytes[16..32]
                     .try_into()
-                    .map_err(|_| BlockSourceError::transient("unexpected work byte length"))?
+                    .map_err(|_| BlockSourceError::transient("unexpected work byte length"))?,
             );
             let count = u128::from(info.height) + 1;
             let total_lo = per_block_lo.saturating_mul(count);
@@ -142,13 +148,14 @@ impl BlockSource for EsploraChainClient {
 
     fn get_block<'a>(
         &'a self,
-        header_hash: &'a ::bitcoin::BlockHash
+        header_hash: &'a ::bitcoin::BlockHash,
     ) -> lightning_block_sync::AsyncBlockSourceResult<'a, BlockData> {
         let esplora = self.esplora.clone();
         let hash = *header_hash;
         Box::pin(async move {
             let block = esplora
-                .get_block_by_hash(&hash).await
+                .get_block_by_hash(&hash)
+                .await
                 .map_err(|e| BlockSourceError::transient(e.to_string()))?
                 .ok_or_else(|| BlockSourceError::transient("block not found"))?;
             if block.block_hash() != hash {
@@ -159,7 +166,7 @@ impl BlockSource for EsploraChainClient {
     }
 
     fn get_best_block(
-        &self
+        &self,
     ) -> lightning_block_sync::AsyncBlockSourceResult<'_, (::bitcoin::BlockHash, Option<u32>)> {
         let esplora = self.esplora.clone();
         Box::pin(async move {
@@ -170,10 +177,12 @@ impl BlockSource for EsploraChainClient {
             // height N and a height of N+1. SPV then walks the wrong chain
             // and trips the channel-manager `chain-order` assert.
             let hash = esplora
-                .get_tip_hash().await
+                .get_tip_hash()
+                .await
                 .map_err(|e| BlockSourceError::transient(e.to_string()))?;
             let info = esplora
-                .get_block_info(&hash).await
+                .get_block_info(&hash)
+                .await
                 .map_err(|e| BlockSourceError::transient(e.to_string()))?;
             Ok((hash, Some(info.height)))
         })

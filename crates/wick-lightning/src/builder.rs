@@ -22,49 +22,43 @@
 
 use std::io::Cursor;
 use std::sync::atomic::AtomicBool;
-use std::sync::{ Arc, Mutex, RwLock };
-use std::time::{ Duration, SystemTime, UNIX_EPOCH };
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitcoin::secp256k1::PublicKey;
 use dashmap::DashMap;
 use lightning::chain;
 use lightning::chain::chainmonitor::ChainMonitor;
 use lightning::chain::channelmonitor::ChannelMonitor;
-use lightning::chain::{ BestBlock, Filter, Watch };
+use lightning::chain::{BestBlock, Filter, Watch};
 use lightning::ln::channelmanager::ChannelManagerReadArgs;
-use lightning::ln::channelmanager::{ ChainParameters, ChannelManager };
+use lightning::ln::channelmanager::{ChainParameters, ChannelManager};
 use lightning::ln::peer_handler::{
-    IgnoringMessageHandler,
-    MessageHandler,
-    PeerDetails,
-    PeerManager,
+    IgnoringMessageHandler, MessageHandler, PeerDetails, PeerManager,
 };
 use lightning::routing::gossip::P2PGossipSync;
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
 use lightning::routing::utxo::UtxoLookup;
 use lightning::sign::ChangeDestinationSourceSync;
-use lightning::sign::{ EntropySource, NodeSigner, Recipient, SignerProvider };
-use lightning::util::async_poll::{ MaybeSend, MaybeSync };
+use lightning::sign::{EntropySource, NodeSigner, Recipient, SignerProvider};
+use lightning::util::async_poll::{MaybeSend, MaybeSync};
 use lightning::util::config::UserConfig;
 use lightning::util::persist::{
-    read_channel_monitors,
-    KVStoreSync,
-    CHANNEL_MANAGER_PERSISTENCE_KEY,
-    CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-    CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+    read_channel_monitors, KVStoreSync, KVStoreSyncWrapper, CHANNEL_MANAGER_PERSISTENCE_KEY,
+    CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use lightning::util::ser::ReadableArgs;
 use lightning::util::sweep::OutputSweeperSync;
 use lightning_background_processor::{
-    process_events_async_with_kv_store_sync,
-    GossipSync,
-    NO_LIQUIDITY_MANAGER,
-    NO_ONION_MESSENGER,
+    process_events_async_with_kv_store_sync, GossipSync, NO_LIQUIDITY_MANAGER, NO_ONION_MESSENGER,
 };
 use lightning_block_sync::init;
-use lightning_block_sync::poll::{ ChainPoller, ValidatedBlockHeader };
-use lightning_block_sync::{ SpvClient, UnboundedCache };
+use lightning_block_sync::poll::{ChainPoller, ValidatedBlockHeader};
+use lightning_block_sync::{SpvClient, UnboundedCache};
+use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
+use lightning_liquidity::lsps2::service::LSPS2ServiceConfig;
+use lightning_liquidity::{LiquidityClientConfig, LiquidityManager, LiquidityServiceConfig};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -73,19 +67,14 @@ use wick_core::TenantId;
 use crate::api::NodeApi;
 use crate::channel_store::ChannelStore;
 use crate::deps::NodeDeps;
-use crate::error::{ Result, WickLightningError };
+use crate::error::{Result, WickLightningError};
 use crate::event::EventHandler;
 use crate::funding::FundingSource;
 use crate::gossip;
+use crate::jit_registry::PendingJitRegistry;
 use crate::node::{
-    LnChainMonitor,
-    LnChannelManager,
-    LnGossipSync,
-    LnMessageRouter,
-    LnPeerManager,
-    LnRouter,
-    LnScorer,
-    Node,
+    LiquidityFilter, LnChainMonitor, LnChannelManager, LnGossipSync, LnLiquidityManager,
+    LnMessageRouter, LnPeerManager, LnRouter, LnScorer, Node,
 };
 use crate::payment_store::PaymentStore;
 use crate::peer_store::PeerStore;
@@ -104,16 +93,37 @@ const INITIAL_FEE_RETRIES: u8 = 3;
 
 /// Builder for a real LDK-backed [`Node<S>`].
 pub struct NodeBuilder<S: WickSigner = lightning::sign::KeysManager>
-    where <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync {
+where
+    <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
+{
     tenant_id: TenantId,
     deps: NodeDeps,
     signer: Option<Arc<S>>,
     funding: Option<Arc<dyn FundingSource>>,
     change_destination: Option<bitcoin::ScriptBuf>,
+    /// Per-node LSPS2 client config. `Some` ⇒ this node negotiates JIT
+    /// channels via the configured LSP peer (LSPS2 client role). `None`
+    /// ⇒ no JIT support.
+    liquidity_client: Option<LSPS2ClientConfig>,
+    /// Per-node LSPS2 service config. `Some` ⇒ this node *is* the LSP
+    /// (LSPS2 service role). The 32-byte `promise_secret` is rotated by
+    /// the operator on a schedule; we surface it as-is.
+    liquidity_service: Option<LSPS2ServiceConfig>,
+    /// LSP peer pubkey wired into [`Node::lsp_peer`] for tenant-side
+    /// `receive_payment_jit`. `None` for the LSP itself + for nodes
+    /// running without an upstream LSP.
+    lsp_peer: Option<PublicKey>,
+    /// Optional service-side event handler. Set on the LSP node to
+    /// drive `LSPS2ServiceEvent::GetInfo`/`BuyRequest`/`OpenChannel`
+    /// responses + forward LDK lifecycle events into the
+    /// `lsps2_service_handler`.
+    lsp_service_handler: Option<Arc<dyn crate::liquidity_hook::LspServiceEventHandler>>,
 }
 
 impl<S> NodeBuilder<S>
-    where S: WickSigner, <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync
+where
+    S: WickSigner,
+    <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
 {
     /// Start a new builder for `tenant_id`.
     ///
@@ -127,13 +137,18 @@ impl<S> NodeBuilder<S>
             signer: None,
             funding: None,
             change_destination: None,
+            liquidity_client: None,
+            liquidity_service: None,
+            lsp_peer: None,
+            lsp_service_handler: None,
         }
     }
 
     /// Bind the signer. Phase 1: a `LocalKeysManager`. Phase 4: a remote VLS signer.
     #[must_use]
     pub fn with_signer<S2: WickSigner>(self, signer: Arc<S2>) -> NodeBuilder<S2>
-        where <S2 as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync
+    where
+        <S2 as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
     {
         NodeBuilder {
             tenant_id: self.tenant_id,
@@ -141,7 +156,44 @@ impl<S> NodeBuilder<S>
             signer: Some(signer),
             funding: self.funding,
             change_destination: self.change_destination,
+            liquidity_client: self.liquidity_client,
+            liquidity_service: self.liquidity_service,
+            lsp_peer: self.lsp_peer,
+            lsp_service_handler: self.lsp_service_handler,
         }
+    }
+
+    /// Install an LSP service-event handler. Required when this node
+    /// runs in service mode (`with_liquidity_service`) — without a
+    /// handler, `LSPS2ServiceEvent`s pile up and clients never get
+    /// responses to `lsps2.get_info` / `lsps2.buy`.
+    #[must_use]
+    pub fn with_lsp_service_handler(
+        mut self,
+        handler: Arc<dyn crate::liquidity_hook::LspServiceEventHandler>,
+    ) -> Self {
+        self.lsp_service_handler = Some(handler);
+        self
+    }
+
+    /// Enable LSPS2 client role: this node will negotiate JIT channels
+    /// via `lsp_peer`. Pass the LSP's pubkey so [`Node::receive_payment_jit`]
+    /// knows which counterparty to address.
+    #[must_use]
+    pub fn with_liquidity_client(mut self, lsp_peer: PublicKey) -> Self {
+        self.liquidity_client = Some(LSPS2ClientConfig::default());
+        self.lsp_peer = Some(lsp_peer);
+        self
+    }
+
+    /// Enable LSPS2 service role: this node will accept JIT requests
+    /// from clients. The 32-byte `promise_secret` is the HMAC key used
+    /// to sign opening fee params; rotate it on a schedule (5-min
+    /// recommended in the architecture spec).
+    #[must_use]
+    pub fn with_liquidity_service(mut self, promise_secret: [u8; 32]) -> Self {
+        self.liquidity_service = Some(LSPS2ServiceConfig { promise_secret });
+        self
     }
 
     /// Bind a [`FundingSource`]. Required for nodes that originate channel
@@ -168,22 +220,48 @@ impl<S> NodeBuilder<S>
 
     /// Build + start the node. Returns once every background task is live.
     pub async fn build(self) -> Result<Arc<Node<S>>> {
-        let Self { tenant_id, deps, signer, funding, change_destination } = self;
+        let Self {
+            tenant_id,
+            deps,
+            signer,
+            funding,
+            change_destination,
+            liquidity_client,
+            liquidity_service,
+            lsp_peer,
+            lsp_service_handler,
+        } = self;
 
         let signer = signer.ok_or_else(|| {
             WickLightningError::Config(
-                "NodeBuilder: signer is required — call with_signer() before build()".into()
+                "NodeBuilder: signer is required — call with_signer() before build()".into(),
             )
         })?;
 
-        let node_id = NodeSigner::get_node_id(signer.as_ref(), Recipient::Node).map_err(|_|
-            WickLightningError::Config("NodeBuilder: get_node_id failed".into())
-        )?;
+        let node_id = NodeSigner::get_node_id(signer.as_ref(), Recipient::Node)
+            .map_err(|_| WickLightningError::Config("NodeBuilder: get_node_id failed".into()))?;
+
+        // Tenant nodes (the ones wired with `with_liquidity_client(lsp_peer)`)
+        // must manually accept inbound channels so the `OpenChannelRequest`
+        // event fires — that's where `EventHandler` calls
+        // `accept_inbound_channel_from_trusted_peer_0conf` for LSP-driven
+        // 0-conf JIT channels. With LDK's default (auto-accept) the event
+        // never fires and the 0-conf path is unreachable.
+        //
+        // The LSP node and any tenant without an upstream LSP keep the
+        // default (auto-accept) — they accept normal Bob → LSP / peer →
+        // tenant channels via LDK's built-in path.
+        let mut user_config = UserConfig::default();
+        if lsp_peer.is_some() {
+            user_config.manually_accept_inbound_channels = true;
+        }
 
         // ── Stores ────────────────────────────────────────────────────────────
-        let kv_store = Arc::new(
-            PgKvStore::new(tenant_id, deps.pg_pool.clone(), deps.runtime.clone())
-        );
+        let kv_store = Arc::new(PgKvStore::new(
+            tenant_id,
+            deps.pg_pool.clone(),
+            deps.runtime.clone(),
+        ));
         let payments = Arc::new(PaymentStore::new(tenant_id, deps.pg_pool.clone()));
         let channels = Arc::new(ChannelStore::new(tenant_id, deps.pg_pool.clone()));
         let peer_store = Arc::new(PeerStore::new(tenant_id, deps.pg_pool.clone()));
@@ -196,41 +274,38 @@ impl<S> NodeBuilder<S>
         let starting_time_secs = u32::try_from(ts.as_secs()).unwrap_or(u32::MAX);
 
         let peer_storage_key = NodeSigner::get_peer_storage_key(signer.as_ref());
-        let chain_monitor: Arc<LnChainMonitor<S>> = Arc::new(
-            ChainMonitor::new(
-                None::<Arc<dyn Filter + Send + Sync>>,
-                deps.broadcaster.clone(),
-                deps.logger.clone(),
-                deps.fee_estimator.clone(),
-                kv_store.clone(),
-                signer.clone(),
-                peer_storage_key
-            )
-        );
+        let chain_monitor: Arc<LnChainMonitor<S>> = Arc::new(ChainMonitor::new(
+            None::<Arc<dyn Filter + Send + Sync>>,
+            deps.broadcaster.clone(),
+            deps.logger.clone(),
+            deps.fee_estimator.clone(),
+            kv_store.clone(),
+            signer.clone(),
+            peer_storage_key,
+        ));
 
         let rgs_url = deps.network.default_rgs().map(ToOwned::to_owned);
         let (network_graph, scorer) = gossip::init_gossip(
             kv_store.clone(),
             deps.network,
             rgs_url.as_deref(),
-            deps.logger.clone()
-        ).await;
+            deps.logger.clone(),
+        )
+        .await;
 
-        let router: Arc<LnRouter<S>> = Arc::new(
-            DefaultRouter::new(
-                network_graph.clone(),
-                deps.logger.clone(),
-                signer.clone(),
-                scorer.clone(),
-                ProbabilisticScoringFeeParameters::default()
-            )
-        );
+        let router: Arc<LnRouter<S>> = Arc::new(DefaultRouter::new(
+            network_graph.clone(),
+            deps.logger.clone(),
+            signer.clone(),
+            scorer.clone(),
+            ProbabilisticScoringFeeParameters::default(),
+        ));
 
         let msg_router: Arc<LnMessageRouter<S>> = Arc::new(
             lightning::onion_message::messenger::DefaultMessageRouter::new(
                 network_graph.clone(),
-                signer.clone()
-            )
+                signer.clone(),
+            ),
         );
 
         // ── ChannelManager (load-or-init) ────────────────────────────────────
@@ -248,38 +323,35 @@ impl<S> NodeBuilder<S>
         // `block_connected` panics with "Blocks must be connected in
         // chain-order" because the channel manager's view is anchored at
         // its persisted (older) tip while the SPV is at the live tip.
-        let loaded_monitors = read_channel_monitors(
-            kv_store.clone(),
-            signer.clone(),
-            signer.clone()
-        ).map_err(|e| {
-            // Monitors are the most dangerous thing to lose — without them
-            // the node can't claim on-chain outputs from its channels. Any
-            // undecodable monitor bytes must stop boot dead; an operator
-            // should restore from backup before the node is allowed to
-            // reconstruct channel state.
-            //
-            // `read_channel_monitors` reads raw bytes under
-            // (MONITORS_PERSISTENCE_PRIMARY_NAMESPACE, "", "<monitor_name>");
-            // on decode failure we don't have the individual bytes handy
-            // (the helper already consumed them), so quarantine is best
-            // effort via a marker row describing the failure for the
-            // operator to investigate.
-            let marker = format!("monitor decode failed: {e}").into_bytes();
-            let _ = kv_store.quarantine("monitors/<read_channel_monitors>", marker);
-            WickLightningError::PersistenceDecode {
-                what: "monitors",
-                err: format!("{e}"),
-            }
-        })?;
+        let loaded_monitors =
+            read_channel_monitors(kv_store.clone(), signer.clone(), signer.clone()).map_err(
+                |e| {
+                    // Monitors are the most dangerous thing to lose — without them
+                    // the node can't claim on-chain outputs from its channels. Any
+                    // undecodable monitor bytes must stop boot dead; an operator
+                    // should restore from backup before the node is allowed to
+                    // reconstruct channel state.
+                    //
+                    // `read_channel_monitors` reads raw bytes under
+                    // (MONITORS_PERSISTENCE_PRIMARY_NAMESPACE, "", "<monitor_name>");
+                    // on decode failure we don't have the individual bytes handy
+                    // (the helper already consumed them), so quarantine is best
+                    // effort via a marker row describing the failure for the
+                    // operator to investigate.
+                    let marker = format!("monitor decode failed: {e}").into_bytes();
+                    let _ = kv_store.quarantine("monitors/<read_channel_monitors>", marker);
+                    WickLightningError::PersistenceDecode {
+                        what: "monitors",
+                        err: format!("{e}"),
+                    }
+                },
+            )?;
 
-        let manager_bytes = match
-            kv_store.read(
-                CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-                CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
-                CHANNEL_MANAGER_PERSISTENCE_KEY
-            )
-        {
+        let manager_bytes = match kv_store.read(
+            CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_KEY,
+        ) {
             Ok(b) => Some(b),
             Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => None,
             Err(e) => {
@@ -305,10 +377,7 @@ impl<S> NodeBuilder<S>
                 "restoring ChannelManager from PgKvStore"
             );
             let monitor_refs: Vec<&ChannelMonitor<<S as SignerProvider>::EcdsaSigner>> =
-                loaded_monitors
-                    .iter()
-                    .map(|(_, m)| m)
-                    .collect();
+                loaded_monitors.iter().map(|(_, m)| m).collect();
             let args = ChannelManagerReadArgs::new(
                 signer.clone(),
                 signer.clone(),
@@ -319,37 +388,30 @@ impl<S> NodeBuilder<S>
                 router.clone(),
                 msg_router.clone(),
                 deps.logger.clone(),
-                UserConfig::default(),
-                monitor_refs
+                user_config.clone(),
+                monitor_refs,
             );
             let mut cursor = Cursor::new(&bytes);
-            let (manager_block_hash, cm) = match <(bitcoin::BlockHash, Arc<LnChannelManager<S>>)>
-                ::read(&mut cursor, args)
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    // Bytes exist but don't decode — typically an LDK
-                    // version mismatch or real corruption. Preserve the
-                    // original bytes in quarantine before bailing so an
-                    // operator can diff them against a known-good backup.
-                    let _ = kv_store.quarantine(
-                        CHANNEL_MANAGER_PERSISTENCE_KEY,
-                        bytes.clone(),
-                    );
-                    return Err(WickLightningError::PersistenceDecode {
-                        what: "channel_manager",
-                        err: format!("{e:?}"),
-                    });
-                }
-            };
+            let (manager_block_hash, cm) =
+                match <(bitcoin::BlockHash, Arc<LnChannelManager<S>>)>::read(&mut cursor, args) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Bytes exist but don't decode — typically an LDK
+                        // version mismatch or real corruption. Preserve the
+                        // original bytes in quarantine before bailing so an
+                        // operator can diff them against a known-good backup.
+                        let _ = kv_store.quarantine(CHANNEL_MANAGER_PERSISTENCE_KEY, bytes.clone());
+                        return Err(WickLightningError::PersistenceDecode {
+                            what: "channel_manager",
+                            err: format!("{e:?}"),
+                        });
+                    }
+                };
             // `args` is dropped here; the `&ChannelMonitor` borrows it held
             // expire, so we can now move the owned monitors out of
             // `loaded_monitors`.
             let owned_monitors: Vec<ChannelMonitor<<S as SignerProvider>::EcdsaSigner>> =
-                loaded_monitors
-                    .into_iter()
-                    .map(|(_, m)| m)
-                    .collect();
+                loaded_monitors.into_iter().map(|(_, m)| m).collect();
 
             // Pair each monitor with its persisted block hash, then build
             // chain::Listen tuples that own the monitor (LDK's
@@ -357,17 +419,15 @@ impl<S> NodeBuilder<S>
             // first element by value). After `synchronize_listeners` we
             // move each monitor back out of its tuple and hand it to
             // `chain_monitor.watch_channel`.
-            let monitor_tuples: Vec<
+            let monitor_tuples: Vec<(
+                bitcoin::BlockHash,
                 (
-                    bitcoin::BlockHash,
-                    (
-                        ChannelMonitor<<S as SignerProvider>::EcdsaSigner>,
-                        Arc<crate::chain::EsploraBroadcaster>,
-                        Arc<crate::chain::FeeEstimator>,
-                        Arc<crate::logger::TracingLogger>,
-                    ),
-                )
-            > = owned_monitors
+                    ChannelMonitor<<S as SignerProvider>::EcdsaSigner>,
+                    Arc<crate::chain::EsploraBroadcaster>,
+                    Arc<crate::chain::FeeEstimator>,
+                    Arc<crate::logger::TracingLogger>,
+                ),
+            )> = owned_monitors
                 .into_iter()
                 .map(|m| {
                     let h = m.current_best_block().block_hash;
@@ -383,36 +443,28 @@ impl<S> NodeBuilder<S>
                 })
                 .collect();
 
-            let listeners: Vec<
-                (bitcoin::BlockHash, &(dyn chain::Listen + Send + Sync))
-            > = monitor_tuples
-                .iter()
-                .map(|(h, t)| (*h, t as &(dyn chain::Listen + Send + Sync)))
-                .chain(
-                    std::iter::once((
+            let listeners: Vec<(bitcoin::BlockHash, &(dyn chain::Listen + Send + Sync))> =
+                monitor_tuples
+                    .iter()
+                    .map(|(h, t)| (*h, t as &(dyn chain::Listen + Send + Sync)))
+                    .chain(std::iter::once((
                         manager_block_hash,
                         &*cm as &(dyn chain::Listen + Send + Sync),
-                    ))
-                )
-                .collect();
+                    )))
+                    .collect();
 
             let mut cache = UnboundedCache::new();
-            let chain_tip = init
-                ::synchronize_listeners(
-                    deps.esplora.as_ref(),
-                    deps.network.into(),
-                    &mut cache,
-                    listeners
-                ).await
-                .map_err(|e| {
-                    WickLightningError::Config(format!("synchronize_listeners: {e:?}"))
-                })?;
+            let chain_tip = init::synchronize_listeners(
+                deps.esplora.as_ref(),
+                deps.network.into(),
+                &mut cache,
+                listeners,
+            )
+            .await
+            .map_err(|e| WickLightningError::Config(format!("synchronize_listeners: {e:?}")))?;
 
             let recovered_monitors: Vec<ChannelMonitor<<S as SignerProvider>::EcdsaSigner>> =
-                monitor_tuples
-                    .into_iter()
-                    .map(|(_, t)| t.0)
-                    .collect();
+                monitor_tuples.into_iter().map(|(_, t)| t.0).collect();
 
             (cm, recovered_monitors, chain_tip)
         } else {
@@ -421,34 +473,33 @@ impl<S> NodeBuilder<S>
                 tenant = %tenant_id,
                 "first boot — constructing fresh ChannelManager"
             );
-            let best_block_header: ValidatedBlockHeader = init
-                ::validate_best_block_header(deps.esplora.as_ref()).await
-                .map_err(|e| {
-                    WickLightningError::Config(format!("validate_best_block_header: {e:?}"))
-                })?;
+            let best_block_header: ValidatedBlockHeader =
+                init::validate_best_block_header(deps.esplora.as_ref())
+                    .await
+                    .map_err(|e| {
+                        WickLightningError::Config(format!("validate_best_block_header: {e:?}"))
+                    })?;
             let chain_params = ChainParameters {
                 network: deps.network.into(),
                 best_block: BestBlock::new(
                     best_block_header.header.block_hash(),
-                    best_block_header.height
+                    best_block_header.height,
                 ),
             };
-            let cm = Arc::new(
-                ChannelManager::new(
-                    deps.fee_estimator.clone(),
-                    chain_monitor.clone(),
-                    deps.broadcaster.clone(),
-                    router.clone(),
-                    msg_router.clone(),
-                    deps.logger.clone(),
-                    signer.clone(),
-                    signer.clone(),
-                    signer.clone(),
-                    UserConfig::default(),
-                    chain_params,
-                    starting_time_secs
-                )
-            );
+            let cm = Arc::new(ChannelManager::new(
+                deps.fee_estimator.clone(),
+                chain_monitor.clone(),
+                deps.broadcaster.clone(),
+                router.clone(),
+                msg_router.clone(),
+                deps.logger.clone(),
+                signer.clone(),
+                signer.clone(),
+                signer.clone(),
+                user_config.clone(),
+                chain_params,
+                starting_time_secs,
+            ));
             (cm, Vec::new(), best_block_header)
         };
 
@@ -468,36 +519,66 @@ impl<S> NodeBuilder<S>
         }
 
         // ── Gossip + PeerManager ─────────────────────────────────────────────
-        let gossip_sync: Arc<LnGossipSync> = Arc::new(
-            P2PGossipSync::new(
-                network_graph.clone(),
-                None::<Arc<dyn UtxoLookup + Send + Sync>>,
-                deps.logger.clone()
+        let gossip_sync: Arc<LnGossipSync> = Arc::new(P2PGossipSync::new(
+            network_graph.clone(),
+            None::<Arc<dyn UtxoLookup + Send + Sync>>,
+            deps.logger.clone(),
+        ));
+
+        // LiquidityManager runs in every node, even ones without LSPS2.
+        // Passing both configs as `None` leaves only LSPS0 transport
+        // active — a no-op for protocols above. Cost is one Arc + a
+        // few Mutexes.
+        let liquidity_kv = KVStoreSyncWrapper(kv_store.clone());
+        let liquidity_client_cfg =
+            liquidity_client.map(|lsps2_client_config| LiquidityClientConfig {
+                lsps1_client_config: None,
+                lsps2_client_config: Some(lsps2_client_config),
+                lsps5_client_config: None,
+            });
+        let liquidity_service_cfg =
+            liquidity_service.map(|lsps2_service_config| LiquidityServiceConfig {
+                lsps2_service_config: Some(lsps2_service_config),
+                lsps5_service_config: None,
+                advertise_service: true,
+            });
+        let liquidity_manager: Arc<LnLiquidityManager<S>> = Arc::new(
+            LiquidityManager::new(
+                signer.clone(),
+                signer.clone(),
+                channel_manager.clone(),
+                None::<Arc<LiquidityFilter>>,
+                None,
+                liquidity_kv,
+                deps.broadcaster.clone(),
+                liquidity_service_cfg,
+                liquidity_client_cfg,
             )
+            .await
+            .map_err(|e| WickLightningError::Config(format!("LiquidityManager::new: {e}")))?,
         );
 
         let ephemeral = EntropySource::get_secure_random_bytes(signer.as_ref());
-        let peer_manager: Arc<LnPeerManager<S>> = Arc::new(
-            PeerManager::new(
-                MessageHandler {
-                    chan_handler: channel_manager.clone(),
-                    route_handler: gossip_sync.clone(),
-                    onion_message_handler: Arc::new(IgnoringMessageHandler {}),
-                    custom_message_handler: Arc::new(IgnoringMessageHandler {}),
-                    send_only_message_handler: chain_monitor.clone(),
-                },
-                starting_time_secs,
-                &ephemeral,
-                deps.logger.clone(),
-                signer.clone()
-            )
-        );
+        let peer_manager: Arc<LnPeerManager<S>> = Arc::new(PeerManager::new(
+            MessageHandler {
+                chan_handler: channel_manager.clone(),
+                route_handler: gossip_sync.clone(),
+                onion_message_handler: Arc::new(IgnoringMessageHandler {}),
+                custom_message_handler: liquidity_manager.clone(),
+                send_only_message_handler: chain_monitor.clone(),
+            },
+            starting_time_secs,
+            &ephemeral,
+            deps.logger.clone(),
+            signer.clone(),
+        ));
 
         // ── Background signals ────────────────────────────────────────────────
         let (stop_tx, _) = watch::channel::<()>(());
-        let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel::<
-            (bitcoin::secp256k1::PublicKey, std::net::SocketAddr)
-        >();
+        let (conn_tx, conn_rx) = tokio::sync::mpsc::unbounded_channel::<(
+            bitcoin::secp256k1::PublicKey,
+            std::net::SocketAddr,
+        )>();
         let pending_sent_at: Arc<DashMap<[u8; 32], u64>> = Arc::new(DashMap::new());
         // Registry that parks FundingGenerationReady events for the
         // self-custodial two-phase channel-open flow. Shared between the
@@ -513,12 +594,17 @@ impl<S> NodeBuilder<S>
             crate::funding_registry::PendingFundingRegistry::with_store(funding_store);
         funding_registry.rehydrate_from_store().await;
 
+        // JIT registry — in-memory only. LSPS2 client events do not
+        // persist across restarts per the lightning-liquidity docs;
+        // the SDK re-issues `lsps2.get_info` after a tenant restart.
+        let jit_registry = PendingJitRegistry::new();
+
         // ── Bind P2P listener ────────────────────────────────────────────────
         let listen_bind = deps.listen_addr_for(tenant_id);
         let listener = TcpListener::bind(listen_bind).await.map_err(|e| {
-            WickLightningError::Config(
-                format!("TcpListener::bind({listen_bind}): {e} — port in use?")
-            )
+            WickLightningError::Config(format!(
+                "TcpListener::bind({listen_bind}): {e} — port in use?"
+            ))
         })?;
         let local_listen = listener
             .local_addr()
@@ -549,61 +635,81 @@ impl<S> NodeBuilder<S>
             bg_handles: Mutex::new(Vec::new()),
             pending_sent_at: pending_sent_at.clone(),
             funding_registry: funding_registry.clone(),
+            liquidity_manager: liquidity_manager.clone(),
+            lsp_peer,
+            jit_registry: jit_registry.clone(),
         });
 
         // ── Spawn tasks ──────────────────────────────────────────────────────
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(5);
 
         // P2P inbound accept loop.
-        handles.push(spawn_p2p_accept(listener, peer_manager.clone(), stop_tx.subscribe()));
+        handles.push(spawn_p2p_accept(
+            listener,
+            peer_manager.clone(),
+            stop_tx.subscribe(),
+        ));
 
         // SPV chain poll loop.
-        handles.push(
-            spawn_chain_poll(
-                deps.esplora.clone(),
-                channel_manager.clone(),
-                chain_monitor.clone(),
-                best_block_header,
-                stop_tx.subscribe()
-            )
-        );
+        handles.push(spawn_chain_poll(
+            deps.esplora.clone(),
+            channel_manager.clone(),
+            chain_monitor.clone(),
+            best_block_header,
+            stop_tx.subscribe(),
+        ));
 
         // Fee estimate refresh loop (one retry on startup, then periodic).
         prime_fee_cache(&deps).await;
-        handles.push(
-            spawn_fee_refresh(deps.esplora.clone(), deps.fee_estimator.clone(), stop_tx.subscribe())
-        );
+        handles.push(spawn_fee_refresh(
+            deps.esplora.clone(),
+            deps.fee_estimator.clone(),
+            stop_tx.subscribe(),
+        ));
 
         // Peer reconnect loop.
-        handles.push(
-            spawn_peer_reconnect(peer_store.clone(), peer_manager.clone(), stop_tx.subscribe())
-        );
+        handles.push(spawn_peer_reconnect(
+            peer_store.clone(),
+            peer_manager.clone(),
+            stop_tx.subscribe(),
+        ));
 
         // ConnectionNeeded dispatch — drives outbound dials requested by LDK.
-        handles.push(spawn_connection_dispatch(conn_rx, peer_manager.clone(), stop_tx.subscribe()));
+        handles.push(spawn_connection_dispatch(
+            conn_rx,
+            peer_manager.clone(),
+            stop_tx.subscribe(),
+        ));
 
         // Gossip background: RGS re-sync every 24h + scorer persist every 10min.
-        handles.push(
-            gossip::spawn_gossip_tasks(
-                rgs_url,
-                network_graph.clone(),
-                scorer.clone(),
-                kv_store.clone(),
-                deps.logger.clone(),
-                stop_tx.subscribe()
-            )
-        );
+        handles.push(gossip::spawn_gossip_tasks(
+            rgs_url,
+            network_graph.clone(),
+            scorer.clone(),
+            kv_store.clone(),
+            deps.logger.clone(),
+            stop_tx.subscribe(),
+        ));
 
         // LDK `process_events_async`.
         let mut event_handler = EventHandler::new(
             payments.clone(),
             channels.clone(),
             deps.runtime.clone(),
-            Arc::new(crate::event::ChannelManagerRuntimeOps(channel_manager.clone())),
-            funding_registry.clone()
-        ).with_connection_dispatch(conn_tx);
+            Arc::new(crate::event::ChannelManagerRuntimeOps(
+                channel_manager.clone(),
+            )),
+            funding_registry.clone(),
+        )
+        .with_connection_dispatch(conn_tx);
         if let Some(f) = funding {
             event_handler = event_handler.with_funding_source(f);
+        }
+        if let Some(ref h) = lsp_service_handler {
+            event_handler = event_handler.with_lsp_service_handler(h.clone());
+        }
+        if let Some(pk) = lsp_peer {
+            event_handler = event_handler.with_lsp_peer(pk);
         }
         let event_handler = Arc::new(event_handler);
 
@@ -613,45 +719,58 @@ impl<S> NodeBuilder<S>
         let sweeper: Option<Arc<LnOutputSweeper<S>>> = change_destination.map(|script| {
             let best_block_for_sweeper = BestBlock::new(
                 best_block_header.header.block_hash(),
-                best_block_header.height
+                best_block_header.height,
             );
-            Arc::new(
-                OutputSweeperSync::new(
-                    best_block_for_sweeper,
-                    deps.broadcaster.clone(),
-                    deps.fee_estimator.clone(),
-                    None::<Arc<dyn Filter + Send + Sync>>,
-                    signer.clone(),
-                    Arc::new(FixedChangeDest(script)),
-                    kv_store.clone(),
-                    deps.logger.clone()
-                )
-            )
-        });
-
-        handles.push(
-            spawn_process_events(
-                channel_manager.clone(),
-                chain_monitor.clone(),
-                peer_manager.clone(),
-                gossip_sync.clone(),
-                scorer.clone(),
+            Arc::new(OutputSweeperSync::new(
+                best_block_for_sweeper,
+                deps.broadcaster.clone(),
+                deps.fee_estimator.clone(),
+                None::<Arc<dyn Filter + Send + Sync>>,
+                signer.clone(),
+                Arc::new(FixedChangeDest(script)),
                 kv_store.clone(),
                 deps.logger.clone(),
-                event_handler,
-                sweeper,
-                stop_tx.clone()
-            )
-        );
+            ))
+        });
+
+        handles.push(spawn_process_events(
+            channel_manager.clone(),
+            chain_monitor.clone(),
+            peer_manager.clone(),
+            gossip_sync.clone(),
+            scorer.clone(),
+            kv_store.clone(),
+            deps.logger.clone(),
+            event_handler,
+            sweeper,
+            liquidity_manager.clone(),
+            stop_tx.clone(),
+        ));
+
+        // LiquidityManager event pump: drain LSPS2 client/service events
+        // into the JIT registry so `receive_payment_jit` callers can
+        // await their request_id. When `lsp_service_handler` is set
+        // (LSP service mode), service events are forwarded into the
+        // operator-supplied handler.
+        handles.push(spawn_liquidity_event_pump(
+            liquidity_manager.clone(),
+            jit_registry.clone(),
+            tenant_id,
+            lsp_peer,
+            lsp_service_handler.clone(),
+            stop_tx.subscribe(),
+        ));
 
         // Install handles into the node.
         {
-            let mut g = node.bg_handles
+            let mut g = node
+                .bg_handles
                 .lock()
                 .map_err(|e| WickLightningError::Config(format!("bg_handles: {e}")))?;
             *g = handles;
         }
-        node.runtime_started.store(true, std::sync::atomic::Ordering::Release);
+        node.runtime_started
+            .store(true, std::sync::atomic::Ordering::Release);
 
         // Reconnect to persisted peers (best-effort; failures are logged).
         reconnect_persisted_peers(peer_store.as_ref(), peer_manager.clone()).await;
@@ -668,9 +787,10 @@ impl<S> NodeBuilder<S>
     }
 }
 
-impl<S> std::fmt::Debug
-    for NodeBuilder<S>
-    where S: WickSigner, <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync
+impl<S> std::fmt::Debug for NodeBuilder<S>
+where
+    S: WickSigner,
+    <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeBuilder")
@@ -685,10 +805,11 @@ impl<S> std::fmt::Debug
 fn spawn_p2p_accept<S>(
     listener: TcpListener,
     peer_manager: Arc<LnPeerManager<S>>,
-    mut stop_rx: watch::Receiver<()>
-)
-    -> JoinHandle<()>
-    where S: WickSigner, <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync
+    mut stop_rx: watch::Receiver<()>,
+) -> JoinHandle<()>
+where
+    S: WickSigner,
+    <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
 {
     tokio::spawn(async move {
         loop {
@@ -734,10 +855,11 @@ fn spawn_chain_poll<S>(
     channel_manager: Arc<LnChannelManager<S>>,
     chain_monitor: Arc<LnChainMonitor<S>>,
     best_block_header: ValidatedBlockHeader,
-    mut stop_rx: watch::Receiver<()>
-)
-    -> JoinHandle<()>
-    where S: WickSigner, <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync
+    mut stop_rx: watch::Receiver<()>,
+) -> JoinHandle<()>
+where
+    S: WickSigner,
+    <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
 {
     tokio::spawn(async move {
         let network = chain.network();
@@ -787,7 +909,7 @@ async fn prime_fee_cache(deps: &NodeDeps) {
 fn spawn_fee_refresh(
     chain: Arc<crate::chain::EsploraChainClient>,
     fee_estimator: Arc<crate::chain::FeeEstimator>,
-    mut stop_rx: watch::Receiver<()>
+    mut stop_rx: watch::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -809,14 +931,16 @@ fn spawn_fee_refresh(
 }
 
 fn spawn_connection_dispatch<S>(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<
-        (bitcoin::secp256k1::PublicKey, std::net::SocketAddr)
-    >,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(
+        bitcoin::secp256k1::PublicKey,
+        std::net::SocketAddr,
+    )>,
     peer_manager: Arc<LnPeerManager<S>>,
-    mut stop_rx: watch::Receiver<()>
-)
-    -> JoinHandle<()>
-    where S: WickSigner, <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync
+    mut stop_rx: watch::Receiver<()>,
+) -> JoinHandle<()>
+where
+    S: WickSigner,
+    <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
 {
     tokio::spawn(async move {
         loop {
@@ -844,10 +968,11 @@ fn spawn_connection_dispatch<S>(
 fn spawn_peer_reconnect<S>(
     peer_store: Arc<PeerStore>,
     peer_manager: Arc<LnPeerManager<S>>,
-    mut stop_rx: watch::Receiver<()>
-)
-    -> JoinHandle<()>
-    where S: WickSigner, <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync
+    mut stop_rx: watch::Receiver<()>,
+) -> JoinHandle<()>
+where
+    S: WickSigner,
+    <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
 {
     tokio::spawn(async move {
         loop {
@@ -873,12 +998,12 @@ fn spawn_peer_reconnect<S>(
                 .collect();
             for peer in persisted {
                 if !connected.contains(&peer.node_id) {
-                    if
-                        let Some(fut) = lightning_net_tokio::connect_outbound(
-                            peer_manager.clone(),
-                            peer.node_id,
-                            peer.address
-                        ).await
+                    if let Some(fut) = lightning_net_tokio::connect_outbound(
+                        peer_manager.clone(),
+                        peer.node_id,
+                        peer.address,
+                    )
+                    .await
                     {
                         drop(fut);
                     }
@@ -889,7 +1014,9 @@ fn spawn_peer_reconnect<S>(
 }
 
 async fn reconnect_persisted_peers<S>(peer_store: &PeerStore, peer_manager: Arc<LnPeerManager<S>>)
-    where S: WickSigner, <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync
+where
+    S: WickSigner,
+    <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
 {
     let persisted = match peer_store.list().await {
         Ok(p) => p,
@@ -903,12 +1030,9 @@ async fn reconnect_persisted_peers<S>(peer_store: &PeerStore, peer_manager: Arc<
         }
     };
     for peer in persisted {
-        if
-            let Some(fut) = lightning_net_tokio::connect_outbound(
-                peer_manager.clone(),
-                peer.node_id,
-                peer.address
-            ).await
+        if let Some(fut) =
+            lightning_net_tokio::connect_outbound(peer_manager.clone(), peer.node_id, peer.address)
+                .await
         {
             drop(fut);
         }
@@ -943,7 +1067,7 @@ type LnOutputSweeper<S> = OutputSweeperSync<
     Arc<dyn Filter + Send + Sync>,
     Arc<PgKvStore>,
     Arc<crate::logger::TracingLogger>,
-    Arc<S>
+    Arc<S>,
 >;
 
 #[allow(clippy::too_many_arguments)]
@@ -957,10 +1081,12 @@ fn spawn_process_events<S>(
     logger: Arc<crate::logger::TracingLogger>,
     event_handler: Arc<EventHandler>,
     sweeper: Option<Arc<LnOutputSweeper<S>>>,
-    stop_tx: watch::Sender<()>
-)
-    -> JoinHandle<()>
-    where S: WickSigner, <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync
+    liquidity_manager: Arc<LnLiquidityManager<S>>,
+    stop_tx: watch::Sender<()>,
+) -> JoinHandle<()>
+where
+    S: WickSigner,
+    <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
 {
     tokio::spawn(async move {
         let sleeper_stop = stop_tx.clone();
@@ -973,26 +1099,33 @@ fn spawn_process_events<S>(
                 }
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         };
-        if
-            let Err(e) = process_events_async_with_kv_store_sync(
-                kv_store,
-                move |event| {
-                    let h = event_handler.clone();
-                    async move { h.handle(event).await }
-                },
-                chain_monitor,
-                channel_manager,
-                NO_ONION_MESSENGER,
-                GossipSync::p2p(gossip_sync),
-                peer_manager,
-                NO_LIQUIDITY_MANAGER,
-                sweeper,
-                logger,
-                Some(scorer),
-                sleeper,
-                false,
-                || { Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()) }
-            ).await
+        let _ = NO_LIQUIDITY_MANAGER; // keep import alive on no-LSPS path
+        if let Err(e) = process_events_async_with_kv_store_sync(
+            kv_store,
+            move |event| {
+                let h = event_handler.clone();
+                async move { h.handle(event).await }
+            },
+            chain_monitor,
+            channel_manager,
+            NO_ONION_MESSENGER,
+            GossipSync::p2p(gossip_sync),
+            peer_manager,
+            Some(liquidity_manager),
+            sweeper,
+            logger,
+            Some(scorer),
+            sleeper,
+            false,
+            || {
+                Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default(),
+                )
+            },
+        )
+        .await
         {
             tracing::error!(
                 target: "wick_lightning",
@@ -1007,11 +1140,169 @@ fn spawn_process_events<S>(
 /// without importing both crates' signer traits.
 pub use crate::node::Node as BuiltNode;
 
+/// Drain LSPS2 events from [`LiquidityManager`] and route client-side
+/// responses into [`PendingJitRegistry`].
+///
+/// `lightning-liquidity` emits events asynchronously via
+/// `next_event_async()`. We loop on it, mapping `LSPS2ClientEvent`
+/// variants to [`crate::jit_registry::JitResponse`] and parking them
+/// keyed by `request_id`. When `expected_lsp` is `Some(_)`, every
+/// client response's `counterparty_node_id` is matched against it —
+/// responses from any other peer are logged + dropped (defense in
+/// depth; the message routing layer should already enforce this).
+///
+/// Service-side events (`LSPS2ServiceEvent`) drive LDK's built-in
+/// `lsps2_service_handler` directly — `wick-lsp::daemon` handles
+/// `GetInfo`/`BuyRequest`/`OpenChannel` here and the LSP's
+/// EventHandler forwards the corresponding LDK lifecycle events
+/// (`HTLCIntercepted`, `ChannelReady`, `PaymentForwarded`) to
+/// complete the protocol.
+#[allow(clippy::too_many_lines)]
+fn spawn_liquidity_event_pump<S>(
+    liquidity_manager: Arc<LnLiquidityManager<S>>,
+    jit_registry: Arc<PendingJitRegistry>,
+    tenant_id: TenantId,
+    expected_lsp: Option<PublicKey>,
+    service_handler: Option<Arc<dyn crate::liquidity_hook::LspServiceEventHandler>>,
+    mut stop_rx: watch::Receiver<()>,
+) -> JoinHandle<()>
+where
+    S: WickSigner,
+    <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
+{
+    use crate::jit_registry::JitResponse;
+    use lightning_liquidity::events::LiquidityEvent;
+    use lightning_liquidity::lsps2::event::LSPS2ClientEvent;
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = stop_rx.changed() => {
+                    tracing::info!(
+                        target: "wick_lightning",
+                        tenant = %tenant_id,
+                        "liquidity_event_pump: stopping"
+                    );
+                    return;
+                }
+                ev = liquidity_manager.next_event_async() => {
+                    match ev {
+                        LiquidityEvent::LSPS2Client(LSPS2ClientEvent::OpeningParametersReady {
+                            request_id,
+                            counterparty_node_id,
+                            opening_fee_params_menu,
+                        }) => {
+                            if !validate_counterparty(expected_lsp, counterparty_node_id, "OpeningParametersReady", tenant_id) {
+                                continue;
+                            }
+                            jit_registry.park(request_id, JitResponse::OpeningParameters {
+                                counterparty_node_id,
+                                opening_fee_params_menu,
+                            });
+                        }
+                        LiquidityEvent::LSPS2Client(LSPS2ClientEvent::InvoiceParametersReady {
+                            request_id,
+                            counterparty_node_id,
+                            intercept_scid,
+                            cltv_expiry_delta,
+                            payment_size_msat,
+                        }) => {
+                            if !validate_counterparty(expected_lsp, counterparty_node_id, "InvoiceParametersReady", tenant_id) {
+                                continue;
+                            }
+                            jit_registry.park(request_id, JitResponse::InvoiceParameters {
+                                counterparty_node_id,
+                                intercept_scid,
+                                cltv_expiry_delta,
+                                payment_size_msat,
+                            });
+                        }
+                        LiquidityEvent::LSPS2Client(LSPS2ClientEvent::GetInfoFailed {
+                            request_id,
+                            counterparty_node_id,
+                            error,
+                        }) => {
+                            if !validate_counterparty(expected_lsp, counterparty_node_id, "GetInfoFailed", tenant_id) {
+                                continue;
+                            }
+                            jit_registry.park(request_id, JitResponse::GetInfoFailed {
+                                counterparty_node_id,
+                                message: format!("{}: {}", error.code, error.message),
+                            });
+                        }
+                        LiquidityEvent::LSPS2Client(LSPS2ClientEvent::BuyRequestFailed {
+                            request_id,
+                            counterparty_node_id,
+                            error,
+                        }) => {
+                            if !validate_counterparty(expected_lsp, counterparty_node_id, "BuyRequestFailed", tenant_id) {
+                                continue;
+                            }
+                            jit_registry.park(request_id, JitResponse::BuyFailed {
+                                counterparty_node_id,
+                                message: format!("{}: {}", error.code, error.message),
+                            });
+                        }
+                        // Service events — delegated to the operator-supplied
+                        // handler when one is wired in. Without a handler the
+                        // event is logged and dropped (clients will time out).
+                        LiquidityEvent::LSPS2Service(svc) => {
+                            match service_handler.as_ref() {
+                                Some(h) => h.handle_service_event(svc).await,
+                                None => tracing::debug!(
+                                    target: "wick_lightning",
+                                    tenant = %tenant_id,
+                                    event = ?svc,
+                                    "LSPS2Service event with no operator handler installed"
+                                ),
+                            }
+                        }
+                        other => {
+                            tracing::debug!(
+                                target: "wick_lightning",
+                                tenant = %tenant_id,
+                                event = ?other,
+                                "liquidity_event_pump: unhandled event (LSPS0/LSPS1/LSPS5)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Validate that an LSPS2 client response came from the configured LSP.
+/// Logs + drops on mismatch.
+fn validate_counterparty(
+    expected: Option<PublicKey>,
+    actual: PublicKey,
+    event: &'static str,
+    tenant_id: TenantId,
+) -> bool {
+    match expected {
+        Some(exp) if exp != actual => {
+            tracing::warn!(
+                target: "wick_lightning",
+                tenant = %tenant_id,
+                event,
+                expected = %exp,
+                actual = %actual,
+                "liquidity_event_pump: dropping LSPS2 response from unexpected counterparty"
+            );
+            false
+        }
+        _ => true,
+    }
+}
+
 // Ensure Node<S> is both NodeApi *and* Send+Sync so the server can box it as
 // `Arc<dyn NodeApi>`. The compile-time check keeps us honest.
 #[allow(dead_code)]
 fn _assert_node_is_api<S>(n: Arc<Node<S>>) -> Arc<dyn NodeApi>
-    where S: WickSigner, <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync
+where
+    S: WickSigner,
+    <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
 {
     n
 }

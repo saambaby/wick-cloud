@@ -200,7 +200,10 @@ mod tests {
         let urgent = fe.get_est_sat_per_1000_weight(ConfirmationTarget::UrgentOnChainSweep);
         let slow = fe.get_est_sat_per_1000_weight(ConfirmationTarget::ChannelCloseMinimum);
         assert!(urgent > MIN_SAT_PER_1000_WEIGHT);
-        assert!(urgent > slow, "urgent ({urgent}) should exceed slow ({slow})");
+        assert!(
+            urgent > slow,
+            "urgent ({urgent}) should exceed slow ({slow})"
+        );
     }
 
     #[test]

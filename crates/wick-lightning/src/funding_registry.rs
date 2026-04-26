@@ -44,6 +44,12 @@ pub struct PendingFunding {
     pub output_script: ScriptBuf,
 }
 
+/// Bounded broadcast capacity for the [`PendingFundingRegistry::subscribe`]
+/// fan-out. Single-consumer in practice (the LSP admin watch RPC); the
+/// channel only buffers events between `park` firing and the operator
+/// SDK draining them. 64 is generous.
+const FUNDING_BROADCAST_CAPACITY: usize = 64;
+
 /// Map of in-flight `FundingGenerationReady` events keyed by
 /// `temporary_channel_id`.
 ///
@@ -58,7 +64,13 @@ pub struct PendingFunding {
 ///
 /// Either ordering delivers exactly once; there's no notification that
 /// can be dropped.
-#[derive(Default)]
+///
+/// Additionally, every `park` fires the request to a broadcast channel
+/// surfaced via [`Self::subscribe`]. The LSP admin
+/// `LspWatchPendingFunding` RPC consumes that stream so the operator's
+/// SDK can sign + finalize self-custodially. The broadcast is purely a
+/// fan-out signal — the authoritative state remains in `ready`, drained
+/// by [`Self::take`] / [`Self::try_take`] at finalize time.
 pub struct PendingFundingRegistry {
     /// Pending requests that have been parked but not yet taken.
     ready: DashMap<ChannelId, PendingFunding>,
@@ -71,6 +83,22 @@ pub struct PendingFundingRegistry {
     /// Postgres pool), the registry is pure in-memory — the crash
     /// recovery guarantee is forfeit.
     store: Option<Arc<FundingStore>>,
+    /// Broadcast fan-out for newly-parked entries. Lossy on subscriber
+    /// lag; consumers that fall behind should re-prime via
+    /// [`Self::snapshot`].
+    broadcast_tx: tokio::sync::broadcast::Sender<(ChannelId, PendingFunding)>,
+}
+
+impl Default for PendingFundingRegistry {
+    fn default() -> Self {
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(FUNDING_BROADCAST_CAPACITY);
+        Self {
+            ready: DashMap::new(),
+            waiters: DashMap::new(),
+            store: None,
+            broadcast_tx,
+        }
+    }
 }
 
 impl fmt::Debug for PendingFundingRegistry {
@@ -97,11 +125,67 @@ impl PendingFundingRegistry {
     /// boot.
     #[must_use]
     pub fn with_store(store: Arc<FundingStore>) -> Arc<Self> {
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(FUNDING_BROADCAST_CAPACITY);
         Arc::new(Self {
             ready: DashMap::new(),
             waiters: DashMap::new(),
             store: Some(store),
+            broadcast_tx,
         })
+    }
+
+    /// Subscribe to a broadcast of newly-parked funding requests.
+    ///
+    /// Used by the LSP admin `LspWatchPendingFunding` RPC to forward
+    /// parked entries to the operator's SDK. Subscribe before reading
+    /// [`Self::snapshot`] to avoid a race where a fresh `park` slips
+    /// in between snapshot and subscribe.
+    ///
+    /// Lossy on subscriber lag (`broadcast::Receiver::recv` returns
+    /// `Lagged(n)`); consumers handling lag should re-prime by calling
+    /// [`Self::snapshot`] and treating the broadcast as a wakeup
+    /// signal.
+    #[must_use]
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<(ChannelId, PendingFunding)> {
+        self.broadcast_tx.subscribe()
+    }
+
+    /// Snapshot of currently-parked (not yet taken) entries.
+    ///
+    /// Returned values are cheap clones. Concurrent with `park` /
+    /// `take` — entries may be drained between the snapshot and the
+    /// caller acting on them. Used at subscriber start-up to bootstrap
+    /// the operator's funding loop.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<(ChannelId, PendingFunding)> {
+        self.ready
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect()
+    }
+
+    /// Non-blocking variant of [`Self::take`]. Returns `Some` only if
+    /// the entry is already parked; never waits. Used by the LSP admin
+    /// `LspFinalizeFunding` handler — by the time the operator calls
+    /// finalize, the entry is guaranteed to be parked (the operator
+    /// observed it via the watch stream).
+    pub fn try_take(&self, temp_id: ChannelId) -> Option<PendingFunding> {
+        let Some((_, req)) = self.ready.remove(&temp_id) else {
+            return None;
+        };
+        if let Some(ref store) = self.store {
+            let store = store.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store.remove(temp_id).await {
+                    tracing::warn!(
+                        target: "wick_lightning",
+                        error = %e,
+                        "funding_registry: durable remove (try_take) failed"
+                    );
+                }
+            });
+        }
+        Some(req)
     }
 
     /// Pull every surviving row from Postgres into the in-memory
@@ -166,6 +250,12 @@ impl PendingFundingRegistry {
                 }
             });
         }
+
+        // Fan-out for LSP admin watchers. Best-effort — `send` errors
+        // when there are no live subscribers, which is the common case
+        // for tenant flows. The authoritative state is the
+        // ready/waiters maps, which are unaffected.
+        let _ = self.broadcast_tx.send((temp_id, req.clone()));
 
         if let Some((_, tx)) = self.waiters.remove(&temp_id) {
             // There's already a waiter — hand the request over directly.

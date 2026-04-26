@@ -24,6 +24,7 @@ use tracing::{debug, error, info, warn};
 use crate::channel_store::{ChannelState, ChannelStore, ChannelUpsert};
 use crate::funding::FundingSource;
 use crate::funding_registry::{PendingFunding, PendingFundingRegistry};
+use crate::liquidity_hook::LspServiceEventHandler;
 use crate::payment_store::{Direction, PaymentStatus, PaymentStore, PaymentWrite};
 
 /// Capability contract for components the event handler reaches back into.
@@ -53,6 +54,17 @@ pub trait EventRuntimeOps: Send + Sync + 'static {
     /// channel is no longer in the ChannelManager (e.g., a race on close —
     /// harmless, as `ChannelClosed` fires next and marks the row closed).
     fn channel_value_sats(&self, channel_id: &[u8; 32]) -> Option<u64>;
+
+    /// Accept an inbound 0-conf channel from a trusted peer (the LSP).
+    /// Used by tenant nodes when an LSPS2-driven JIT channel-open arrives.
+    /// The caller is responsible for verifying that the counterparty is
+    /// actually the configured LSP; this method does no such check itself.
+    fn accept_inbound_channel_from_trusted_peer_0conf(
+        &self,
+        temporary_channel_id: lightning::ln::types::ChannelId,
+        counterparty_node_id: bitcoin::secp256k1::PublicKey,
+        user_channel_id: u128,
+    ) -> Result<(), String>;
 }
 
 /// Adapter so a real [`ChannelManager`] satisfies [`EventRuntimeOps`].
@@ -83,6 +95,19 @@ where
     fn channel_value_sats(&self, channel_id: &[u8; 32]) -> Option<u64> {
         self.0.channel_value_sats(channel_id)
     }
+
+    fn accept_inbound_channel_from_trusted_peer_0conf(
+        &self,
+        temporary_channel_id: lightning::ln::types::ChannelId,
+        counterparty_node_id: bitcoin::secp256k1::PublicKey,
+        user_channel_id: u128,
+    ) -> Result<(), String> {
+        self.0.accept_inbound_channel_from_trusted_peer_0conf(
+            temporary_channel_id,
+            counterparty_node_id,
+            user_channel_id,
+        )
+    }
 }
 
 /// Thin trait over the [`ChannelManager`] methods the event handler
@@ -99,6 +124,12 @@ pub trait ChannelManagerOps {
     /// channel is no longer in the ChannelManager (e.g., a race on close —
     /// harmless, as `ChannelClosed` fires next and marks the row closed).
     fn channel_value_sats(&self, channel_id: &[u8; 32]) -> Option<u64>;
+    fn accept_inbound_channel_from_trusted_peer_0conf(
+        &self,
+        temporary_channel_id: lightning::ln::types::ChannelId,
+        counterparty_node_id: bitcoin::secp256k1::PublicKey,
+        user_channel_id: u128,
+    ) -> Result<(), String>;
 }
 
 /// Historic alias retained so external call sites that reference
@@ -154,6 +185,24 @@ where
             .find(|c| &c.channel_id.0 == channel_id)
             .map(|c| c.channel_value_satoshis)
     }
+
+    fn accept_inbound_channel_from_trusted_peer_0conf(
+        &self,
+        temporary_channel_id: lightning::ln::types::ChannelId,
+        counterparty_node_id: bitcoin::secp256k1::PublicKey,
+        user_channel_id: u128,
+    ) -> Result<(), String> {
+        // 5th arg is `Option<ChannelConfigOverrides>` in LDK 0.2 — pass
+        // `None` to inherit the channel manager's default config.
+        ChannelManager::accept_inbound_channel_from_trusted_peer_0conf(
+            self,
+            &temporary_channel_id,
+            &counterparty_node_id,
+            user_channel_id,
+            None,
+        )
+        .map_err(|e| format!("{e:?}"))
+    }
 }
 
 /// Per-tenant LDK event handler.
@@ -177,6 +226,18 @@ pub struct EventHandler {
     /// A background task in `NodeBuilder` consumes this and calls
     /// `lightning_net_tokio::connect_outbound`.
     connection_tx: Option<mpsc::UnboundedSender<(PublicKey, SocketAddr)>>,
+    /// Optional service-side LSPS2 hook. When set, LDK lifecycle
+    /// events (`HTLCIntercepted`, `ChannelReady`, `PaymentForwarded`,
+    /// `HTLCHandlingFailed`) are forwarded to the operator's LSP
+    /// service handler so the LSPS2 protocol can complete.
+    lsp_service_handler: Option<Arc<dyn LspServiceEventHandler>>,
+    /// Pubkey of the LSP this node trusts for inbound 0-conf JIT
+    /// channels. When set, `Event::OpenChannelRequest` accepts unsolicited
+    /// inbound opens from this counterparty via
+    /// `accept_inbound_channel_from_trusted_peer_0conf`. Set on tenant
+    /// nodes built with `with_liquidity_client(lsp_peer)`; `None` on the
+    /// LSP node itself and on tenant nodes without an upstream LSP.
+    lsp_peer: Option<PublicKey>,
 }
 
 impl std::fmt::Debug for EventHandler {
@@ -204,7 +265,30 @@ impl EventHandler {
             funding: None,
             funding_registry,
             connection_tx: None,
+            lsp_service_handler: None,
+            lsp_peer: None,
         }
+    }
+
+    /// Bind the trusted LSP pubkey for inbound 0-conf JIT acceptance.
+    /// When set, `Event::OpenChannelRequest` from this counterparty is
+    /// accepted as a 0-conf trusted-peer channel; all other inbound
+    /// requests are ignored.
+    #[must_use]
+    pub fn with_lsp_peer(mut self, lsp_peer: PublicKey) -> Self {
+        self.lsp_peer = Some(lsp_peer);
+        self
+    }
+
+    /// Wire an LSPS2 service hook. When set, LDK lifecycle events that
+    /// the LSPS2 service handler needs (`HTLCIntercepted`,
+    /// `ChannelReady`, `PaymentForwarded`, `HTLCHandlingFailed`) are
+    /// forwarded into the hook in addition to the per-tenant
+    /// persistence work.
+    #[must_use]
+    pub fn with_lsp_service_handler(mut self, handler: Arc<dyn LspServiceEventHandler>) -> Self {
+        self.lsp_service_handler = Some(handler);
+        self
     }
 
     /// Bind a [`FundingSource`]. Only needed for nodes that originate
@@ -436,6 +520,7 @@ impl LdkEventHandler for EventHandler {
 
             Event::ChannelReady {
                 channel_id,
+                user_channel_id,
                 counterparty_node_id,
                 ..
             } => {
@@ -456,6 +541,13 @@ impl LdkEventHandler for EventHandler {
                     error!(target: "wick_lightning", error = %e, "ChannelReady: DB upsert failed");
                     return Err(ReplayEvent());
                 }
+                if let Some(h) = self.lsp_service_handler.as_ref() {
+                    let h = Arc::clone(h);
+                    self.block_on(async move {
+                        h.forward_channel_ready(user_channel_id, channel_id, counterparty_node_id)
+                            .await;
+                    });
+                }
             }
 
             Event::ChannelClosed { channel_id, .. } => {
@@ -465,9 +557,82 @@ impl LdkEventHandler for EventHandler {
                 }
             }
 
-            // ── Deferred to Phase 2 (LSPS2 JIT + park/wake) ────────────────
-            Event::HTLCIntercepted { .. } | Event::OpenChannelRequest { .. } => {
-                debug!(target: "wick_lightning", ?event, "event deferred to phase 2");
+            // ── LSPS2 JIT + 0-conf channel acceptance ───────────────────────
+            Event::HTLCIntercepted {
+                intercept_id,
+                requested_next_hop_scid,
+                expected_outbound_amount_msat,
+                payment_hash,
+                ..
+            } => {
+                if let Some(h) = self.lsp_service_handler.as_ref() {
+                    let h = Arc::clone(h);
+                    self.block_on(async move {
+                        h.forward_htlc_intercepted(
+                            intercept_id,
+                            requested_next_hop_scid,
+                            expected_outbound_amount_msat,
+                            payment_hash,
+                        )
+                        .await;
+                    });
+                } else {
+                    debug!(
+                        target: "wick_lightning",
+                        scid = requested_next_hop_scid,
+                        "HTLCIntercepted with no LSP service handler — fail back"
+                    );
+                }
+            }
+            Event::OpenChannelRequest {
+                temporary_channel_id,
+                counterparty_node_id,
+                ..
+            } => {
+                // Tenant-side: accept 0-conf JIT channels that originate
+                // from the configured LSP peer. All other inbound opens
+                // are unsolicited — ignore so LDK times them out.
+                if self.lsp_peer == Some(counterparty_node_id) {
+                    // user_channel_id is opaque to LDK on the receiver
+                    // side; the LSP echoes its own internal id over the
+                    // wire. Mint a fresh u128 from the temporary channel
+                    // id so we have a stable per-open correlation key
+                    // for logging.
+                    let mut prefix = [0u8; 16];
+                    prefix.copy_from_slice(&temporary_channel_id.0[..16]);
+                    let user_channel_id = u128::from_le_bytes(prefix);
+                    match self.ops.accept_inbound_channel_from_trusted_peer_0conf(
+                        temporary_channel_id,
+                        counterparty_node_id,
+                        user_channel_id,
+                    ) {
+                        Ok(()) => {
+                            info!(
+                                target: "wick_lightning",
+                                ?temporary_channel_id,
+                                %counterparty_node_id,
+                                "accepted inbound 0-conf JIT channel from trusted LSP"
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                target: "wick_lightning",
+                                ?temporary_channel_id,
+                                %counterparty_node_id,
+                                error = %e,
+                                "accept_inbound_channel_from_trusted_peer_0conf failed"
+                            );
+                            return Err(ReplayEvent());
+                        }
+                    }
+                } else {
+                    debug!(
+                        target: "wick_lightning",
+                        ?temporary_channel_id,
+                        %counterparty_node_id,
+                        "OpenChannelRequest from non-LSP peer — ignoring"
+                    );
+                }
             }
 
             // ── Deferred to Phase 3 (on-chain sweep + splicing) ────────────
@@ -477,9 +642,25 @@ impl LdkEventHandler for EventHandler {
                 debug!(target: "wick_lightning", ?event, "event deferred to phase 3");
             }
 
-            // ── Deferred to Phase 8 (forwarding + onion / BOLT12) ──────────
-            Event::PaymentForwarded { .. }
-            | Event::InvoiceReceived { .. }
+            // ── Forwarding + onion / BOLT12 ────────────────────────────────
+            Event::PaymentForwarded {
+                next_channel_id,
+                skimmed_fee_msat,
+                ..
+            } => {
+                if let (Some(h), Some(next_id)) =
+                    (self.lsp_service_handler.as_ref(), next_channel_id)
+                {
+                    let h = Arc::clone(h);
+                    let fee = skimmed_fee_msat.unwrap_or(0);
+                    self.block_on(async move {
+                        h.forward_payment_forwarded(next_id, fee).await;
+                    });
+                } else {
+                    debug!(target: "wick_lightning", ?event, "PaymentForwarded observed");
+                }
+            }
+            Event::InvoiceReceived { .. }
             | Event::OnionMessageIntercepted { .. }
             | Event::OnionMessagePeerConnected { .. } => {
                 debug!(target: "wick_lightning", ?event, "event deferred to phase 8");
@@ -503,12 +684,22 @@ impl LdkEventHandler for EventHandler {
                 }
             }
 
+            Event::HTLCHandlingFailed { failure_type, .. } => {
+                if let Some(h) = self.lsp_service_handler.as_ref() {
+                    let h = Arc::clone(h);
+                    self.block_on(async move {
+                        h.forward_htlc_handling_failed(failure_type).await;
+                    });
+                } else {
+                    debug!(target: "wick_lightning", "HTLCHandlingFailed observed");
+                }
+            }
+
             // ── Observed but no persistence required ───────────────────────
             Event::PaymentPathSuccessful { .. }
             | Event::PaymentPathFailed { .. }
             | Event::ProbeSuccessful { .. }
-            | Event::ProbeFailed { .. }
-            | Event::HTLCHandlingFailed { .. } => {
+            | Event::ProbeFailed { .. } => {
                 debug!(target: "wick_lightning", ?event, "event observed; no persistence required");
             }
 

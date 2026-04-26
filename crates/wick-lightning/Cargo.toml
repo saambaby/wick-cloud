@@ -51,6 +51,7 @@ lightning-net-tokio            = { workspace = true }
 lightning-background-processor = { workspace = true }
 lightning-persister            = { workspace = true }
 lightning-rapid-gossip-sync    = { workspace = true }
+lightning-liquidity            = { workspace = true }
 bitcoin                        = { workspace = true }
 
 # Chain backend

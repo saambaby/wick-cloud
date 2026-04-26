@@ -87,7 +87,9 @@ impl PgKvStore {
             .map_err(|e| sqlx_to_io(&e))?;
 
         match row {
-            Some(r) => Ok(r.try_get::<Vec<u8>, _>("value").map_err(|e| sqlx_to_io(&e))?),
+            Some(r) => Ok(r
+                .try_get::<Vec<u8>, _>("value")
+                .map_err(|e| sqlx_to_io(&e))?),
             None => Err(io::Error::new(io::ErrorKind::NotFound, "key not in store")),
         }
     }

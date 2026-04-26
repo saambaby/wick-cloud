@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use bitcoin::secp256k1::PublicKey;
 use lightning::ln::types::ChannelId;
 
-use crate::node::{Balance, ChannelSummary, PaymentRecord, PaymentResult};
+use crate::node::{Balance, ChannelSummary, JitInvoice, JitQuote, PaymentRecord, PaymentResult};
 
 /// Capability surface for a per-tenant Lightning node.
 ///
@@ -50,6 +50,25 @@ pub trait NodeApi: Send + Sync + Debug + 'static {
 
     /// Return the most recent `limit` payment rows from Postgres.
     async fn get_transactions(&self, limit: u32) -> anyhow::Result<Vec<PaymentRecord>>;
+
+    /// Negotiate LSPS2 `lsps2.get_info` with the configured LSP peer
+    /// and return a fee quote. Use the result to display a fee preview
+    /// before issuing a JIT invoice via [`Self::receive_payment_jit`].
+    ///
+    /// Errors if no LSP is configured (`builder.with_liquidity_client`
+    /// was not called) or if the LSP fails / times out.
+    async fn lsps2_get_info(&self, amount_msat: Option<u64>) -> anyhow::Result<JitQuote>;
+
+    /// Issue a JIT-enabled BOLT11 invoice. End-to-end: negotiates
+    /// `get_info` + `buy` with the LSP, embeds the LSP's intercept SCID
+    /// as a private route hint, and returns the signed invoice. Pays
+    /// reach the LSP first and trigger a 0-conf channel open to this
+    /// tenant before forwarding.
+    ///
+    /// `amount_msat` is required; LSPS2 buy quotes against a payment
+    /// size, so any-amount JIT invoices are rejected at this layer.
+    async fn receive_payment_jit(&self, amount_msat: u64, memo: &str)
+        -> anyhow::Result<JitInvoice>;
 
     /// Lightning node pubkey (derived from the signer).
     fn node_id(&self) -> PublicKey;

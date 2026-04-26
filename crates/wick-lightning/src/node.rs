@@ -39,7 +39,10 @@ use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeePa
 use lightning::routing::utxo::UtxoLookup;
 use lightning::sign::SignerProvider;
 use lightning::util::async_poll::{MaybeSend, MaybeSync};
+use lightning::util::persist::KVStoreSyncWrapper;
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
+use lightning_liquidity::utils::time::DefaultTimeProvider;
+use lightning_liquidity::LiquidityManager;
 use lightning_net_tokio::SocketDescriptor;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -47,6 +50,7 @@ use wick_core::TenantId;
 
 use crate::api::NodeApi;
 use crate::chain::{EsploraBroadcaster, EsploraChainClient, FeeEstimator};
+use crate::jit_registry::PendingJitRegistry;
 use crate::logger::TracingLogger;
 use crate::payment_store::{Direction, PaymentStatus, PaymentStore, PaymentWrite};
 use crate::peer_store::{PeerInfo, PeerStore};
@@ -103,6 +107,42 @@ pub struct PaymentRecord {
     pub timestamp: i64,
     /// Optional invoice memo.
     pub memo: Option<String>,
+}
+
+/// LSPS2 fee quote returned by [`NodeApi::lsps2_get_info`].
+///
+/// Tenants surface this through the SDK so users can preview the JIT
+/// channel opening fee before committing to an invoice.
+#[derive(Debug, Clone)]
+pub struct JitQuote {
+    /// LSP node id that issued the quote.
+    pub lsp_pubkey: PublicKey,
+    /// Floor opening fee in millisatoshis.
+    pub min_fee_msat: u64,
+    /// Proportional fee in parts-per-million of the JIT payment size.
+    pub proportional_ppm: u32,
+    /// Minimum payment size (msat) the LSP will accept.
+    pub min_payment_size_msat: u64,
+    /// Maximum payment size (msat) the LSP will accept.
+    pub max_payment_size_msat: u64,
+    /// Quote expiry as Unix seconds. After this, the SDK must
+    /// re-request before issuing an invoice.
+    pub valid_until_unix: i64,
+}
+
+/// JIT-enabled BOLT11 invoice produced by [`NodeApi::receive_payment_jit`].
+#[derive(Debug, Clone)]
+pub struct JitInvoice {
+    /// BOLT11 invoice string.
+    pub bolt11: String,
+    /// 32-byte payment hash from the BOLT11.
+    pub payment_hash: [u8; 32],
+    /// Quoted opening fee (msat) the LSP will deduct from the first
+    /// inbound payment. Surfaced for UI display; the LSP enforces it
+    /// independently on settlement.
+    pub jit_fee_msat_quote: u64,
+    /// LSP pubkey carried in the invoice's route hint.
+    pub lsp_pubkey: PublicKey,
 }
 
 /// A channel summary for [`NodeApi::list_channels`].
@@ -170,13 +210,35 @@ pub type LnChannelManager<S> = ChannelManager<
 pub type LnGossipSync =
     P2PGossipSync<Arc<LnNetworkGraph>, Arc<dyn UtxoLookup + Send + Sync>, Arc<TracingLogger>>;
 
+/// Trait-object alias for [`Filter`] passed into [`LiquidityManager`].
+///
+/// Phase 3 nodes pass `None::<Arc<LiquidityFilter>>` for the chain source —
+/// LSPS2 client mode does not need it; LSPS2 service mode does its own
+/// chain sourcing through the existing tenant `ChainMonitor`.
+pub type LiquidityFilter = dyn Filter + Send + Sync;
+
+/// Concrete instantiation of LDK's [`LiquidityManager`] for Wick nodes.
+///
+/// Both tenant-side (client config) and LSP-side (service config) Nodes
+/// instantiate the same type — the difference is purely in which
+/// `client_config` / `service_config` is populated at construction time.
+pub type LnLiquidityManager<S> = LiquidityManager<
+    Arc<S>,
+    Arc<S>,
+    Arc<LnChannelManager<S>>,
+    Arc<LiquidityFilter>,
+    KVStoreSyncWrapper<Arc<PgKvStore>>,
+    DefaultTimeProvider,
+    Arc<EsploraBroadcaster>,
+>;
+
 pub type LnPeerManager<S> = PeerManager<
     SocketDescriptor,
     Arc<LnChannelManager<S>>,
     Arc<LnGossipSync>,
     Arc<IgnoringMessageHandler>,
     Arc<TracingLogger>,
-    Arc<IgnoringMessageHandler>,
+    Arc<LnLiquidityManager<S>>,
     Arc<S>,
     Arc<LnChainMonitor<S>>,
 >;
@@ -235,6 +297,22 @@ where
     /// two-phase channel-open flow. Populated by the event handler;
     /// drained by [`NodeApi::open_channel_init`](crate::api::NodeApi::open_channel_init).
     pub(crate) funding_registry: Arc<crate::funding_registry::PendingFundingRegistry>,
+    /// LDK [`LiquidityManager`] — wired as the `PeerManager`'s
+    /// `CustomMessageHandler`. Held as an `Arc` so the event-pump
+    /// background task and the [`NodeApi::receive_payment_jit`]
+    /// gRPC-facing path can both reach the LSPS2 client handler.
+    pub(crate) liquidity_manager: Arc<LnLiquidityManager<S>>,
+    /// LSP peer pubkey used by [`NodeApi::receive_payment_jit`] when
+    /// negotiating LSPS2 `get_info` / `buy`. `None` disables JIT for
+    /// this node — `receive_payment_jit` returns an error if invoked.
+    /// On tenant nodes this is set from `[lsp].listen_addr` of the
+    /// in-process LSP; on the LSP node itself it is `None`.
+    pub(crate) lsp_peer: Option<PublicKey>,
+    /// Parks `LSPS2ClientEvent` responses awaiting a matching
+    /// `request_id`. Mirrors [`PendingFundingRegistry`]: oneshot-per-key
+    /// so there is no race between the event-pump task writing a
+    /// response and the gRPC-facing future awaiting it.
+    pub(crate) jit_registry: Arc<PendingJitRegistry>,
 }
 
 impl<S> std::fmt::Debug for Node<S>
@@ -273,6 +351,90 @@ where
     #[must_use]
     pub fn local_listen_addr(&self) -> Option<std::net::SocketAddr> {
         self.listen_addr.read().ok().and_then(|g| *g)
+    }
+
+    /// Shared `Arc` to the inner [`LnLiquidityManager`]. Required by
+    /// `wick-lsp`'s operator handler so it can call `lsps2_service_handler`
+    /// methods (`opening_fee_params_generated`, `invoice_parameters_generated`,
+    /// `htlc_intercepted`, `channel_ready`, `payment_forwarded`).
+    #[must_use]
+    pub fn liquidity_manager_arc(&self) -> Arc<LnLiquidityManager<S>> {
+        self.liquidity_manager.clone()
+    }
+
+    /// Allocate a fresh intercept SCID for an LSPS2 buy response.
+    /// Wraps `ChannelManager::get_intercept_scid()`.
+    #[must_use]
+    pub fn channel_manager_get_intercept_scid(&self) -> u64 {
+        self.channel_manager.get_intercept_scid()
+    }
+
+    /// Fail an intercepted HTLC back upstream. Wraps
+    /// `ChannelManager::fail_intercepted_htlc`. LDK 0.2 returns
+    /// `unknown_next_peer` semantics regardless of caller intent — the
+    /// LSP signals "no JIT channel exists for this SCID" and the payer
+    /// retries via a different route.
+    pub fn channel_manager_fail_intercepted_htlc(
+        &self,
+        intercept_id: lightning::ln::channelmanager::InterceptId,
+    ) -> anyhow::Result<()> {
+        self.channel_manager
+            .fail_intercepted_htlc(intercept_id)
+            .map_err(|e| anyhow::anyhow!("fail_intercepted_htlc: {e:?}"))
+    }
+
+    /// Create a JIT channel to `peer` for the LSPS2 service flow.
+    /// Wraps `ChannelManager::create_channel(...)` with the LSP's
+    /// `user_channel_id`. Channel config is left as default (Phase 3
+    /// runs trusted-non-0conf channels; 0-conf is slice 3.3 work).
+    pub fn channel_manager_create_jit_channel(
+        &self,
+        peer: PublicKey,
+        channel_value_sat: u64,
+        user_channel_id: u128,
+    ) -> anyhow::Result<()> {
+        self.channel_manager
+            .create_channel(peer, channel_value_sat, 0, user_channel_id, None, None)
+            .map_err(|e| anyhow::anyhow!("create_channel: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Subscribe to newly-parked entries on this node's funding
+    /// registry. Used by the LSP admin `LspWatchPendingFunding` RPC to
+    /// stream parked funding requests to the operator's SDK for
+    /// self-custodial signing.
+    #[must_use]
+    pub fn funding_registry_subscribe(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<(
+        lightning::ln::types::ChannelId,
+        crate::funding_registry::PendingFunding,
+    )> {
+        self.funding_registry.subscribe()
+    }
+
+    /// Snapshot of currently-parked funding requests on this node. Used
+    /// by the LSP admin watch RPC to bootstrap the operator's stream
+    /// at subscribe time before live broadcast events arrive.
+    #[must_use]
+    pub fn funding_registry_snapshot(
+        &self,
+    ) -> Vec<(
+        lightning::ln::types::ChannelId,
+        crate::funding_registry::PendingFunding,
+    )> {
+        self.funding_registry.snapshot()
+    }
+
+    /// Drain the parked funding entry for `temp_id` without waiting.
+    /// Returns `None` if the entry was never parked or has already
+    /// been taken. Used by the LSP admin `LspFinalizeFunding` RPC right
+    /// before calling `funding_transaction_generated`.
+    pub fn funding_registry_try_take(
+        &self,
+        temp_id: lightning::ln::types::ChannelId,
+    ) -> Option<crate::funding_registry::PendingFunding> {
+        self.funding_registry.try_take(temp_id)
     }
 }
 
@@ -410,6 +572,133 @@ where
 
     async fn get_transactions(&self, limit: u32) -> anyhow::Result<Vec<PaymentRecord>> {
         Ok(self.payments.list(limit).await?)
+    }
+
+    async fn lsps2_get_info(&self, amount_msat: Option<u64>) -> anyhow::Result<JitQuote> {
+        const TIMEOUT: Duration = Duration::from_secs(15);
+
+        let lsp = self
+            .lsp_peer
+            .ok_or_else(|| anyhow::anyhow!("no LSP peer configured for this node"))?;
+        let client = self
+            .liquidity_manager
+            .lsps2_client_handler()
+            .ok_or_else(|| anyhow::anyhow!("LSPS2 client handler not enabled"))?;
+
+        // The token field is reserved for operator-defined coupons / API keys;
+        // we don't use it.
+        let req_id = client.request_opening_params(lsp, None);
+        let resp = self
+            .jit_registry
+            .take(req_id, TIMEOUT)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("LSPS2 get_info timed out after {TIMEOUT:?}"))?;
+
+        let menu = match resp {
+            crate::jit_registry::JitResponse::OpeningParameters {
+                opening_fee_params_menu,
+                ..
+            } => opening_fee_params_menu,
+            crate::jit_registry::JitResponse::GetInfoFailed { message, .. } => {
+                anyhow::bail!("LSPS2 get_info rejected: {message}");
+            }
+            other => anyhow::bail!("unexpected LSPS2 response shape: {other:?}"),
+        };
+
+        let chosen = pick_cheapest_fee_params(&menu, amount_msat).ok_or_else(|| {
+            anyhow::anyhow!(
+                "LSP returned no fee params matching the requested payment size {amount_msat:?}"
+            )
+        })?;
+
+        Ok(JitQuote {
+            lsp_pubkey: lsp,
+            min_fee_msat: chosen.min_fee_msat,
+            proportional_ppm: chosen.proportional,
+            min_payment_size_msat: chosen.min_payment_size_msat,
+            max_payment_size_msat: chosen.max_payment_size_msat,
+            valid_until_unix: chosen.valid_until.0.timestamp(),
+        })
+    }
+
+    async fn receive_payment_jit(
+        &self,
+        amount_msat: u64,
+        memo: &str,
+    ) -> anyhow::Result<JitInvoice> {
+        const TIMEOUT: Duration = Duration::from_secs(15);
+
+        if amount_msat == 0 {
+            anyhow::bail!("receive_payment_jit requires amount_msat > 0");
+        }
+
+        let lsp = self
+            .lsp_peer
+            .ok_or_else(|| anyhow::anyhow!("no LSP peer configured for this node"))?;
+        let client = self
+            .liquidity_manager
+            .lsps2_client_handler()
+            .ok_or_else(|| anyhow::anyhow!("LSPS2 client handler not enabled"))?;
+
+        // Step 1 — negotiate `get_info` to learn the fee menu.
+        let info_id = client.request_opening_params(lsp, None);
+        let info_resp = self
+            .jit_registry
+            .take(info_id, TIMEOUT)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("LSPS2 get_info timed out after {TIMEOUT:?}"))?;
+        let menu = match info_resp {
+            crate::jit_registry::JitResponse::OpeningParameters {
+                opening_fee_params_menu,
+                ..
+            } => opening_fee_params_menu,
+            crate::jit_registry::JitResponse::GetInfoFailed { message, .. } => {
+                anyhow::bail!("LSPS2 get_info rejected: {message}");
+            }
+            other => anyhow::bail!("unexpected get_info response: {other:?}"),
+        };
+        let chosen = pick_cheapest_fee_params(&menu, Some(amount_msat)).ok_or_else(|| {
+            anyhow::anyhow!(
+                "LSP returned no fee params matching the requested payment size {amount_msat}"
+            )
+        })?;
+        let opening_fee_msat = compute_opening_fee_msat(amount_msat, &chosen);
+
+        // Step 2 — `select_opening_params` to commit to the chosen menu
+        // entry and learn the intercept SCID.
+        let buy_id = client
+            .select_opening_params(lsp, Some(amount_msat), chosen.clone())
+            .map_err(|e| anyhow::anyhow!("LSPS2 select_opening_params: {e:?}"))?;
+        let buy_resp = self
+            .jit_registry
+            .take(buy_id, TIMEOUT)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("LSPS2 buy timed out after {TIMEOUT:?}"))?;
+        let (intercept_scid, cltv_expiry_delta) = match buy_resp {
+            crate::jit_registry::JitResponse::InvoiceParameters {
+                intercept_scid,
+                cltv_expiry_delta,
+                ..
+            } => (intercept_scid, cltv_expiry_delta),
+            crate::jit_registry::JitResponse::BuyFailed { message, .. } => {
+                anyhow::bail!("LSPS2 buy rejected: {message}");
+            }
+            other => anyhow::bail!("unexpected buy response: {other:?}"),
+        };
+
+        // Step 3 — build the BOLT11 by hand so we can inject the LSP's
+        // intercept SCID as a private route hint. ChannelManager's
+        // `create_bolt11_invoice` only emits hints for *real* channels;
+        // for JIT we don't have one yet.
+        build_jit_bolt11_invoice(
+            self,
+            lsp,
+            intercept_scid,
+            cltv_expiry_delta,
+            amount_msat,
+            memo,
+            opening_fee_msat,
+        )
     }
 
     fn node_id(&self) -> PublicKey {
@@ -559,9 +848,11 @@ where
     }
 
     async fn has_pending_htlcs(&self) -> anyhow::Result<bool> {
-        Ok(self.channel_manager.list_channels().iter().any(|c| {
-            !c.pending_outbound_htlcs.is_empty() || !c.pending_inbound_htlcs.is_empty()
-        }))
+        Ok(self
+            .channel_manager
+            .list_channels()
+            .iter()
+            .any(|c| !c.pending_outbound_htlcs.is_empty() || !c.pending_inbound_htlcs.is_empty()))
     }
 
     async fn has_inflight_outbound(&self) -> anyhow::Result<bool> {
@@ -602,4 +893,145 @@ where
             }
         }
     }
+}
+
+// ── JIT helpers ───────────────────────────────────────────────────────────────
+
+/// Pick the cheapest viable [`LSPS2OpeningFeeParams`] from the menu the
+/// LSP returned, applying the payment-size constraint when known.
+fn pick_cheapest_fee_params(
+    menu: &[lightning_liquidity::lsps2::msgs::LSPS2OpeningFeeParams],
+    amount_msat: Option<u64>,
+) -> Option<lightning_liquidity::lsps2::msgs::LSPS2OpeningFeeParams> {
+    menu.iter()
+        .filter(|p| match amount_msat {
+            Some(a) => a >= p.min_payment_size_msat && a <= p.max_payment_size_msat,
+            None => true,
+        })
+        .min_by_key(|p| p.min_fee_msat)
+        .cloned()
+}
+
+/// Compute the JIT opening fee per LSPS2 §"client agrees to paying":
+/// `max(min_fee_msat, proportional * (payment_size_msat / 1_000_000))`.
+fn compute_opening_fee_msat(
+    payment_size_msat: u64,
+    params: &lightning_liquidity::lsps2::msgs::LSPS2OpeningFeeParams,
+) -> u64 {
+    let proportional =
+        (u128::from(params.proportional) * u128::from(payment_size_msat)) / 1_000_000u128;
+    let proportional = u64::try_from(proportional).unwrap_or(u64::MAX);
+    proportional.max(params.min_fee_msat)
+}
+
+/// Build + sign a JIT-enabled BOLT11 invoice with a private route hint
+/// pointing at the LSP's intercept SCID.
+///
+/// Mirrors `ChannelManager::create_bolt11_invoice` (channelmanager.rs
+/// L12543) but replaces auto-discovered channel hints with our single
+/// LSP intercept hint — we have no real channel yet at invoice time.
+fn build_jit_bolt11_invoice<S>(
+    node: &Node<S>,
+    lsp_pubkey: PublicKey,
+    intercept_scid: u64,
+    cltv_expiry_delta: u32,
+    amount_msat: u64,
+    memo: &str,
+    opening_fee_msat: u64,
+) -> anyhow::Result<JitInvoice>
+where
+    S: WickSigner,
+    <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
+{
+    use bitcoin::hashes::sha256::Hash as Sha256Hash;
+    use bitcoin::hashes::Hash;
+    use lightning::ln::msgs::ChannelMessageHandler;
+    use lightning::routing::gossip::RoutingFees;
+    use lightning::routing::router::{RouteHint, RouteHintHop};
+    use lightning::sign::{NodeSigner, Recipient};
+    use lightning_invoice::{Bolt11Invoice, Currency, InvoiceBuilder};
+
+    // The receiver never pays the LSP a forwarding fee on a JIT hop —
+    // the opening_fee is deducted from the payment_size directly. Use
+    // (0, 0) to keep the route-hint hop fee-free. `htlc_maximum_msat`
+    // is `None` so MPP routing is not artificially capped; the LSP's
+    // own size bounds (in `LSPS2OpeningFeeParams`) gate validity.
+    let route_hint = RouteHint(vec![RouteHintHop {
+        src_node_id: lsp_pubkey,
+        short_channel_id: intercept_scid,
+        fees: RoutingFees {
+            base_msat: 0,
+            proportional_millionths: 0,
+        },
+        cltv_expiry_delta: u16::try_from(cltv_expiry_delta).unwrap_or(u16::MAX),
+        htlc_minimum_msat: None,
+        htlc_maximum_msat: None,
+    }]);
+
+    // LSPS2 requires `min_final_cltv_expiry_delta` to be at least
+    // 2 more than the LDK default — the LSP needs that headroom to
+    // open the channel and forward the HTLC before the final hop's
+    // CLTV elapses. See ldk-node `liquidity.rs::lsps2_create_jit_invoice`.
+    let min_final_cltv = lightning::ln::channelmanager::MIN_FINAL_CLTV_EXPIRY_DELTA + 2;
+
+    let (payment_hash, payment_secret) = node
+        .channel_manager
+        .create_inbound_payment(Some(amount_msat), 3600, Some(min_final_cltv))
+        .map_err(|()| anyhow::anyhow!("create_inbound_payment failed (invalid amount?)"))?;
+
+    // `get_chain_hashes` returns Option<Vec<ChainHash>>: None for nodes
+    // built without `ChainParameters` (LDK has no opinion); Some when
+    // configured. Wick always builds with chain params, so unwrap is
+    // safe. We use the first hash for currency selection.
+    let chain_hash = node
+        .channel_manager
+        .get_chain_hashes()
+        .and_then(|v| v.into_iter().next())
+        .ok_or_else(|| anyhow::anyhow!("ChannelManager has no chain hash"))?;
+    let network = if chain_hash == bitcoin::Network::Bitcoin.chain_hash() {
+        Currency::Bitcoin
+    } else if chain_hash == bitcoin::Network::Testnet.chain_hash() {
+        Currency::BitcoinTestnet
+    } else if chain_hash == bitcoin::Network::Signet.chain_hash() {
+        Currency::Signet
+    } else if chain_hash == bitcoin::Network::Regtest.chain_hash() {
+        Currency::Regtest
+    } else {
+        Currency::Bitcoin
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("system time before epoch: {e}"))?;
+
+    let raw = InvoiceBuilder::new(network)
+        .description(memo.to_owned())
+        .duration_since_epoch(now)
+        .payee_pub_key(node.channel_manager.get_our_node_id())
+        .payment_hash(Sha256Hash::from_slice(&payment_hash.0).unwrap())
+        .payment_secret(payment_secret)
+        .basic_mpp()
+        .min_final_cltv_expiry_delta(u64::from(min_final_cltv))
+        .expiry_time(Duration::from_secs(3600))
+        .amount_milli_satoshis(amount_msat)
+        .private_route(route_hint)
+        .build_raw()
+        .map_err(|e| anyhow::anyhow!("InvoiceBuilder::build_raw: {e:?}"))?;
+
+    let signer = node.signer.clone();
+    let signature = NodeSigner::sign_invoice(signer.as_ref(), &raw, Recipient::Node)
+        .map_err(|()| anyhow::anyhow!("NodeSigner::sign_invoice failed"))?;
+
+    let signed = raw
+        .sign::<_, ()>(|_| Ok(signature))
+        .map_err(|e| anyhow::anyhow!("raw_invoice.sign: {e:?}"))?;
+    let invoice = Bolt11Invoice::from_signed(signed)
+        .map_err(|e| anyhow::anyhow!("Bolt11Invoice::from_signed: {e:?}"))?;
+
+    Ok(JitInvoice {
+        bolt11: invoice.to_string(),
+        payment_hash: payment_hash.0,
+        jit_fee_msat_quote: opening_fee_msat,
+        lsp_pubkey,
+    })
 }
