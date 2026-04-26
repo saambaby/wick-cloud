@@ -29,11 +29,14 @@ use wick_lightning::{
 use wick_lsp::{ LspBuilder, LspDaemon, LspPartialConfig, OpeningParamsView };
 use wick_lsp::daemon::GriefConfig;
 use wick_proto::wick::admin_service_server::AdminServiceServer;
+use wick_proto::wick::signer_service_server::SignerServiceServer;
+use wick_vls::SignerSessionRegistry;
 use wick_server::{
     factory,
     grpc::{ LspInfo, WickAdminGrpcService, WickGrpcService },
     lsp_bridge::ManagerLspBridge,
     node::manager::{ ManagerConfig, NodeManager },
+    signer_service::WickSignerGrpcService,
 };
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -370,7 +373,18 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
-    let server = Server::builder().add_service(WalletServiceServer::new(grpc_service));
+    // Phase-4 remote-signer registry. Shared between (a) the per-tenant
+    // node factory (so each Node holds a `wick_vls::SignerSession` that
+    // resolves the live SDK connection on every signer call) and (b) the
+    // gRPC `SignerService.Attach` handler (which installs the SDK side of
+    // the bidi stream on connect). Most-recent-wins on reconnect is
+    // implemented inside `SignerSessionRegistry::register`.
+    let signer_registry = Arc::new(SignerSessionRegistry::new());
+    let signer_service = WickSignerGrpcService::new(pool.raw().clone(), signer_registry.clone());
+
+    let server = Server::builder()
+        .add_service(WalletServiceServer::new(grpc_service))
+        .add_service(SignerServiceServer::new(signer_service));
     let server = if let Some(svc) = admin_service {
         server.add_service(AdminServiceServer::new(svc))
     } else {

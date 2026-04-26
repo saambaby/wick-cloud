@@ -4514,6 +4514,7 @@ dependencies = [
  "async-trait",
  "bitcoin",
  "dashmap",
+ "futures",
  "hex",
  "hmac",
  "lightning 0.2.2",
@@ -4536,6 +4537,7 @@ dependencies = [
  "wick-lightning",
  "wick-lsp",
  "wick-proto",
+ "wick-vls",
 ]
 
 [[package]]

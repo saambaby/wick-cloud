@@ -423,3 +423,42 @@ message LspFinalizeFundingRequest {
 }
 
 message LspFinalizeFundingResponse {}
+
+// SignerService — Phase 4 remote signer.
+//
+// Tenant Lightning keys live exclusively in the SDK. The server's
+// `wick-vls::SignerSession` services every LDK signer-trait call by
+// dispatching a VLS-protocol frame down this bidi stream and awaiting
+// the SDK's reply. Most-recent-wins on reconnect: a fresh `Attach`
+// closes any prior session for the same tenant and fails its
+// in-flight calls.
+//
+// Auth: the standard tenant `Authorization: Bearer <token>` header.
+// The server resolves the bearer token to a `TenantId` and uses that
+// as the `context_id` in the registry.
+service SignerService {
+  rpc Attach(stream SignerInbound) returns (stream SignerOutbound);
+}
+
+// Server → SDK frame. `oneof` envelope so future control frames
+// (state-sync watermarks, keepalive) can land without breaking wire
+// format. Today only `vls_call` is populated.
+message SignerOutbound {
+  oneof kind {
+    // Wire-encoded VLS frame produced by `SignerConnection::dispatch_*_call`:
+    //   node:    `[4B req_id BE][0x01][3B reserved][vls_bytes]`
+    //   channel: `[4B req_id BE][0x02][3B reserved][8B dbid BE][33B peer_id][vls_bytes]`
+    // `vls_bytes = [u16 type BE][data]` — `vls_protocol::msgs::SerBolt::as_vec`.
+    bytes vls_call = 1;
+  }
+}
+
+// SDK → server frame. Today only `vls_response` is populated.
+message SignerInbound {
+  oneof kind {
+    // Wire-encoded VLS reply: `[4B req_id BE][1B status][body]` — `status=0x00`
+    // means success and `body` is the VLS reply bytes; otherwise `body` is a
+    // UTF-8 error string. Routed through `SignerConnection::resolve_response`.
+    bytes vls_response = 1;
+  }
+}

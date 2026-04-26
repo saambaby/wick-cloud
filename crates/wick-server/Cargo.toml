@@ -25,6 +25,8 @@ wick-db        = { workspace = true }
 wick-proto     = { workspace = true }
 wick-lightning = { workspace = true }
 wick-lsp       = { workspace = true }
+wick-vls       = { workspace = true }
+futures        = { workspace = true }
 
 tokio      = { workspace = true }
 tracing    = { workspace = true }
