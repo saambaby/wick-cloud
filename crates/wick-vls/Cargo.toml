@@ -6,12 +6,43 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Validating Lightning Signer — on-device policy engine. Phase 4."
+description = "VLS-protocol remote signer adapter — implements LDK 0.2 signer traits over a tonic bidi stream so tenant Lightning keys live exclusively in the SDK."
 
 [lints]
 workspace = true
 
 [dependencies]
+# Internal
 wick-core = { workspace = true }
-zeroize = { workspace = true }
+
+# Async / runtime
+tokio        = { workspace = true }
+async-trait  = { workspace = true }
+futures      = { workspace = true }
+
+# Errors / logging
+anyhow    = { workspace = true }
 thiserror = { workspace = true }
+tracing   = { workspace = true }
+
+# Concurrency primitives
+dashmap     = { workspace = true }
+parking_lot = { workspace = true }
+
+# Serde
+serde = { workspace = true }
+
+# Crypto
+zeroize   = { workspace = true }
+secp256k1 = { workspace = true }
+hex       = { workspace = true }
+
+# LDK 0.2 — required for the WickSigner trait impls
+lightning = { workspace = true }
+bitcoin   = { workspace = true }
+
+# VLS wire protocol — codec only (LDK-version-agnostic).
+# DO NOT add vls-core or vls-protocol-client here: they pin lightning 0.1.x
+# which conflicts with the lightning 0.2.2 train this crate compiles against.
+vls-protocol = "0.14.0"
+serde_bolt   = "0.5.1"
