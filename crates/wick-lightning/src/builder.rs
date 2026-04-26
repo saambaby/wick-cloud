@@ -252,6 +252,27 @@ where
         // default (auto-accept) — they accept normal Bob → LSP / peer →
         // tenant channels via LDK's built-in path.
         let mut user_config = UserConfig::default();
+        // Phase-4 zero-counterparty-reserve policy. Required for VLS's
+        // `SimpleValidator` to accept the initial counterparty
+        // commitment — its `to_remote ≤ push_value_msat` check rejects
+        // any non-zero counterparty reserve. Documented trade-off: the
+        // counterparty can spend their side down to zero; force-close /
+        // justice paths unaffected.
+        //
+        // - `their_channel_reserve_proportional_millionths = 0`: when WE
+        //   open, ask the counterparty for zero reserve.
+        // - `max_channel_reserve_satoshis = u64::MAX`: when counterparty
+        //   opens to us, accept whatever reserve LDK negotiates. LDK
+        //   enforces an internal floor (~1000 sats, derived from
+        //   dust_limit + commitment headroom) so even a counterparty that
+        //   sets proportional=0 will still propose a small absolute reserve
+        //   — refuse-on-zero is too strict in practice.
+        user_config
+            .channel_handshake_config
+            .their_channel_reserve_proportional_millionths = 0;
+        user_config
+            .channel_handshake_limits
+            .max_channel_reserve_satoshis = u64::MAX;
         if lsp_peer.is_some() {
             user_config.manually_accept_inbound_channels = true;
         }

@@ -13,7 +13,8 @@ workspace = true
 
 [dependencies]
 # Internal
-wick-core = { workspace = true }
+wick-core      = { workspace = true }
+wick-lightning = { workspace = true }
 
 # Async / runtime
 tokio        = { workspace = true }

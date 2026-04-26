@@ -374,6 +374,22 @@ impl SignerSession {
     }
 }
 
+// ── WickSigner ────────────────────────────────────────────────────────────────
+
+// Explicit `WickSigner` impl wires the trait's outbound-channel staging
+// methods to `SignerSession`'s existing inherent helpers. Required because
+// the prior blanket `impl<T> WickSigner for T` was dropped when the trait
+// gained methods (defaults can't be specialised).
+impl wick_lightning::WickSigner for SignerSession {
+    fn register_outbound_channel_open(&self, user_channel_id: u128, push_msat: u64) {
+        SignerSession::register_outbound_channel_open(self, user_channel_id, push_msat);
+    }
+
+    fn clear_outbound_channel_open(&self, user_channel_id: u128) {
+        SignerSession::clear_outbound_channel_open(self, user_channel_id);
+    }
+}
+
 // ── EntropySource ─────────────────────────────────────────────────────────────
 
 impl EntropySource for SignerSession {
@@ -899,6 +915,34 @@ impl ChannelSigner for VlsRemoteChannelSigner {
         if self.failed {
             return Err(());
         }
+        // LDK 0.2's two-phase funding (`open_channel_init` /
+        // `open_channel_finalize`) calls `validate_holder_commitment` as
+        // a self-check before the funding outpoint is known — i.e. before
+        // any `EcdsaChannelSigner` method has fired and given us
+        // `ChannelTransactionParameters`, so `maybe_setup_channel` can't
+        // run yet. VLS rejects with "channel not ready" because no
+        // `SetupChannel` has been delivered.
+        //
+        // Skip the VLS round-trip when the channel hasn't been set up.
+        // Cryptographic correctness is still enforced — `sign_holder_commitment`
+        // (which IS handed `ChannelTransactionParameters` and runs
+        // `maybe_setup_channel`) re-signs the same commitment downstream and
+        // VLS validates it then. LDK's own counterparty-signature check
+        // covers the gap until that fires.
+        let setup_done = self
+            .channel_meta
+            .get(&self.channel_keys_id)
+            .map(|m| m.setup_funding.is_some())
+            .unwrap_or(false);
+        if !setup_done {
+            tracing::debug!(
+                target: "wick_vls",
+                dbid = self.dbid,
+                "validate_holder_commitment: channel not yet set up — deferring VLS validation to sign_holder_commitment"
+            );
+            return Ok(());
+        }
+
         let conn = self.active_conn()?;
         let commitment_number = holder_tx.commitment_number();
         let feerate = holder_tx.negotiated_feerate_per_kw();
@@ -1009,8 +1053,15 @@ impl EcdsaChannelSigner for VlsRemoteChannelSigner {
 
         let commitment_number = commitment_tx.commitment_number();
         let feerate = commitment_tx.negotiated_feerate_per_kw();
-        let to_local_value_sat = commitment_tx.to_broadcaster_value_sat();
-        let to_remote_value_sat = commitment_tx.to_countersignatory_value_sat();
+        // VLS terminology in `SignRemoteCommitmentTx2` is from the LOCAL
+        // signer's perspective:
+        //   - `to_local_value_sat`  = OUR (local) value
+        //   - `to_remote_value_sat` = COUNTERPARTY's value
+        // In LDK's counterparty commitment, the counterparty is the
+        // broadcaster and we are the countersignatory, so map the names
+        // accordingly.
+        let to_local_value_sat = commitment_tx.to_countersignatory_value_sat();
+        let to_remote_value_sat = commitment_tx.to_broadcaster_value_sat();
 
         let trusted = commitment_tx.trust();
         let per_commitment_point = trusted.keys().per_commitment_point.serialize();

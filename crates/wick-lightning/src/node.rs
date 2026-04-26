@@ -39,6 +39,7 @@ use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeePa
 use lightning::routing::utxo::UtxoLookup;
 use lightning::sign::SignerProvider;
 use lightning::util::async_poll::{MaybeSend, MaybeSync};
+use lightning::util::config::UserConfig;
 use lightning::util::persist::KVStoreSyncWrapper;
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
 use lightning_liquidity::utils::time::DefaultTimeProvider;
@@ -393,9 +394,27 @@ where
         channel_value_sat: u64,
         user_channel_id: u128,
     ) -> anyhow::Result<()> {
-        self.channel_manager
-            .create_channel(peer, channel_value_sat, 0, user_channel_id, None, None)
-            .map_err(|e| anyhow::anyhow!("create_channel: {e:?}"))?;
+        // Stage `push_msat = 0` on the signer so VLS-backed signers see
+        // the right `SetupChannel.push_value` when LDK calls
+        // `generate_channel_keys_id(inbound=false, user_channel_id)`.
+        // No-op for `KeysManager`-backed signers.
+        self.signer
+            .register_outbound_channel_open(user_channel_id, 0);
+        let result = self
+            .channel_manager
+            .create_channel(
+                peer,
+                channel_value_sat,
+                0,
+                user_channel_id,
+                None,
+                Some(zero_counterparty_reserve_user_config()),
+            )
+            .map_err(|e| anyhow::anyhow!("create_channel: {e:?}"));
+        if result.is_err() {
+            self.signer.clear_outbound_channel_open(user_channel_id);
+        }
+        result?;
         Ok(())
     }
 
@@ -761,9 +780,26 @@ where
         if !self.is_running() {
             anyhow::bail!("node is not running");
         }
-        self.channel_manager
-            .create_channel(peer_id, channel_value_sat, push_msat, 0, None, None)
-            .map_err(|e| anyhow::anyhow!("create_channel: {e:?}"))?;
+        // Stage `push_msat` on the signer (no-op for `KeysManager`,
+        // real for `SignerSession` — feeds VLS's `SetupChannel.push_value`).
+        let user_channel_id: u128 = rand::random();
+        self.signer
+            .register_outbound_channel_open(user_channel_id, push_msat);
+        let result = self
+            .channel_manager
+            .create_channel(
+                peer_id,
+                channel_value_sat,
+                push_msat,
+                user_channel_id,
+                None,
+                Some(zero_counterparty_reserve_user_config()),
+            )
+            .map_err(|e| anyhow::anyhow!("create_channel: {e:?}"));
+        if result.is_err() {
+            self.signer.clear_outbound_channel_open(user_channel_id);
+        }
+        result?;
         Ok(())
     }
 
@@ -778,26 +814,44 @@ where
             anyhow::bail!("node is not running");
         }
 
+        // Stage `push_msat` against a fresh `user_channel_id` so VLS-backed
+        // signers populate `SetupChannel.push_value` correctly. The same id
+        // is passed to `create_channel` so LDK's `generate_channel_keys_id`
+        // call (which drains the staging) sees a matching key.
+        let user_channel_id: u128 = rand::random();
+        self.signer
+            .register_outbound_channel_open(user_channel_id, push_msat);
+
         // `create_channel` returns the temporary_channel_id LDK will use in
         // the later FundingGenerationReady event, so we know which key to
         // poll for in the registry.
-        let temp_id = self
-            .channel_manager
-            .create_channel(peer_id, channel_value_sat, push_msat, 0, None, None)
-            .map_err(|e| anyhow::anyhow!("create_channel: {e:?}"))?;
+        let temp_id = match self.channel_manager.create_channel(
+            peer_id,
+            channel_value_sat,
+            push_msat,
+            user_channel_id,
+            None,
+            Some(zero_counterparty_reserve_user_config()),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                self.signer.clear_outbound_channel_open(user_channel_id);
+                anyhow::bail!("create_channel: {e:?}");
+            }
+        };
 
         // FundingGenerationReady fires asynchronously after the peer accepts
         // the open_channel message. `take` polls the registry (which the
         // event handler writes into) up to `timeout`.
-        let pending = self
-            .funding_registry
-            .take(temp_id, timeout)
-            .await
-            .ok_or_else(|| {
-                anyhow::anyhow!(
+        let pending = match self.funding_registry.take(temp_id, timeout).await {
+            Some(p) => p,
+            None => {
+                self.signer.clear_outbound_channel_open(user_channel_id);
+                anyhow::bail!(
                     "timed out waiting for FundingGenerationReady for temp_id {temp_id:?}"
-                )
-            })?;
+                );
+            }
+        };
         Ok((temp_id, pending))
     }
 
@@ -1034,4 +1088,27 @@ where
         jit_fee_msat_quote: opening_fee_msat,
         lsp_pubkey,
     })
+}
+
+/// Per-channel `UserConfig` override used on every wick-initiated
+/// `ChannelManager::create_channel` call.
+///
+/// Forces `their_channel_reserve_proportional_millionths = 0` so the
+/// counterparty has no reserve carved out of the initial commitment. This
+/// is what allows VLS's `SimpleValidator` to accept the funder's first
+/// `sign_counterparty_commitment` — that policy enforces
+/// `to_remote ≤ push_value_msat` on the initial commitment, and any
+/// non-zero counterparty reserve appears as `to_remote > 0` even when
+/// `push_msat = 0`.
+///
+/// Trade-off: the counterparty can spend a wick channel down to zero on
+/// their side; the standard "reserve = small economic disincentive" stops
+/// applying. Justice transactions and the broader force-close path are
+/// unaffected. Self-custodial validation by VLS is more important here
+/// than the ~1% economic cushion.
+fn zero_counterparty_reserve_user_config() -> UserConfig {
+    let mut cfg = UserConfig::default();
+    cfg.channel_handshake_config
+        .their_channel_reserve_proportional_millionths = 0;
+    cfg
 }

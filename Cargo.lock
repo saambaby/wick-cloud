@@ -4586,6 +4586,7 @@ dependencies = [
  "tracing",
  "vls-protocol",
  "wick-core",
+ "wick-lightning",
  "zeroize",
 ]
 
