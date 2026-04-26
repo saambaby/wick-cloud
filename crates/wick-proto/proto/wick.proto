@@ -46,6 +46,21 @@ service WalletService {
 
   // ListChannels returns a snapshot of the tenant's current channels.
   rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
+
+  // GetLspInfo returns the operator-mode LSP's pubkey + listen address
+  // so SDK clients can connect their tenant Node directly. Server-mode
+  // deployments without an LSP enabled return an empty pubkey.
+  rpc GetLspInfo(GetLspInfoRequest) returns (GetLspInfoResponse);
+
+  // Lsps2GetInfo negotiates the LSPS2 `lsps2.get_info` flow with the
+  // configured LSP and returns a fee quote. Use this to display a fee
+  // preview before issuing a JIT-enabled invoice.
+  rpc Lsps2GetInfo(Lsps2GetInfoRequest) returns (Lsps2GetInfoResponse);
+
+  // GetJitInvoice issues a JIT-enabled BOLT11 invoice end-to-end.
+  // Internally negotiates `lsps2.get_info` + `lsps2.buy` then embeds
+  // the LSP's intercept SCID as a private route hint in the invoice.
+  rpc GetJitInvoice(GetJitInvoiceRequest) returns (GetJitInvoiceResponse);
 }
 
 // ── CreateTenant ─────────────────────────────────────────────────────────────
@@ -271,3 +286,140 @@ message ChannelSummary {
   // `true` once the channel is funded, confirmed, and ready for payments.
   bool is_usable = 6;
 }
+
+// ── LSP / LSPS2 (Phase 3) ─────────────────────────────────────────────────────
+
+message GetLspInfoRequest {}
+
+message GetLspInfoResponse {
+  // 33-byte compressed SEC1 pubkey of the in-process LSP, hex-encoded.
+  // Empty string if no LSP is enabled on this server.
+  string lsp_pubkey_hex = 1;
+
+  // LSP listen host:port pair (e.g. "0.0.0.0:19836"). Empty when LSP is disabled.
+  string lsp_address = 2;
+
+  // `true` when the LSP daemon is enabled, has a fresh upstream peer
+  // connection, and has at least `min_jit_payment_size_msat` worth of
+  // routing liquidity.
+  bool ready = 3;
+}
+
+message Lsps2GetInfoRequest {
+  // Requested payment size in msat. Optional — leave unset to fetch
+  // the LSP's full menu without size filtering.
+  optional uint64 amount_msat = 1;
+}
+
+message Lsps2GetInfoResponse {
+  // 33-byte LSP pubkey hex.
+  string lsp_pubkey_hex = 1;
+  // Floor opening fee charged on the JIT channel.
+  uint64 min_fee_msat = 2;
+  // Proportional fee (parts-per-million of payment size).
+  uint32 proportional_ppm = 3;
+  // Minimum payment size the LSP will accept (msat).
+  uint64 min_payment_size_msat = 4;
+  // Maximum payment size the LSP will accept (msat).
+  uint64 max_payment_size_msat = 5;
+  // Quote expiry as Unix seconds.
+  int64 valid_until_unix = 6;
+}
+
+message GetJitInvoiceRequest {
+  // Required. LSPS2 buy needs a payment size to quote the opening fee.
+  uint64 amount_msat = 1;
+  // Human-readable invoice description.
+  string memo = 2;
+}
+
+message GetJitInvoiceResponse {
+  // BOLT11 invoice with the LSP intercept SCID embedded as a private
+  // route hint.
+  string bolt11 = 1;
+
+  // 32-byte payment hash from the BOLT11.
+  bytes payment_hash = 2;
+
+  // Quoted opening fee (msat) the LSP will deduct from the first
+  // inbound payment routed against the intercept SCID. Surface in the
+  // UI so the user knows the net amount they'll receive.
+  uint64 jit_fee_msat_quote = 3;
+
+  // 33-byte LSP pubkey hex (for display / verification).
+  string lsp_pubkey_hex = 4;
+}
+
+// ── AdminService (slice 3.3a) ─────────────────────────────────────────────────
+//
+// Operator-scoped RPCs distinct from the tenant `WalletService`. Used
+// by the operator's SDK to install the LSP's Lightning identity at
+// runtime (no server-resident seed) and to drive the self-custodial
+// JIT channel-funding flow:
+//
+//   1. RegisterLspIdentity(seed)       — server builds the LSP daemon.
+//   2. LspWatchPendingFunding (stream) — server yields parked
+//                                        FundingGenerationReady events.
+//   3. LspFinalizeFunding(temp_id, tx) — operator signed the funding tx
+//                                        from its own BDK wallet; server
+//                                        hands it to LDK.
+//
+// Auth: gated by an `x-wick-admin-secret` metadata header validated
+// against the server's `WICK_ADMIN_SECRET` env var. Plain gRPC
+// metadata for slice 3.3a; macaroon scope plumbing arrives in 3.3c.
+service AdminService {
+  // Install the LSP's Lightning identity from the operator's SDK.
+  // The 32-byte seed is consumed in-memory only — never persisted on
+  // the server. Idempotent on the same seed (re-registration with the
+  // matching pubkey is a no-op); errors on a different seed.
+  rpc RegisterLspIdentity(RegisterLspIdentityRequest) returns (RegisterLspIdentityResponse);
+
+  // Stream parked FundingGenerationReady events the operator's SDK
+  // must sign for. The stream first replays any currently-parked
+  // entries, then yields newly-parked entries as the LSP creates JIT
+  // channels.
+  rpc LspWatchPendingFunding(LspWatchPendingFundingRequest) returns (stream LspPendingFunding);
+
+  // Finalize a parked funding entry by handing the server a fully-
+  // signed bitcoin::Transaction. Drains the entry from the funding
+  // registry and calls ChannelManager::funding_transaction_generated.
+  rpc LspFinalizeFunding(LspFinalizeFundingRequest) returns (LspFinalizeFundingResponse);
+}
+
+message RegisterLspIdentityRequest {
+  // 32-byte LSP Lightning seed. Same shape as today's LocalKeysManager
+  // input. Phase 4 swaps this for a remote-signer URL + attestation.
+  bytes lightning_seed = 1;
+}
+
+message RegisterLspIdentityResponse {
+  // 33-byte compressed SEC1 pubkey hex of the registered LSP.
+  string lsp_pubkey_hex = 1;
+  // Always true on success — the slot is occupied.
+  bool ready = 2;
+}
+
+message LspWatchPendingFundingRequest {}
+
+message LspPendingFunding {
+  // 32-byte temporary_channel_id LDK assigned to this open.
+  bytes temp_channel_id = 1;
+  // 33-byte compressed SEC1 counterparty pubkey hex.
+  string counterparty_pubkey_hex = 2;
+  // Channel capacity in satoshis — exact amount the funding tx must pay.
+  uint64 value_sat = 3;
+  // Hex-encoded raw 2-of-2 multisig scriptPubKey LDK wants to fund.
+  string output_script_hex = 4;
+}
+
+message LspFinalizeFundingRequest {
+  // 32-byte temp_channel_id from the watch stream.
+  bytes temp_channel_id = 1;
+  // 33-byte compressed SEC1 counterparty pubkey hex.
+  string counterparty_pubkey_hex = 2;
+  // Hex-encoded serialised bitcoin::Transaction paying `value_sat` to
+  // the `output_script_hex` from the watch event.
+  string funding_tx_hex = 3;
+}
+
+message LspFinalizeFundingResponse {}
