@@ -28,15 +28,10 @@ pub struct PendingEventStore;
 impl PendingEventStore {
     /// Enqueue one event payload for `tenant_id`. Returns the serial id
     /// Postgres assigned so callers can correlate it back to [`Self::ack`].
-    pub async fn push(
-        pool: &Pool,
-        tenant_id: TenantId,
-        payload: &[u8],
-    ) -> anyhow::Result<i64> {
+    pub async fn push(pool: &Pool, tenant_id: TenantId, payload: &[u8]) -> anyhow::Result<i64> {
         let schema = tenant_id.schema_name();
-        let sql = format!(
-            r#"INSERT INTO "{schema}".pending_events (payload) VALUES ($1) RETURNING id"#
-        );
+        let sql =
+            format!(r#"INSERT INTO "{schema}".pending_events (payload) VALUES ($1) RETURNING id"#);
         let id: (i64,) = sqlx::query_as(&sql)
             .bind(payload)
             .fetch_one(pool.raw())
@@ -68,18 +63,12 @@ impl PendingEventStore {
 
     /// Delete the given event ids after the active actor has received
     /// them. Idempotent — acking an id that's already gone is a no-op.
-    pub async fn ack(
-        pool: &Pool,
-        tenant_id: TenantId,
-        ids: &[i64],
-    ) -> anyhow::Result<()> {
+    pub async fn ack(pool: &Pool, tenant_id: TenantId, ids: &[i64]) -> anyhow::Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
         let schema = tenant_id.schema_name();
-        let sql = format!(
-            r#"DELETE FROM "{schema}".pending_events WHERE id = ANY($1)"#
-        );
+        let sql = format!(r#"DELETE FROM "{schema}".pending_events WHERE id = ANY($1)"#);
         sqlx::query(&sql)
             .bind(ids)
             .execute(pool.raw())
@@ -94,9 +83,7 @@ impl PendingEventStore {
     /// events stay unprocessed longer than necessary).
     pub async fn len(pool: &Pool, tenant_id: TenantId) -> anyhow::Result<i64> {
         let schema = tenant_id.schema_name();
-        let sql = format!(
-            r#"SELECT COUNT(*)::bigint FROM "{schema}".pending_events"#
-        );
+        let sql = format!(r#"SELECT COUNT(*)::bigint FROM "{schema}".pending_events"#);
         let (n,): (i64,) = sqlx::query_as(&sql)
             .fetch_one(pool.raw())
             .await

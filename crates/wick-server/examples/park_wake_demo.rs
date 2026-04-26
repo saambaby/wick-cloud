@@ -13,8 +13,8 @@
 //! Run via `just park-wake-demo` or
 //! `cargo run --release --example park_wake_demo -p wick-server`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bitcoin::secp256k1::PublicKey;
@@ -161,11 +161,7 @@ impl NodeApi for StubNode {
     async fn send_payment(&self, _: &str) -> anyhow::Result<PaymentResult> {
         unimplemented!("stub")
     }
-    async fn receive_payment(
-        &self,
-        _: Option<u64>,
-        _: &str,
-    ) -> anyhow::Result<(String, Vec<u8>)> {
+    async fn receive_payment(&self, _: Option<u64>, _: &str) -> anyhow::Result<(String, Vec<u8>)> {
         unimplemented!("stub")
     }
     async fn get_transactions(&self, _: u32) -> anyhow::Result<Vec<PaymentRecord>> {
@@ -204,6 +200,16 @@ impl NodeApi for StubNode {
         unimplemented!("stub")
     }
     async fn list_channels(&self) -> anyhow::Result<Vec<ChannelSummary>> {
+        unimplemented!("stub")
+    }
+    async fn lsps2_get_info(&self, _: Option<u64>) -> anyhow::Result<wick_lightning::JitQuote> {
+        unimplemented!("stub")
+    }
+    async fn receive_payment_jit(
+        &self,
+        _: u64,
+        _: &str,
+    ) -> anyhow::Result<wick_lightning::JitInvoice> {
         unimplemented!("stub")
     }
     async fn has_pending_htlcs(&self) -> anyhow::Result<bool> {

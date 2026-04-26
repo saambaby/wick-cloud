@@ -14,11 +14,11 @@
 //!    them would lose user funds.
 
 use std::sync::Arc;
-use std::time::{ Duration, Instant };
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use tokio::sync::{ OwnedSemaphorePermit, Semaphore };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use wick_core::TenantId;
 
 /// Priority of a wake request.
@@ -123,10 +123,11 @@ impl WakeAdmission {
     pub async fn acquire(
         &self,
         tenant_id: TenantId,
-        priority: WakePriority
+        priority: WakePriority,
     ) -> Result<WakePermit, WakeAdmissionError> {
         if priority == WakePriority::User {
-            let bucket = self.buckets
+            let bucket = self
+                .buckets
                 .entry(tenant_id)
                 .or_insert_with(|| Mutex::new(TokenBucket::new()));
             let mut guard = bucket.lock();
@@ -135,9 +136,11 @@ impl WakeAdmission {
                 .map_err(|retry_after_secs| WakeAdmissionError::RateLimited { retry_after_secs })?;
         }
 
-        let global = self.global
+        let global = self
+            .global
             .clone()
-            .acquire_owned().await
+            .acquire_owned()
+            .await
             .map_err(|_| WakeAdmissionError::SemaphoreClosed)?;
         Ok(WakePermit { _global: global })
     }
@@ -163,7 +166,8 @@ mod tests {
         // 10 Payment wakes in a row — none rate-limited.
         for _ in 0..10 {
             let _p = adm
-                .acquire(tid, WakePriority::Payment).await
+                .acquire(tid, WakePriority::Payment)
+                .await
                 .expect("payment must not be rate-limited");
         }
     }
@@ -177,7 +181,10 @@ mod tests {
             let _p = adm.acquire(tid, WakePriority::User).await.expect("ok");
         }
         // 4th — rate limited.
-        let err = adm.acquire(tid, WakePriority::User).await.expect_err("4th must be rate-limited");
+        let err = adm
+            .acquire(tid, WakePriority::User)
+            .await
+            .expect_err("4th must be rate-limited");
         assert!(matches!(err, WakeAdmissionError::RateLimited { .. }));
     }
 
@@ -209,7 +216,9 @@ mod tests {
             let _p = adm2.acquire(tid, WakePriority::Payment).await.unwrap();
         });
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), third).await.is_err(),
+            tokio::time::timeout(Duration::from_millis(50), third)
+                .await
+                .is_err(),
             "third acquire must block until a permit is returned"
         );
     }

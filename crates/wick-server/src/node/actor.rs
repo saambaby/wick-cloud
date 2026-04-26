@@ -23,16 +23,19 @@
 //! `NodeInner` via `ArcSwap`, but never writes the state atom directly.
 
 use std::fmt;
-use std::sync::{ atomic::{ AtomicU64, Ordering }, Arc, RwLock };
-use std::time::{ SystemTime, UNIX_EPOCH };
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, RwLock,
+};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use tokio::sync::{ mpsc, Notify };
-use tracing::{ debug, info, warn };
+use tokio::sync::{mpsc, Notify};
+use tracing::{debug, info, warn};
 use wick_core::TenantId;
 use wick_lightning::NodeApi;
 
-use crate::node::{ state, NodeCmd, NodeHandle, NodeInner, ParkOutcome, NODE_CMD_CAPACITY };
+use crate::node::{state, NodeCmd, NodeHandle, NodeInner, ParkOutcome, NODE_CMD_CAPACITY};
 
 // ── Actor ─────────────────────────────────────────────────────────────────────
 
@@ -75,12 +78,10 @@ impl NodeActor {
         let state_atom = Arc::new(std::sync::atomic::AtomicU8::new(state::PARKED));
         let last_active = Arc::new(AtomicU64::new(0));
         let wake_notify = Arc::new(Notify::new());
-        let inner = Arc::new(
-            ArcSwap::from_pointee(NodeInner {
-                tx: Some(tx),
-                node: None,
-            })
-        );
+        let inner = Arc::new(ArcSwap::from_pointee(NodeInner {
+            tx: Some(tx),
+            node: None,
+        }));
 
         let actor = NodeActor {
             tenant_id,
@@ -157,17 +158,15 @@ impl NodeActor {
     fn handle_activate(
         &mut self,
         node: Arc<dyn NodeApi>,
-        resp: tokio::sync::oneshot::Sender<anyhow::Result<()>>
+        resp: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
     ) {
         self.node = Some(node.clone());
         // Publish node — preserve the existing tx (set at spawn, never changes).
         let current = self.inner.load();
-        self.inner.store(
-            Arc::new(NodeInner {
-                tx: current.tx.clone(),
-                node: Some(node),
-            })
-        );
+        self.inner.store(Arc::new(NodeInner {
+            tx: current.tx.clone(),
+            node: Some(node),
+        }));
         self.touch_last_active();
         let _ = resp.send(Ok(()));
         info!(tenant = %self.tenant_id, "node activated");
@@ -184,7 +183,7 @@ impl NodeActor {
     async fn try_park(
         &mut self,
         force: bool,
-        resp: tokio::sync::oneshot::Sender<ParkOutcome>
+        resp: tokio::sync::oneshot::Sender<ParkOutcome>,
     ) -> bool {
         // Drain any commands that arrived between the poller enqueueing Park
         // and Park being dequeued. Non-park commands must be processed so user
@@ -211,14 +210,10 @@ impl NodeActor {
                 NodeCmd::Activate { resp: act_resp, .. } => {
                     // Activate arrived during drain (manager racing with poller).
                     // Reject: the poller wins; wake will re-activate on next demand.
-                    let _ = act_resp.send(
-                        Err(
-                            anyhow::anyhow!(
-                                "Activate rejected: Park already in progress for tenant {}",
-                                self.tenant_id
-                            )
-                        )
-                    );
+                    let _ = act_resp.send(Err(anyhow::anyhow!(
+                        "Activate rejected: Park already in progress for tenant {}",
+                        self.tenant_id
+                    )));
                 }
                 other => {
                     self.touch_last_active();
@@ -245,11 +240,14 @@ impl NodeActor {
                     "has_inflight_outbound failed; assuming activity and requeueing Park");
                 true
             });
-            let has_monitor = node.has_unresolved_monitor_events().await.unwrap_or_else(|e| {
-                warn!(tenant = %self.tenant_id, error = %e,
+            let has_monitor = node
+                .has_unresolved_monitor_events()
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(tenant = %self.tenant_id, error = %e,
                     "has_unresolved_monitor_events failed; assuming activity and requeueing Park");
-                true
-            });
+                    true
+                });
 
             if has_htlcs || has_inflight || has_monitor {
                 debug!(tenant = %self.tenant_id, has_htlcs, has_inflight, has_monitor,
@@ -266,12 +264,10 @@ impl NodeActor {
 
         // Clear the node reference from the shared inner (preserve tx).
         let current = self.inner.load();
-        self.inner.store(
-            Arc::new(NodeInner {
-                tx: current.tx.clone(),
-                node: None,
-            })
-        );
+        self.inner.store(Arc::new(NodeInner {
+            tx: current.tx.clone(),
+            node: None,
+        }));
 
         let _ = resp.send(ParkOutcome::Parked);
         // Actor stays in the run loop — only Shutdown exits.
@@ -311,6 +307,12 @@ impl NodeActor {
             NodeCmd::ListChannels { resp } => {
                 let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
             }
+            NodeCmd::Lsps2GetInfo { resp, .. } => {
+                let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
+            }
+            NodeCmd::GetJitInvoice { resp, .. } => {
+                let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
+            }
             NodeCmd::Activate { .. } | NodeCmd::Park { .. } | NodeCmd::Shutdown => {
                 unreachable!("Activate / Park / Shutdown handled before reject_parked")
             }
@@ -322,11 +324,17 @@ impl NodeActor {
     }
 
     fn now_secs() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     async fn handle(&mut self, cmd: NodeCmd) {
-        let node = self.node.as_ref().expect("handle only called when node is Some");
+        let node = self
+            .node
+            .as_ref()
+            .expect("handle only called when node is Some");
         match cmd {
             NodeCmd::GetBalance { resp } => {
                 if resp.send(node.get_balance().await).is_err() {
@@ -340,8 +348,15 @@ impl NodeActor {
                 }
             }
 
-            NodeCmd::ReceivePayment { amount_msat, memo, resp } => {
-                if resp.send(node.receive_payment(amount_msat, &memo).await).is_err() {
+            NodeCmd::ReceivePayment {
+                amount_msat,
+                memo,
+                resp,
+            } => {
+                if resp
+                    .send(node.receive_payment(amount_msat, &memo).await)
+                    .is_err()
+                {
                     warn!(tenant = %self.tenant_id, "ReceivePayment: caller dropped response receiver");
                 }
             }
@@ -359,20 +374,41 @@ impl NodeActor {
                 }
             }
 
-            NodeCmd::ConnectPeer { peer, host, port, resp } => {
-                if resp.send(node.connect_peer(peer, &host, port).await).is_err() {
+            NodeCmd::ConnectPeer {
+                peer,
+                host,
+                port,
+                resp,
+            } => {
+                if resp
+                    .send(node.connect_peer(peer, &host, port).await)
+                    .is_err()
+                {
                     warn!(tenant = %self.tenant_id, "ConnectPeer: caller dropped response receiver");
                 }
             }
 
-            NodeCmd::OpenChannelInit { peer, value_sat, push_msat, timeout, resp } => {
-                let outcome = node.open_channel_init(peer, value_sat, push_msat, timeout).await;
+            NodeCmd::OpenChannelInit {
+                peer,
+                value_sat,
+                push_msat,
+                timeout,
+                resp,
+            } => {
+                let outcome = node
+                    .open_channel_init(peer, value_sat, push_msat, timeout)
+                    .await;
                 if resp.send(outcome).is_err() {
                     warn!(tenant = %self.tenant_id, "OpenChannelInit: caller dropped response receiver");
                 }
             }
 
-            NodeCmd::OpenChannelFinalize { temp_channel_id, counterparty, funding_tx, resp } => {
+            NodeCmd::OpenChannelFinalize {
+                temp_channel_id,
+                counterparty,
+                funding_tx,
+                resp,
+            } => {
                 let result = node
                     .open_channel_finalize(&temp_channel_id, &counterparty, funding_tx)
                     .await;
@@ -384,6 +420,25 @@ impl NodeActor {
             NodeCmd::ListChannels { resp } => {
                 if resp.send(node.list_channels().await).is_err() {
                     warn!(tenant = %self.tenant_id, "ListChannels: caller dropped response receiver");
+                }
+            }
+
+            NodeCmd::Lsps2GetInfo { amount_msat, resp } => {
+                if resp.send(node.lsps2_get_info(amount_msat).await).is_err() {
+                    warn!(tenant = %self.tenant_id, "Lsps2GetInfo: caller dropped response receiver");
+                }
+            }
+
+            NodeCmd::GetJitInvoice {
+                amount_msat,
+                memo,
+                resp,
+            } => {
+                if resp
+                    .send(node.receive_payment_jit(amount_msat, &memo).await)
+                    .is_err()
+                {
+                    warn!(tenant = %self.tenant_id, "GetJitInvoice: caller dropped response receiver");
                 }
             }
 

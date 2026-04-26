@@ -12,22 +12,33 @@
 //! 3. Dispatches the `NodeCmd` through the manager.
 //! 4. Awaits the response and maps it to gRPC types.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::oneshot;
+use subtle::ConstantTimeEq;
+
+use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 use wick_core::TenantId;
 use wick_db::Pool;
+use wick_lsp::{LspBuilder, LspDaemon};
+
+// `LspBuilder` is used by `WickAdminGrpcService` below.
 use wick_proto::wick::{
-    wallet_service_server::WalletService, ChannelSummary as PbChannelSummary,
-    ConnectPeerRequest, ConnectPeerResponse, CreateTenantRequest, CreateTenantResponse,
-    GetBalanceRequest, GetBalanceResponse, GetNodeInfoRequest, GetNodeInfoResponse,
-    GetTransactionsRequest, GetTransactionsResponse, ListChannelsRequest, ListChannelsResponse,
-    OpenChannelFinalizeRequest, OpenChannelFinalizeResponse, OpenChannelInitRequest,
-    OpenChannelInitResponse, Payment, ReceivePaymentRequest, ReceivePaymentResponse,
-    SendPaymentRequest, SendPaymentResponse,
+    admin_service_server::AdminService, wallet_service_server::WalletService,
+    ChannelSummary as PbChannelSummary, ConnectPeerRequest, ConnectPeerResponse,
+    CreateTenantRequest, CreateTenantResponse, GetBalanceRequest, GetBalanceResponse,
+    GetJitInvoiceRequest, GetJitInvoiceResponse, GetLspInfoRequest, GetLspInfoResponse,
+    GetNodeInfoRequest, GetNodeInfoResponse, GetTransactionsRequest, GetTransactionsResponse,
+    ListChannelsRequest, ListChannelsResponse, LspFinalizeFundingRequest,
+    LspFinalizeFundingResponse, LspPendingFunding, LspWatchPendingFundingRequest,
+    Lsps2GetInfoRequest, Lsps2GetInfoResponse, OpenChannelFinalizeRequest,
+    OpenChannelFinalizeResponse, OpenChannelInitRequest, OpenChannelInitResponse, Payment,
+    ReceivePaymentRequest, ReceivePaymentResponse, RegisterLspIdentityRequest,
+    RegisterLspIdentityResponse, SendPaymentRequest, SendPaymentResponse,
 };
 
 use crate::auth::Auth;
@@ -35,6 +46,11 @@ use crate::node::{
     manager::{DispatchError, NodeManager, ProvisionError},
     NodeCmd,
 };
+
+/// Metadata header carrying the admin shared secret. Compared against
+/// `WICK_ADMIN_SECRET` config / env at handler entry. Slice 3.3a auth
+/// stop-gap until macaroon scope plumbing arrives in 3.3c.
+const ADMIN_SECRET_METADATA: &str = "x-wick-admin-secret";
 
 /// Timeout for `OpenChannelInit` to wait on LDK's `FundingGenerationReady`.
 /// The event typically fires within hundreds of milliseconds after
@@ -67,18 +83,73 @@ const VALID_PLAN_TIERS: &[&str] = &["free", "standard", "premium"];
 
 // ── Service struct ────────────────────────────────────────────────────────────
 
-/// Implements the tonic-generated `WalletService` trait.
+/// Public-facing identity of the in-process LSP, surfaced to SDK
+/// clients via [`WalletService::get_lsp_info`].
 #[derive(Debug, Clone)]
+pub struct LspInfo {
+    /// 33-byte compressed pubkey of the LSP node.
+    pub pubkey: bitcoin::secp256k1::PublicKey,
+    /// `host:port` string clients use for [`WalletService::connect_peer`].
+    pub address: String,
+    /// `true` when the LSP is connected to its upstream and has
+    /// liquidity available to open JIT channels.
+    pub ready: bool,
+}
+
+/// Implements the tonic-generated `WalletService` trait.
+#[derive(Clone)]
 pub struct WickGrpcService {
     manager: Arc<NodeManager>,
     pool: Pool,
+    /// Static LSP identity surfaced via `GetLspInfo` (pubkey + listen
+    /// address). Sourced from `[lsp].pubkey_hex` config — the operator
+    /// publishes their public key at deployment so tenants know which
+    /// counterparty to expect LSPS2 messages from.
+    lsp_info: Option<LspInfo>,
+    /// Slot holding the live LSP daemon once an operator's SDK has
+    /// successfully called `RegisterLspIdentity` with a matching seed.
+    /// `None` when the slot is empty; `GetLspInfo` reads it to surface
+    /// the `ready` flag dynamically.
+    lsp_daemon_slot: Option<Arc<RwLock<Option<LspDaemon>>>>,
+}
+
+impl std::fmt::Debug for WickGrpcService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WickGrpcService")
+            .field("has_lsp", &self.lsp_info.is_some())
+            .field("has_daemon_slot", &self.lsp_daemon_slot.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl WickGrpcService {
-    /// Construct the service with a shared manager and pool.
+    /// Construct the service with a shared manager and pool. No LSP
+    /// surfaced to clients (`get_lsp_info` returns an empty pubkey).
     #[must_use]
     pub fn new(manager: Arc<NodeManager>, pool: Pool) -> Self {
-        Self { manager, pool }
+        Self {
+            manager,
+            pool,
+            lsp_info: None,
+            lsp_daemon_slot: None,
+        }
+    }
+
+    /// Construct the service with the LSP identity surfaced to clients.
+    /// Used when the operator-mode LSP daemon is enabled.
+    #[must_use]
+    pub fn with_lsp(
+        manager: Arc<NodeManager>,
+        pool: Pool,
+        lsp_info: LspInfo,
+        lsp_daemon_slot: Arc<RwLock<Option<LspDaemon>>>,
+    ) -> Self {
+        Self {
+            manager,
+            pool,
+            lsp_info: Some(lsp_info),
+            lsp_daemon_slot: Some(lsp_daemon_slot),
+        }
     }
 }
 
@@ -105,8 +176,9 @@ impl WalletService for WickGrpcService {
                 "pubkey_hex must be a 33-byte compressed SEC1 pubkey (66 hex chars)",
             ));
         }
-        bitcoin::secp256k1::PublicKey::from_slice(&pubkey_bytes)
-            .map_err(|_| Status::invalid_argument("pubkey_hex is not a valid secp256k1 public key"))?;
+        bitcoin::secp256k1::PublicKey::from_slice(&pubkey_bytes).map_err(|_| {
+            Status::invalid_argument("pubkey_hex is not a valid secp256k1 public key")
+        })?;
 
         // Validate plan_tier against the known allowlist.
         let plan_tier = if req.plan_tier.is_empty() {
@@ -355,8 +427,9 @@ impl WalletService for WickGrpcService {
 
         let peer_bytes = hex::decode(&req.peer_pubkey_hex)
             .map_err(|_| Status::invalid_argument("peer_pubkey_hex is not valid hex"))?;
-        let peer = bitcoin::secp256k1::PublicKey::from_slice(&peer_bytes)
-            .map_err(|_| Status::invalid_argument("peer_pubkey_hex is not a valid secp256k1 key"))?;
+        let peer = bitcoin::secp256k1::PublicKey::from_slice(&peer_bytes).map_err(|_| {
+            Status::invalid_argument("peer_pubkey_hex is not a valid secp256k1 key")
+        })?;
 
         if req.host.is_empty() {
             return Err(Status::invalid_argument("host is required"));
@@ -394,8 +467,9 @@ impl WalletService for WickGrpcService {
 
         let peer_bytes = hex::decode(&req.peer_pubkey_hex)
             .map_err(|_| Status::invalid_argument("peer_pubkey_hex is not valid hex"))?;
-        let peer = bitcoin::secp256k1::PublicKey::from_slice(&peer_bytes)
-            .map_err(|_| Status::invalid_argument("peer_pubkey_hex is not a valid secp256k1 key"))?;
+        let peer = bitcoin::secp256k1::PublicKey::from_slice(&peer_bytes).map_err(|_| {
+            Status::invalid_argument("peer_pubkey_hex is not a valid secp256k1 key")
+        })?;
 
         if req.channel_value_sat == 0 {
             return Err(Status::invalid_argument("channel_value_sat must be > 0"));
@@ -444,8 +518,9 @@ impl WalletService for WickGrpcService {
 
         let peer_bytes = hex::decode(&req.peer_pubkey_hex)
             .map_err(|_| Status::invalid_argument("peer_pubkey_hex is not valid hex"))?;
-        let peer = bitcoin::secp256k1::PublicKey::from_slice(&peer_bytes)
-            .map_err(|_| Status::invalid_argument("peer_pubkey_hex is not a valid secp256k1 key"))?;
+        let peer = bitcoin::secp256k1::PublicKey::from_slice(&peer_bytes).map_err(|_| {
+            Status::invalid_argument("peer_pubkey_hex is not a valid secp256k1 key")
+        })?;
 
         let tx_bytes = hex::decode(&req.funding_tx_hex)
             .map_err(|_| Status::invalid_argument("funding_tx_hex is not valid hex"))?;
@@ -506,6 +581,107 @@ impl WalletService for WickGrpcService {
 
         Ok(Response::new(ListChannelsResponse { channels }))
     }
+
+    async fn get_lsp_info(
+        &self,
+        _request: Request<GetLspInfoRequest>,
+    ) -> Result<Response<GetLspInfoResponse>, Status> {
+        // Public RPC — no auth gate. SDK clients call this before
+        // registering so they can connect their tenant Node to the LSP.
+        //
+        // `ready` is sourced from the live daemon slot when present:
+        // the operator's SDK fills the slot via `RegisterLspIdentity`,
+        // so `ready=true` exactly when an identity has been registered
+        // and the daemon is built.
+        let resp = match &self.lsp_info {
+            Some(info) => {
+                let ready = match &self.lsp_daemon_slot {
+                    Some(slot) => slot.read().await.is_some(),
+                    None => false,
+                };
+                GetLspInfoResponse {
+                    lsp_pubkey_hex: hex::encode(info.pubkey.serialize()),
+                    lsp_address: info.address.clone(),
+                    ready,
+                }
+            }
+            None => GetLspInfoResponse::default(),
+        };
+        Ok(Response::new(resp))
+    }
+
+    async fn lsps2_get_info(
+        &self,
+        request: Request<Lsps2GetInfoRequest>,
+    ) -> Result<Response<Lsps2GetInfoResponse>, Status> {
+        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let req = request.into_inner();
+
+        let (tx, rx) = oneshot::channel();
+        self.manager
+            .dispatch(
+                tenant_id,
+                NodeCmd::Lsps2GetInfo {
+                    amount_msat: req.amount_msat,
+                    resp: tx,
+                },
+            )
+            .await
+            .map_err(dispatch_error_to_status)?;
+
+        let quote = rx
+            .await
+            .map_err(|_| Status::internal("node actor dropped the response channel"))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(Lsps2GetInfoResponse {
+            lsp_pubkey_hex: hex::encode(quote.lsp_pubkey.serialize()),
+            min_fee_msat: quote.min_fee_msat,
+            proportional_ppm: quote.proportional_ppm,
+            min_payment_size_msat: quote.min_payment_size_msat,
+            max_payment_size_msat: quote.max_payment_size_msat,
+            valid_until_unix: quote.valid_until_unix,
+        }))
+    }
+
+    async fn get_jit_invoice(
+        &self,
+        request: Request<GetJitInvoiceRequest>,
+    ) -> Result<Response<GetJitInvoiceResponse>, Status> {
+        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let req = request.into_inner();
+
+        if req.amount_msat == 0 {
+            return Err(Status::invalid_argument(
+                "amount_msat is required and must be > 0 for JIT invoices",
+            ));
+        }
+
+        let (tx, rx) = oneshot::channel();
+        self.manager
+            .dispatch(
+                tenant_id,
+                NodeCmd::GetJitInvoice {
+                    amount_msat: req.amount_msat,
+                    memo: req.memo,
+                    resp: tx,
+                },
+            )
+            .await
+            .map_err(dispatch_error_to_status)?;
+
+        let invoice = rx
+            .await
+            .map_err(|_| Status::internal("node actor dropped the response channel"))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(GetJitInvoiceResponse {
+            bolt11: invoice.bolt11,
+            payment_hash: invoice.payment_hash.to_vec(),
+            jit_fee_msat_quote: invoice.jit_fee_msat_quote,
+            lsp_pubkey_hex: hex::encode(invoice.lsp_pubkey.serialize()),
+        }))
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -551,5 +727,281 @@ mod tests {
             dispatch_error_to_status(DispatchError::Internal(anyhow::anyhow!("boom"))).code(),
             Code::Internal
         );
+    }
+}
+
+// ── AdminService ──────────────────────────────────────────────────────────────
+//
+// Operator-scoped RPCs gated behind a shared admin secret. Slice 3.3a
+// implementation; macaroon scope plumbing arrives in 3.3c.
+
+/// Implements the operator-side admin gRPC.
+///
+/// Holds:
+/// - The pre-registration `LspBuilder` (constructed at boot from the
+///   `[lsp]` config).
+/// - The `Arc<RwLock<Option<LspDaemon>>>` slot the registered daemon
+///   lands into.
+/// - The expected LSP pubkey from `[lsp].pubkey_hex` config (used to
+///   validate that the operator's seed matches the published public
+///   key) — `None` skips validation.
+/// - The shared admin secret used to gate every method.
+#[derive(Clone)]
+pub struct WickAdminGrpcService {
+    pub(crate) lsp_builder: Arc<LspBuilder>,
+    pub(crate) lsp_daemon_slot: Arc<RwLock<Option<LspDaemon>>>,
+    pub(crate) expected_lsp_pubkey: Option<bitcoin::secp256k1::PublicKey>,
+    pub(crate) admin_secret: String,
+}
+
+impl std::fmt::Debug for WickAdminGrpcService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WickAdminGrpcService")
+            .field("expected_lsp_pubkey", &self.expected_lsp_pubkey)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WickAdminGrpcService {
+    /// Construct a new admin service.
+    #[must_use]
+    pub fn new(
+        lsp_builder: Arc<LspBuilder>,
+        lsp_daemon_slot: Arc<RwLock<Option<LspDaemon>>>,
+        expected_lsp_pubkey: Option<bitcoin::secp256k1::PublicKey>,
+        admin_secret: String,
+    ) -> Self {
+        Self {
+            lsp_builder,
+            lsp_daemon_slot,
+            expected_lsp_pubkey,
+            admin_secret,
+        }
+    }
+
+    /// Reject the request unless the `x-wick-admin-secret` metadata
+    /// matches the configured shared secret.
+    fn authorize<T>(&self, req: &Request<T>) -> Result<(), Status> {
+        let presented = req
+            .metadata()
+            .get(ADMIN_SECRET_METADATA)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        let rhs = self.admin_secret.as_bytes();
+        if rhs.is_empty() {
+            return Err(Status::unauthenticated("admin secret not configured"));
+        }
+        if presented.as_bytes().ct_eq(rhs).into() {
+            Ok(())
+        } else {
+            Err(Status::unauthenticated("admin secret missing or invalid"))
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl AdminService for WickAdminGrpcService {
+    async fn register_lsp_identity(
+        &self,
+        request: Request<RegisterLspIdentityRequest>,
+    ) -> Result<Response<RegisterLspIdentityResponse>, Status> {
+        self.authorize(&request)?;
+        let req = request.into_inner();
+
+        if req.lightning_seed.len() != 32 {
+            return Err(Status::invalid_argument(
+                "lightning_seed must be exactly 32 bytes",
+            ));
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&req.lightning_seed);
+
+        // Idempotency: if a daemon is already registered, return its
+        // pubkey. Re-registering with the same seed → the same pubkey,
+        // so callers retrying after a network blip get a no-op success.
+        // Re-registering with a different seed is rejected — channel
+        // state would be stranded.
+        {
+            let slot = self.lsp_daemon_slot.read().await;
+            if let Some(daemon) = slot.as_ref() {
+                return Ok(Response::new(RegisterLspIdentityResponse {
+                    lsp_pubkey_hex: hex::encode(daemon.pubkey.serialize()),
+                    ready: true,
+                }));
+            }
+        }
+
+        let daemon = self
+            .lsp_builder
+            .build_with_seed(seed)
+            .await
+            .map_err(|e| Status::internal(format!("build LSP daemon: {e}")))?;
+
+        // Validate pubkey against the operator's published value if
+        // configured — protects against accidentally registering the
+        // wrong seed against this server.
+        if let Some(expected) = self.expected_lsp_pubkey {
+            if daemon.pubkey != expected {
+                return Err(Status::failed_precondition(format!(
+                    "registered seed derived pubkey {} does not match \
+                     configured [lsp].pubkey_hex {}",
+                    daemon.pubkey, expected
+                )));
+            }
+        }
+
+        let pubkey_hex = hex::encode(daemon.pubkey.serialize());
+        let mut slot = self.lsp_daemon_slot.write().await;
+        // Re-check under the write lock in case another caller raced.
+        if slot.is_some() {
+            // Another concurrent register won — drop our build (the
+            // daemon's `Drop` aborts the event-pump task). Re-emit the
+            // existing daemon's pubkey for idempotency.
+            let existing_pubkey = slot
+                .as_ref()
+                .map(|d| hex::encode(d.pubkey.serialize()))
+                .unwrap_or_default();
+            // Best-effort shutdown of the duplicate we just built.
+            tokio::spawn(async move { daemon.shutdown().await });
+            return Ok(Response::new(RegisterLspIdentityResponse {
+                lsp_pubkey_hex: existing_pubkey,
+                ready: true,
+            }));
+        }
+        *slot = Some(daemon);
+
+        Ok(Response::new(RegisterLspIdentityResponse {
+            lsp_pubkey_hex: pubkey_hex,
+            ready: true,
+        }))
+    }
+
+    type LspWatchPendingFundingStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<LspPendingFunding, Status>> + Send>>;
+
+    async fn lsp_watch_pending_funding(
+        &self,
+        request: Request<LspWatchPendingFundingRequest>,
+    ) -> Result<Response<Self::LspWatchPendingFundingStream>, Status> {
+        self.authorize(&request)?;
+
+        // Subscribe under the slot read lock so we don't race a fresh
+        // `park` between snapshot and subscribe.
+        let slot = self.lsp_daemon_slot.read().await;
+        let daemon = slot
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("LSP not registered"))?;
+        let mut rx = daemon.typed_node.funding_registry_subscribe();
+        let snapshot = daemon.typed_node.funding_registry_snapshot();
+        drop(slot);
+
+        let (tx, output_rx) = mpsc::channel::<Result<LspPendingFunding, Status>>(64);
+
+        // Bootstrap: replay every currently-parked entry so the operator
+        // can drain anything that landed before they connected.
+        for (temp_id, pending) in snapshot {
+            let msg = LspPendingFunding {
+                temp_channel_id: temp_id.0.to_vec(),
+                counterparty_pubkey_hex: hex::encode(pending.counterparty.serialize()),
+                value_sat: pending.value_sat,
+                output_script_hex: hex::encode(pending.output_script.as_bytes()),
+            };
+            if tx.send(Ok(msg)).await.is_err() {
+                // Client disconnected during bootstrap — silently exit.
+                return Ok(Response::new(Box::pin(ReceiverStream::new(output_rx))));
+            }
+        }
+
+        // Live tail: forward broadcast events until the operator
+        // disconnects or the LSP daemon shuts down.
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok((temp_id, pending)) => {
+                        let msg = LspPendingFunding {
+                            temp_channel_id: temp_id.0.to_vec(),
+                            counterparty_pubkey_hex: hex::encode(pending.counterparty.serialize()),
+                            value_sat: pending.value_sat,
+                            output_script_hex: hex::encode(pending.output_script.as_bytes()),
+                        };
+                        if tx.send(Ok(msg)).await.is_err() {
+                            return; // operator disconnected
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Operator fell behind — surface as a non-fatal
+                        // status so the client can re-prime via a fresh
+                        // subscribe + snapshot. Continue listening.
+                        let _ = tx
+                            .send(Err(Status::data_loss(format!(
+                                "lsp watch lagged by {n} events; re-subscribe to re-prime"
+                            ))))
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Daemon shut down. End the stream cleanly.
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(output_rx))))
+    }
+
+    async fn lsp_finalize_funding(
+        &self,
+        request: Request<LspFinalizeFundingRequest>,
+    ) -> Result<Response<LspFinalizeFundingResponse>, Status> {
+        self.authorize(&request)?;
+        let req = request.into_inner();
+
+        if req.temp_channel_id.len() != 32 {
+            return Err(Status::invalid_argument("temp_channel_id must be 32 bytes"));
+        }
+        let mut tcid = [0u8; 32];
+        tcid.copy_from_slice(&req.temp_channel_id);
+        let temp_channel_id = lightning::ln::types::ChannelId(tcid);
+
+        let counterparty_bytes = hex::decode(&req.counterparty_pubkey_hex)
+            .map_err(|_| Status::invalid_argument("counterparty_pubkey_hex is not valid hex"))?;
+        let counterparty =
+            bitcoin::secp256k1::PublicKey::from_slice(&counterparty_bytes).map_err(|_| {
+                Status::invalid_argument("counterparty_pubkey_hex is not a valid secp256k1 key")
+            })?;
+
+        let tx_bytes = hex::decode(&req.funding_tx_hex)
+            .map_err(|_| Status::invalid_argument("funding_tx_hex is not valid hex"))?;
+        let funding_tx: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&tx_bytes).map_err(|e| {
+                Status::invalid_argument(format!("funding_tx_hex is not a valid bitcoin tx: {e}"))
+            })?;
+
+        let slot = self.lsp_daemon_slot.read().await;
+        let daemon = slot
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("LSP not registered"))?;
+
+        // Drain the parked entry from the registry so it isn't
+        // re-yielded to a future watcher. A `None` here means either
+        // (a) the operator finalized for an unknown temp_id (client
+        // bug), or (b) the entry was already drained by a concurrent
+        // finalize. Surface as not_found.
+        let _drained = daemon.typed_node.funding_registry_try_take(temp_channel_id);
+        if _drained.is_none() {
+            return Err(Status::not_found(
+                "no parked funding entry for the supplied temp_channel_id",
+            ));
+        }
+
+        // Hand the signed tx to LDK via the existing wrapped method
+        // (also used by tenant `OpenChannelFinalize`).
+        daemon
+            .node
+            .open_channel_finalize(&temp_channel_id, &counterparty, funding_tx)
+            .await
+            .map_err(|e| Status::internal(format!("funding_transaction_generated: {e}")))?;
+
+        Ok(Response::new(LspFinalizeFundingResponse {}))
     }
 }

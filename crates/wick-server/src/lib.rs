@@ -7,4 +7,5 @@
 pub mod auth;
 pub mod factory;
 pub mod grpc;
+pub mod lsp_bridge;
 pub mod node;

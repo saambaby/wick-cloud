@@ -29,11 +29,14 @@ pub mod admission;
 pub mod event_buffer;
 pub mod manager;
 
-use std::sync::{ atomic::{ AtomicU64, AtomicU8 }, Arc, RwLock };
+use std::sync::{
+    atomic::{AtomicU64, AtomicU8},
+    Arc, RwLock,
+};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use tokio::sync::{ mpsc, oneshot, Notify };
+use tokio::sync::{mpsc, oneshot, Notify};
 use wick_lightning::NodeApi;
 
 /// Memory reserved per active node (bytes).
@@ -87,7 +90,7 @@ pub struct ErrorState {
 // ── Response types (owned by `wick-lightning`) ───────────────────────────────
 
 /// Re-exported from [`wick_lightning`] so callers need only import from here.
-pub use wick_lightning::{ Balance, ChannelSummary, PaymentRecord, PaymentResult };
+pub use wick_lightning::{Balance, ChannelSummary, PaymentRecord, PaymentResult};
 
 // ── NodeCmd ──────────────────────────────────────────────────────────────────
 
@@ -142,7 +145,9 @@ pub enum NodeCmd {
     GetNodeInfo {
         /// Response channel — `(pubkey, Some(host:port)) | (pubkey, None)` if
         /// the node has no listener.
-        resp: oneshot::Sender<anyhow::Result<(bitcoin::secp256k1::PublicKey, Option<std::net::SocketAddr>)>>,
+        resp: oneshot::Sender<
+            anyhow::Result<(bitcoin::secp256k1::PublicKey, Option<std::net::SocketAddr>)>,
+        >,
     },
     /// Connect to a Lightning peer and persist it for reconnection.
     ConnectPeer {
@@ -169,7 +174,12 @@ pub enum NodeCmd {
         timeout: std::time::Duration,
         /// Response channel — yields the temp_channel_id LDK assigned and
         /// the parked `PendingFunding` (output_script + value).
-        resp: oneshot::Sender<anyhow::Result<(lightning::ln::types::ChannelId, wick_lightning::PendingFunding)>>,
+        resp: oneshot::Sender<
+            anyhow::Result<(
+                lightning::ln::types::ChannelId,
+                wick_lightning::PendingFunding,
+            )>,
+        >,
     },
     /// Complete an outbound channel open with a caller-supplied, pre-signed
     /// funding transaction.
@@ -188,6 +198,22 @@ pub enum NodeCmd {
     ListChannels {
         /// Response channel.
         resp: oneshot::Sender<anyhow::Result<Vec<ChannelSummary>>>,
+    },
+    /// Negotiate LSPS2 `lsps2.get_info` and return a fee quote.
+    Lsps2GetInfo {
+        /// Optional payment size to filter the LSP's fee menu against.
+        amount_msat: Option<u64>,
+        /// Response channel.
+        resp: oneshot::Sender<anyhow::Result<wick_lightning::JitQuote>>,
+    },
+    /// Issue a JIT-enabled BOLT11 invoice (LSPS2 end-to-end).
+    GetJitInvoice {
+        /// Required payment size in millisatoshis.
+        amount_msat: u64,
+        /// Invoice memo / description.
+        memo: String,
+        /// Response channel.
+        resp: oneshot::Sender<anyhow::Result<wick_lightning::JitInvoice>>,
     },
     /// Install (or re-install) a [`NodeApi`] into a parked actor.
     ///
@@ -307,12 +333,10 @@ impl NodeHandle {
             state: Arc::new(AtomicU8::new(state::ACTIVE)),
             last_active: Arc::new(AtomicU64::new(0)),
             wake_notify: Arc::new(Notify::new()),
-            inner: Arc::new(
-                ArcSwap::from_pointee(NodeInner {
-                    tx: Some(tx),
-                    node: None,
-                })
-            ),
+            inner: Arc::new(ArcSwap::from_pointee(NodeInner {
+                tx: Some(tx),
+                node: None,
+            })),
             error: Arc::new(RwLock::new(None)),
         }
     }

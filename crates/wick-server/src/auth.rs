@@ -94,20 +94,28 @@ mod tests {
     #[test]
     fn missing_header_returns_unauthenticated() {
         let req: tonic::Request<()> = tonic::Request::new(());
-        assert_eq!(Auth::extract_bearer(&req).unwrap_err().code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            Auth::extract_bearer(&req).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
     }
 
     #[test]
     fn malformed_scheme_returns_unauthenticated() {
         let mut req: tonic::Request<()> = tonic::Request::new(());
-        req.metadata_mut().insert("authorization", "Token abc123".parse().unwrap());
-        assert_eq!(Auth::extract_bearer(&req).unwrap_err().code(), tonic::Code::Unauthenticated);
+        req.metadata_mut()
+            .insert("authorization", "Token abc123".parse().unwrap());
+        assert_eq!(
+            Auth::extract_bearer(&req).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
     }
 
     #[test]
     fn valid_bearer_prefix_extracts_raw_value() {
         let mut req: tonic::Request<()> = tonic::Request::new(());
-        req.metadata_mut().insert("authorization", "Bearer deadbeef".parse().unwrap());
+        req.metadata_mut()
+            .insert("authorization", "Bearer deadbeef".parse().unwrap());
         assert_eq!(Auth::extract_bearer(&req).unwrap(), "deadbeef");
     }
 
@@ -128,8 +136,12 @@ mod tests {
     async fn non_hex_token_returns_unauthenticated() {
         let pool = test_pool().await;
         let mut req: tonic::Request<()> = tonic::Request::new(());
-        req.metadata_mut().insert("authorization", "Bearer zzz_not_hex!!".parse().unwrap());
-        assert_eq!(Auth::authenticate(&pool, &req).await.unwrap_err().code(), tonic::Code::Unauthenticated);
+        req.metadata_mut()
+            .insert("authorization", "Bearer zzz_not_hex!!".parse().unwrap());
+        assert_eq!(
+            Auth::authenticate(&pool, &req).await.unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
     }
 
     #[tokio::test]
@@ -137,9 +149,16 @@ mod tests {
     async fn unknown_token_returns_unauthenticated() {
         let pool = test_pool().await;
         let mut req: tonic::Request<()> = tonic::Request::new(());
-        req.metadata_mut()
-            .insert("authorization", format!("Bearer {}", hex::encode([0xde; 32])).parse().unwrap());
-        assert_eq!(Auth::authenticate(&pool, &req).await.unwrap_err().code(), tonic::Code::Unauthenticated);
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", hex::encode([0xde; 32]))
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            Auth::authenticate(&pool, &req).await.unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
     }
 
     #[tokio::test]
@@ -158,8 +177,13 @@ mod tests {
         .expect("insert suspended wallet");
 
         let mut req: tonic::Request<()> = tonic::Request::new(());
-        req.metadata_mut()
-            .insert("authorization", format!("Bearer {raw_token}").parse().unwrap());
-        assert_eq!(Auth::authenticate(&pool, &req).await.unwrap_err().code(), tonic::Code::Unauthenticated);
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {raw_token}").parse().unwrap(),
+        );
+        assert_eq!(
+            Auth::authenticate(&pool, &req).await.unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
     }
 }

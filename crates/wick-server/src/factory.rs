@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use bitcoin::secp256k1::PublicKey;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use wick_core::TenantId;
@@ -44,15 +45,33 @@ fn derive_tenant_seed(master: &[u8; 32], tenant_id: TenantId) -> [u8; 32] {
 /// unchanged across the swap.
 #[must_use]
 pub fn node_factory(master_seed: [u8; 32], deps: NodeDeps) -> NodeFactory {
+    node_factory_with_lsp(master_seed, deps, None)
+}
+
+/// Build a `NodeFactory` that wires every tenant Node as an LSPS2
+/// client of `lsp_peer` (when `Some`).
+///
+/// Distinct from [`node_factory`] only in the `with_liquidity_client(lsp_peer)`
+/// builder call. When `lsp_peer` is `None`, behaves identically to
+/// [`node_factory`].
+#[must_use]
+pub fn node_factory_with_lsp(
+    master_seed: [u8; 32],
+    deps: NodeDeps,
+    lsp_peer: Option<PublicKey>,
+) -> NodeFactory {
     Arc::new(move |tenant_id| {
         let seed = derive_tenant_seed(&master_seed, tenant_id);
         let deps = deps.clone();
+        let lsp_peer = lsp_peer;
         Box::pin(async move {
             let signer = Arc::new(from_seed(seed));
-            let node = NodeBuilder::<LocalKeysManager>::new(tenant_id, deps)
-                .with_signer(signer)
-                .build()
-                .await?;
+            let mut builder =
+                NodeBuilder::<LocalKeysManager>::new(tenant_id, deps).with_signer(signer);
+            if let Some(peer) = lsp_peer {
+                builder = builder.with_liquidity_client(peer);
+            }
+            let node = builder.build().await?;
             Ok(node as Arc<dyn NodeApi>)
         })
     })
