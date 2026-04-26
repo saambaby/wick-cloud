@@ -797,6 +797,38 @@ impl VlsRemoteChannelSigner {
             .unwrap_or(SENTINEL_PUBKEY)
     }
 
+    /// `true` once `SetupChannel` has been delivered to VLS.
+    fn channel_is_set_up(&self) -> bool {
+        self.channel_meta
+            .get(&self.channel_keys_id)
+            .map(|m| m.setup_funding.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Wait (up to ~5s) for `SetupChannel` to land before serving a
+    /// `ChannelSigner` method that has no `ChannelTransactionParameters`
+    /// argument (and therefore can't call `maybe_setup_channel` itself).
+    ///
+    /// Returning `Err(())` from a `ChannelSigner` method causes LDK to
+    /// disable the channel rather than retry, so this short async wait
+    /// is the safest gap-filler when the underlying race resolves quickly
+    /// (the concurrent `EcdsaChannelSigner` call holds a `block_vls!`
+    /// future that flips `setup_funding` shortly after this fires).
+    fn await_setup(&self) -> Result<(), ()> {
+        if self.channel_is_set_up() {
+            return Ok(());
+        }
+        block_vls!(async {
+            for _ in 0..100 {
+                if self.channel_is_set_up() {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(())
+        })
+    }
+
     /// Ensure the VLS-side channel is promoted to its real counterparty
     /// keys + funding outpoint. Idempotent — short-circuits when the
     /// `SetupChannel` has already been delivered for the same funding
@@ -882,6 +914,15 @@ impl ChannelSigner for VlsRemoteChannelSigner {
         if self.failed {
             return Err(());
         }
+        // VLS in stub state (NewChannel, no SetupChannel yet) only allows
+        // points 0 and 1 — the per-commitment points used in OpenChannel
+        // / AcceptChannel. For commit ≥ 2 the channel must be `setup_channel`
+        // promoted; await that briefly rather than returning Err (which LDK
+        // would treat as a fatal signer error and disable the channel).
+        let vls_commit_number = (1u64 << 48).saturating_sub(1).saturating_sub(idx);
+        if vls_commit_number > 1 {
+            self.await_setup()?;
+        }
         let conn = self.active_conn()?;
         let peer_id = self.current_peer_id();
         let bytes = block_vls!(rpc::rpc_get_per_commitment_point(
@@ -897,6 +938,8 @@ impl ChannelSigner for VlsRemoteChannelSigner {
         if self.failed {
             return Err(());
         }
+        // Same stub-state gate as `get_per_commitment_point`.
+        self.await_setup()?;
         let conn = self.active_conn()?;
         let peer_id = self.current_peer_id();
         block_vls!(rpc::rpc_release_commitment_secret(
@@ -915,30 +958,19 @@ impl ChannelSigner for VlsRemoteChannelSigner {
         if self.failed {
             return Err(());
         }
-        // LDK 0.2's two-phase funding (`open_channel_init` /
-        // `open_channel_finalize`) calls `validate_holder_commitment` as
-        // a self-check before the funding outpoint is known — i.e. before
-        // any `EcdsaChannelSigner` method has fired and given us
-        // `ChannelTransactionParameters`, so `maybe_setup_channel` can't
-        // run yet. VLS rejects with "channel not ready" because no
-        // `SetupChannel` has been delivered.
-        //
-        // Skip the VLS round-trip when the channel hasn't been set up.
-        // Cryptographic correctness is still enforced — `sign_holder_commitment`
-        // (which IS handed `ChannelTransactionParameters` and runs
-        // `maybe_setup_channel`) re-signs the same commitment downstream and
-        // VLS validates it then. LDK's own counterparty-signature check
-        // covers the gap until that fires.
-        let setup_done = self
-            .channel_meta
-            .get(&self.channel_keys_id)
-            .map(|m| m.setup_funding.is_some())
-            .unwrap_or(false);
-        if !setup_done {
+        // LDK 0.2's two-phase funding calls `validate_holder_commitment` as a
+        // pre-funding self-check, before any `EcdsaChannelSigner` method has
+        // fired with `ChannelTransactionParameters`. There's no concurrent
+        // racing call that could deliver `SetupChannel`, so awaiting setup
+        // would deadlock — skip the VLS round-trip in this state and let
+        // `sign_holder_commitment` (which IS handed `ChannelTransactionParameters`
+        // and runs `maybe_setup_channel`) re-validate downstream. LDK's own
+        // counterparty-signature check covers the gap.
+        if !self.channel_is_set_up() {
             tracing::debug!(
                 target: "wick_vls",
                 dbid = self.dbid,
-                "validate_holder_commitment: channel not yet set up — deferring VLS validation to sign_holder_commitment"
+                "validate_holder_commitment: channel not set up — deferring to sign_holder_commitment"
             );
             return Ok(());
         }
