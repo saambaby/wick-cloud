@@ -110,6 +110,40 @@ impl Default for SignerSessionRegistry {
     }
 }
 
+/// Per-tenant handle that resolves the *current* [`SignerConnection`] from
+/// the [`SignerSessionRegistry`] on every signing call.
+///
+/// The signer holds this rather than an `Arc<SignerConnection>` directly so
+/// that reconnects (which install a fresh connection in the registry) are
+/// transparent to the LDK signer trait impls — the next call will simply
+/// resolve the new connection.
+#[derive(Clone, Debug)]
+pub struct ConnLookup {
+    context_id: String,
+    registry: Arc<SignerSessionRegistry>,
+}
+
+impl ConnLookup {
+    pub fn new(context_id: String, registry: Arc<SignerSessionRegistry>) -> Self {
+        Self {
+            context_id,
+            registry,
+        }
+    }
+
+    pub fn context_id(&self) -> &str {
+        &self.context_id
+    }
+
+    pub fn resolve(&self) -> Option<Arc<SignerConnection>> {
+        self.registry.get(&self.context_id)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.registry.is_ready(&self.context_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

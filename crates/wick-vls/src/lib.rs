@@ -36,8 +36,10 @@
 
 mod connection;
 mod registry;
+mod session;
 
 pub mod rpc;
 
 pub use connection::SignerConnection;
-pub use registry::{OutboundSignerFrame, SignerSessionRegistry, StateSyncChannel};
+pub use registry::{ConnLookup, OutboundSignerFrame, SignerSessionRegistry, StateSyncChannel};
+pub use session::{SignerSession, VlsRemoteChannelSigner};
