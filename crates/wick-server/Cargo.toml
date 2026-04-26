@@ -42,7 +42,6 @@ tonic      = { workspace = true }
 tokio-stream = { workspace = true }
 hex        = "0.4"
 bitcoin    = { workspace = true }
-hmac       = { workspace = true }
 sha2       = { workspace = true }
 subtle     = "2.6"
 rand       = { workspace = true }

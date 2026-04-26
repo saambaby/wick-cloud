@@ -16,8 +16,9 @@ esplora_url         = "http://localhost:3002"
 # Lightning software already listening on 9735 or nearby ports.
 listen_port_base    = 0
 
-# Canonical BIP39 zero-entropy phrase — safe for local regtest only.
-server_mnemonic     = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+# Phase-4: tenant Lightning keys live exclusively in the SDK. The server
+# holds NO seed material; the tenant SDK serves every signer call over
+# the `SignerService.Attach` bidi gRPC stream.
 
 # ── Phase-2 park/wake tuning (all optional — defaults shown) ─────────────────
 # Uncomment and override for chaos runs or latency profiling.

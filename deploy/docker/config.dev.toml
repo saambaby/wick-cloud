@@ -9,7 +9,6 @@
 # To use local regtest instead, point WICK_CONFIG at config.regtest.toml.
 #
 # All fields can be overridden by WICK_* environment variables:
-#   WICK_SERVER_MNEMONIC   — inject seed without editing this file
 #   WICK_DATABASE_URL      — inject DB credentials
 #   WICK_LISTEN_PORT_BASE  — override P2P port allocation
 #   WICK_GRPC_ADDR         — e.g. 0.0.0.0:50051 for non-localhost access
@@ -27,9 +26,11 @@ network             = "mutinynet"
 # need stable inbound addresses across park/wake cycles.
 listen_port_base    = 0
 
-# Canonical BIP39 zero-entropy phrase — dev-only, never deploy.
-# Override without editing this file: WICK_SERVER_MNEMONIC="word1 word2 ..."
-server_mnemonic     = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+# Phase-4: tenant Lightning keys live exclusively in the SDK. The server
+# holds NO seed material. Each tenant's SDK opens a `SignerService.Attach`
+# bidi gRPC stream and serves every signer call from its on-device
+# `vls-protocol-signer`. The tenant must be online for its node to sign
+# anything (parked tenants cannot receive payments without waking the SDK).
 
 # ── Phase-2 park/wake tuning (all optional — defaults shown) ─────────────────
 # Uncomment and override for staging chaos runs or latency profiling.

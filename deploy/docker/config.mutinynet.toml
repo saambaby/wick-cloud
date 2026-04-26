@@ -5,13 +5,11 @@
 #   just postgres-up
 #   cargo run --bin wick-server -- --config deploy/docker/config.mutinynet.toml
 #
-# IMPORTANT: never commit a real mnemonic to version control.
-# Inject the seed via environment variable instead:
-#   export WICK_SERVER_MNEMONIC="word1 word2 ... word24"
-# Or replace server_mnemonic below with a freshly-generated phrase:
-#   python -c "from mnemonic import Mnemonic; print(Mnemonic('english').generate(256))"
+# Phase-4: tenant Lightning keys live exclusively in the SDK. The server
+# holds NO seed material; each tenant's SDK opens a `SignerService.Attach`
+# bidi gRPC stream and serves every signer call locally.
 #
-# Other secrets can be injected the same way:
+# Secrets injected via environment variables:
 #   WICK_DATABASE_URL      — DB connection string with real credentials
 #   WICK_LISTEN_PORT_BASE  — override P2P port allocation
 #   WICK_GRPC_ADDR         — e.g. 0.0.0.0:50051 for non-localhost access
@@ -27,9 +25,6 @@ network             = "mutinynet"
 # OS assigns a random port per tenant. Set a non-zero base (e.g. 19735) if
 # you need stable inbound addresses that survive park/wake cycles.
 listen_port_base    = 0
-
-# Replace with a real mnemonic or use WICK_SERVER_MNEMONIC (see above).
-server_mnemonic     = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
 # ── Phase-2 park/wake tuning (all optional — defaults shown) ─────────────────
 # Mutinynet has 30-second blocks; wake_deadline can be tighter than regtest.

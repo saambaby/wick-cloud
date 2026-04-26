@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tracing::{ info, warn };
-use wick_core::{ config, metrics, tracing_init, LspConfig, WickIdentity, WickNetwork };
+use wick_core::{ config, metrics, tracing_init, LspConfig, WickNetwork };
 use wick_db::Pool;
 use wick_proto::wick::wallet_service_server::WalletServiceServer;
 
@@ -63,11 +63,6 @@ struct Config {
     /// [`WickNetwork::default_esplora`].
     #[serde(default)]
     esplora_url: Option<String>,
-    /// BIP39 mnemonic for the server master seed (12 or 24 words).
-    ///
-    /// The master seed is the first 32 bytes of `mnemonic.to_seed("")`.
-    /// Phase 4 replaces this entirely with a remote VLS signer handle.
-    server_mnemonic: String,
     /// Base port for per-tenant P2P Lightning listeners. Each tenant binds
     /// `0.0.0.0:{base + tenant_id}`. `0` means let the OS pick a port.
     #[serde(default)]
@@ -178,14 +173,6 @@ fn default_memory_budget_bytes() -> usize {
     512 * 1024 * 1024 // 512 MiB
 }
 
-/// Resolve the 32-byte master seed from the configured BIP39 mnemonic.
-fn resolve_master_seed(cfg: &Config) -> Result<[u8; 32]> {
-    let identity = WickIdentity::from_phrase(&cfg.server_mnemonic, cfg.network).context(
-        "server_mnemonic is not a valid BIP39 phrase"
-    )?;
-    Ok(identity.seed)
-}
-
 /// Bundle returned from [`resolve_lsp_identity`] when the operator-mode
 /// LSP is enabled.
 struct ResolvedLsp {
@@ -242,10 +229,10 @@ async fn main() -> Result<()> {
     let fee_estimator = Arc::new(FeeEstimator::new());
     let logger = Arc::new(TracingLogger);
 
-    // `wick-lightning` no longer carries seed material. The master seed
-    // is resolved from `server_mnemonic` below and flows to the node
-    // factory, which derives per-tenant seeds; Phase 4 replaces the
-    // factory with a VLS-backed closure and removes seed-at-rest entirely.
+    // Per-tenant LDK signing keys live exclusively in the SDK (Phase 4).
+    // The server holds no seed material; each per-tenant `Node` is built
+    // with a `wick_vls::SignerSession` that resolves the live SDK
+    // bidi stream through `signer_registry` on every signer call.
     let deps = NodeDeps {
         pg_pool: pool.raw().clone(),
         network: cfg.network,
@@ -257,7 +244,13 @@ async fn main() -> Result<()> {
         listen_port_base: cfg.listen_port_base.unwrap_or(wick_lightning::DEFAULT_LISTEN_PORT_BASE),
     };
 
-    let master_seed = resolve_master_seed(&cfg)?;
+    // Phase-4 remote-signer registry. Shared between (a) the per-tenant
+    // node factory below (so each `Node` resolves the live SDK
+    // connection on every signer call) and (b) the gRPC
+    // `SignerService.Attach` handler that installs the SDK side of the
+    // bidi stream on connect. Most-recent-wins on reconnect lives in
+    // `SignerSessionRegistry::register`.
+    let signer_registry = Arc::new(SignerSessionRegistry::new());
 
     // Resolve the in-process LSP identity (if enabled) so tenant nodes
     // can be wired as LSPS2 clients pointing at it. The actual LSP
@@ -278,7 +271,7 @@ async fn main() -> Result<()> {
     };
     let lsp_peer_for_tenants = lsp_state.as_ref().map(|s| s.pubkey);
 
-    let factory = factory::node_factory_with_lsp(master_seed, deps, lsp_peer_for_tenants);
+    let factory = factory::node_factory_with_lsp(deps, signer_registry.clone(), lsp_peer_for_tenants);
 
     let manager_config = cfg.park_wake.apply(ManagerConfig::default(), cfg.memory_budget_bytes);
     info!(
@@ -373,13 +366,6 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
-    // Phase-4 remote-signer registry. Shared between (a) the per-tenant
-    // node factory (so each Node holds a `wick_vls::SignerSession` that
-    // resolves the live SDK connection on every signer call) and (b) the
-    // gRPC `SignerService.Attach` handler (which installs the SDK side of
-    // the bidi stream on connect). Most-recent-wins on reconnect is
-    // implemented inside `SignerSessionRegistry::register`.
-    let signer_registry = Arc::new(SignerSessionRegistry::new());
     let signer_service = WickSignerGrpcService::new(pool.raw().clone(), signer_registry.clone());
 
     let server = Server::builder()

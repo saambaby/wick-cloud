@@ -1,73 +1,73 @@
-//! Phase-1 `NodeFactory` — `LocalKeysManager` backed by HMAC-derived per-tenant seeds.
+//! Phase-4 `NodeFactory` — `wick_vls::SignerSession` backed by a per-tenant
+//! gRPC bidi stream the SDK opens via [`SignerService.Attach`].
 //!
-//! The server holds a single 32-byte master seed (resolved from
-//! `server_mnemonic` in [`crate::main`]) and derives a per-tenant seed via
-//! `HMAC-SHA256(master, tenant_id)`. This is explicitly temporary: Phase 4
-//! replaces the master seed entirely with a remote VLS signer.
+//! The server holds **no** seed material. For each tenant the closure:
 //!
-//! The server is **not** custodial of channel-funding UTXOs. Channel opens
-//! use the two-phase `OpenChannelInit` / `OpenChannelFinalize` gRPC flow:
-//! the client builds + signs the funding tx on its own BDK wallet and
-//! hands it to the server, which passes it straight to LDK's
-//! `ChannelManager::funding_transaction_generated`. The node never holds
-//! on-chain keys beyond the LDK signing keys (`LocalKeysManager`) that
-//! Phase 4 VLS will move on-device.
+//! 1. Builds a [`ConnLookup`] over the shared
+//!    [`SignerSessionRegistry`] keyed on the tenant's `context_id`.
+//! 2. Refuses early with `signer offline` if the SDK side of the bidi
+//!    stream is not currently attached — `wake_loading` surfaces this as
+//!    `WakeError::SignerOffline` so the gRPC layer can map it to
+//!    `Status::failed_precondition` without burning a wake slot.
+//! 3. Calls [`SignerSession::init`] to negotiate VLS `HsmdInit2` + fetch
+//!    the three LDK-only node keys (peer-storage, inbound-payment,
+//!    receive-auth) over the live stream.
+//! 4. Hands the `Arc<SignerSession>` to `NodeBuilder::with_signer`.
+//!
+//! Channel funding remains self-custodial via the existing two-phase
+//! `OpenChannelInit` / `OpenChannelFinalize` flow; this factory does not
+//! touch on-chain key material.
 
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use bitcoin::secp256k1::PublicKey;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use wick_core::TenantId;
-use wick_lightning::{from_seed, LocalKeysManager, NodeApi, NodeBuilder, NodeDeps};
+use wick_lightning::{NodeApi, NodeBuilder, NodeDeps};
+use wick_vls::{ConnLookup, SignerSession, SignerSessionRegistry};
 
 use crate::node::manager::NodeFactory;
 
-/// Derive a per-tenant 32-byte seed from the server master seed.
-///
-/// Same inputs always produce the same seed — required so `NodeBuilder`'s
-/// restart path can reattach to previously-persisted channel state.
-#[allow(clippy::expect_used)] // [u8; 32] is never zero-length; new_from_slice cannot fail
-fn derive_tenant_seed(master: &[u8; 32], tenant_id: TenantId) -> [u8; 32] {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(master).expect("HMAC accepts any key length");
-    mac.update(tenant_id.to_string().as_bytes());
-    mac.finalize().into_bytes().into()
-}
-
-/// Build a `NodeFactory` that derives per-tenant seeds from the server's
-/// BIP39-derived `master_seed` and captures the shared [`NodeDeps`] via
-/// closure.
-///
-/// Phase 4 replaces this entire factory with a VLS-backed closure — the
-/// server no longer holds seed material at that point. Callers pass the
-/// returned value directly to `NodeManager::new` — the closure shape is
-/// unchanged across the swap.
+/// Build a remote-signer-backed `NodeFactory` capturing the shared
+/// [`NodeDeps`] + [`SignerSessionRegistry`] via closure.
 #[must_use]
-pub fn node_factory(master_seed: [u8; 32], deps: NodeDeps) -> NodeFactory {
-    node_factory_with_lsp(master_seed, deps, None)
+pub fn node_factory(deps: NodeDeps, registry: Arc<SignerSessionRegistry>) -> NodeFactory {
+    node_factory_with_lsp(deps, registry, None)
 }
 
-/// Build a `NodeFactory` that wires every tenant Node as an LSPS2
-/// client of `lsp_peer` (when `Some`).
-///
-/// Distinct from [`node_factory`] only in the `with_liquidity_client(lsp_peer)`
-/// builder call. When `lsp_peer` is `None`, behaves identically to
-/// [`node_factory`].
+/// Variant that wires every tenant `Node` as an LSPS2 client of `lsp_peer`
+/// (when `Some`). Identical to [`node_factory`] otherwise.
 #[must_use]
 pub fn node_factory_with_lsp(
-    master_seed: [u8; 32],
     deps: NodeDeps,
+    registry: Arc<SignerSessionRegistry>,
     lsp_peer: Option<PublicKey>,
 ) -> NodeFactory {
-    Arc::new(move |tenant_id| {
-        let seed = derive_tenant_seed(&master_seed, tenant_id);
+    Arc::new(move |tenant_id: TenantId| {
         let deps = deps.clone();
-        let lsp_peer = lsp_peer;
+        let registry = Arc::clone(&registry);
         Box::pin(async move {
-            let signer = Arc::new(from_seed(seed));
+            let context_id = tenant_id.to_string();
+            let lookup = ConnLookup::new(context_id.clone(), registry);
+
+            // SignerOffline precheck: refuse cleanly before paying any
+            // wake cost. The gRPC layer maps this to
+            // `Status::failed_precondition("signer offline")` so the
+            // SDK can surface a clear "reconnect your signer" message.
+            if !lookup.is_ready() {
+                anyhow::bail!(
+                    "signer offline for tenant {tenant_id} — SDK must be attached to receive payments"
+                );
+            }
+
+            let signer = Arc::new(SignerSession::new(lookup));
+            signer
+                .init(deps.network.into())
+                .await
+                .with_context(|| format!("signer init failed for tenant {tenant_id}"))?;
+
             let mut builder =
-                NodeBuilder::<LocalKeysManager>::new(tenant_id, deps).with_signer(signer);
+                NodeBuilder::<SignerSession>::new(tenant_id, deps).with_signer(Arc::clone(&signer));
             if let Some(peer) = lsp_peer {
                 builder = builder.with_liquidity_client(peer);
             }

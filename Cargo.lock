@@ -4516,7 +4516,6 @@ dependencies = [
  "dashmap",
  "futures",
  "hex",
- "hmac",
  "lightning 0.2.2",
  "metrics",
  "parking_lot",
