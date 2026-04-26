@@ -303,32 +303,22 @@ impl NodeManager {
             .context("create tenant schema")?;
 
         // Spawn a long-lived actor starting in PARKED state (no node yet,
-        // no memory reserved). The first wake_loading call below reserves
-        // memory and installs the node via NodeCmd::Activate.
+        // no memory reserved). The first dispatch will wake-on-demand via
+        // `wake_loading`, which runs the factory and brings the tenant to
+        // ACTIVE.
+        //
+        // We deliberately do NOT call `self.wake()` here. The Phase-4
+        // factory builds `Node<wick_vls::SignerSession>` and refuses
+        // (`SignerOffline`) if the SDK side of the bidi signer stream is
+        // not attached. The SDK only opens that stream AFTER `create_tenant`
+        // returns it a bearer token (see `WickClient::register`), so an
+        // eager wake here would always fail at the chicken-and-egg edge.
+        // Lazy activation is the right shape — the factory runs on the
+        // first real operation, by which time the SDK signer is attached.
         let handle = NodeActor::spawn(tenant_id);
         self.nodes.insert(tenant_id, handle);
 
-        // Immediately activate — builds the node via factory and brings the
-        // tenant to ACTIVE. Returns an error if the factory fails.
-        //
-        // Distinguish corrupt-state failures from generic wake errors so
-        // the gRPC layer can return `FAILED_PRECONDITION` (don't retry;
-        // operator intervention required) instead of `INTERNAL` (transient).
-        // The factory bubbles `WickLightningError::PersistenceDecode`'s
-        // Display ("persistence decode failed …") through `anyhow::Error`.
-        self.wake(tenant_id).await.map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("persistence decode failed") {
-                ProvisionError::CorruptState {
-                    tenant: tenant_id,
-                    detail: msg,
-                }
-            } else {
-                ProvisionError::Other(e.context("initial node activation"))
-            }
-        })?;
-
-        info!(tenant = %tenant_id, "node provisioned and active");
+        info!(tenant = %tenant_id, "node provisioned (parked; activates on first use)");
         Ok(())
     }
 
