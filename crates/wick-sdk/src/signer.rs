@@ -501,3 +501,100 @@ fn encode_error(req_id: u32, err: &str) -> Vec<u8> {
     frame.extend_from_slice(bytes);
     frame
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn test_xprv() -> Xpriv {
+        // Deterministic seed → xprv for derivation tests. NOT a real wallet.
+        Xpriv::new_master(bitcoin::Network::Regtest, &[0x42; 32]).unwrap()
+    }
+
+    fn test_seed() -> [u8; 32] {
+        [0x11; 32]
+    }
+
+    #[test]
+    fn ldk_node_keys_derivation_is_deterministic() {
+        let seed = test_seed();
+        let (_, body1) = handle_get_ldk_node_keys(7, &[1], &seed).unwrap();
+        let (_, body2) = handle_get_ldk_node_keys(7, &[1], &seed).unwrap();
+        assert_eq!(body1, body2);
+        assert_eq!(body1.len(), 96);
+        // Three keys must differ (different domain-separated info strings).
+        assert_ne!(&body1[0..32], &body1[32..64]);
+        assert_ne!(&body1[32..64], &body1[64..96]);
+    }
+
+    #[test]
+    fn ldk_node_keys_rejects_unknown_version() {
+        let seed = test_seed();
+        let err = handle_get_ldk_node_keys(7, &[2], &seed).unwrap_err();
+        assert_eq!(err.0, 7);
+        assert!(err.1.contains("unsupported version"));
+    }
+
+    #[test]
+    fn wallet_address_derivation_round_trips() {
+        let xprv = test_xprv();
+        let payload = {
+            let mut p = vec![1];
+            p.extend_from_slice(&7u32.to_le_bytes());
+            p
+        };
+        let (_, body) = handle_get_wallet_address(9, &payload, &xprv, WickNetwork::Regtest).unwrap();
+
+        // [u16 LE addr_len][addr_bytes][script_pubkey]
+        assert!(body.len() > 2);
+        let addr_len = u16::from_le_bytes([body[0], body[1]]) as usize;
+        assert!(body.len() >= 2 + addr_len);
+        let addr = std::str::from_utf8(&body[2..2 + addr_len]).unwrap();
+        // Regtest P2WPKH addresses start with `bcrt1q`.
+        assert!(addr.starts_with("bcrt1q"), "expected bcrt1q…, got {addr}");
+
+        // Repeat — derivation must be deterministic for the same index.
+        let (_, body2) = handle_get_wallet_address(9, &payload, &xprv, WickNetwork::Regtest).unwrap();
+        assert_eq!(body, body2);
+    }
+
+    #[test]
+    fn wallet_address_rejects_short_payload() {
+        let xprv = test_xprv();
+        let err =
+            handle_get_wallet_address(9, &[1, 0, 0], &xprv, WickNetwork::Regtest).unwrap_err();
+        assert!(err.1.contains("too short"));
+    }
+
+    #[test]
+    fn unimplemented_extensions_return_explicit_errors() {
+        let xprv = test_xprv();
+        let seed = test_seed();
+        for type_be in [0xFD02u16, 0xFD03, 0xFD04] {
+            let err =
+                handle_extension(7, type_be, &[], &xprv, &seed, WickNetwork::Regtest).unwrap_err();
+            assert!(
+                err.1.contains("not implemented"),
+                "type 0x{type_be:04X}: {}",
+                err.1
+            );
+        }
+    }
+
+    #[test]
+    fn encode_success_layout() {
+        let frame = encode_success(0xDEAD_BEEF, vec![0xCA, 0xFE]);
+        assert_eq!(frame[..4], [0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(frame[4], 0x00);
+        assert_eq!(&frame[5..], &[0xCA, 0xFE]);
+    }
+
+    #[test]
+    fn encode_error_layout() {
+        let frame = encode_error(0x0000_0001, "boom");
+        assert_eq!(frame[..4], [0x00, 0x00, 0x00, 0x01]);
+        assert_eq!(frame[4], 0x01);
+        assert_eq!(&frame[5..], b"boom");
+    }
+}
