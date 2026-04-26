@@ -12,7 +12,40 @@ description = "LSP daemon — LiquidityManager wrapper, peer_registry, JIT chann
 workspace = true
 
 [dependencies]
-wick-core = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
+# Internal
+wick-core      = { workspace = true }
+wick-lightning = { workspace = true }
+
+# Async / runtime
+tokio       = { workspace = true }
+async-trait = { workspace = true }
+futures     = { workspace = true }
+
+# Errors / logging
+anyhow    = { workspace = true }
 thiserror = { workspace = true }
+tracing   = { workspace = true }
+
+# Concurrency
+dashmap = { workspace = true }
+
+# DB
+sqlx   = { workspace = true, features = ["chrono", "uuid"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid   = { workspace = true }
+
+# Crypto
+hmac      = { workspace = true }
+sha2      = { workspace = true }
+rand      = { workspace = true }
+secp256k1 = { workspace = true }
+
+# Serialisation
+serde      = { workspace = true }
+serde_json = { workspace = true }
+hex        = { workspace = true }
+
+# LDK
+lightning           = { workspace = true }
+lightning-liquidity = { workspace = true }
+bitcoin             = { workspace = true }
