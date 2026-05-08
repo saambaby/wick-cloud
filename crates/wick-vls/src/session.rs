@@ -65,6 +65,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 
 use crate::connection::SignerConnection;
+use crate::meta_store::{ChannelMetaStoreRef, StoredChannelMeta};
 use crate::registry::ConnLookup;
 use crate::rpc;
 
@@ -179,6 +180,15 @@ pub struct SignerSession {
     /// [`VlsRemoteChannelSigner`] vended out of this session so the
     /// callback can fire from inside `maybe_setup_channel`.
     signer_unblock: Arc<OnceLock<Box<dyn Fn() + Send + Sync>>>,
+
+    /// Optional durable backing for [`Self::channel_meta`] +
+    /// [`Self::channel_keys`]. When `Some`, every mutation to either map
+    /// is mirrored to the store via a fire-and-forget `tokio::spawn`, and
+    /// [`Self::rehydrate`] re-populates both maps + the global
+    /// `DBID_COUNTER` floor on boot. When `None` the session behaves
+    /// exactly as before (in-memory only — fine for unit tests, never
+    /// for production).
+    meta_store: Option<ChannelMetaStoreRef>,
 }
 
 impl std::fmt::Debug for SignerSession {
@@ -207,7 +217,111 @@ impl SignerSession {
             pending_outbound_push_by_user_channel_id: DashMap::new(),
             pending_outbound_push_by_channel_keys_id: DashMap::new(),
             signer_unblock: Arc::new(OnceLock::new()),
+            meta_store: None,
         }
+    }
+
+    /// Bind a durable [`ChannelMetaStore`] for write-through + restart
+    /// rehydration. Pass [`Self::rehydrate`] before
+    /// [`crate::SignerSession::init`] so LDK's first call into
+    /// `derive_channel_signer` sees the persisted `(channel_keys_id →
+    /// dbid, peer_id, pubkeys)` map.
+    #[must_use]
+    pub fn with_meta_store(mut self, store: ChannelMetaStoreRef) -> Self {
+        self.meta_store = Some(store);
+        self
+    }
+
+    /// Re-load every persisted [`ChannelMeta`] into the in-memory map and
+    /// raise the process-global `DBID_COUNTER` floor above the highest
+    /// persisted `dbid` so newly-allocated channels never collide with a
+    /// pre-restart channel. Idempotent.
+    ///
+    /// Call exactly once, after [`Self::with_meta_store`] and before
+    /// `NodeBuilder::build` invokes
+    /// `ChannelManager::read` (which is what calls
+    /// `derive_channel_signer` for every persisted channel).
+    pub async fn rehydrate(&self) -> anyhow::Result<()> {
+        let Some(store) = self.meta_store.as_ref() else {
+            return Ok(());
+        };
+        let rows = store.load_all().await?;
+        let mut max_dbid: u64 = 0;
+        for row in rows {
+            max_dbid = max_dbid.max(row.dbid);
+            // Reconstruct the in-memory `ChannelMeta`.
+            self.channel_meta.insert(
+                row.channel_keys_id,
+                ChannelMeta {
+                    dbid: row.dbid,
+                    peer_id: row.peer_id,
+                    setup_funding: row.setup_funding,
+                    push_value_msat: row.push_value_msat,
+                },
+            );
+            // If we have the cached basepoints, re-hydrate `channel_keys`
+            // too — `derive_channel_signer` will then short-circuit on
+            // the cache hit instead of hitting the SDK.
+            if let Some(blob) = row.pubkeys {
+                if let Some(keys) = decode_pubkeys_blob(&blob) {
+                    let destination_script = match self.node_pubkey.get() {
+                        Some(pk) => shutdown_script_from_pubkey(*pk).into_inner(),
+                        None => bitcoin::ScriptBuf::new(),
+                    };
+                    self.channel_keys.insert(
+                        row.channel_keys_id,
+                        CachedChannelKeys {
+                            pubkeys: keys,
+                            destination_script,
+                        },
+                    );
+                }
+            }
+        }
+        // Lift the global counter to max+1 so a fresh `alloc_dbid` post-
+        // restart never overlaps a persisted channel. `fetch_max` is
+        // monotonic — concurrent restarts are still safe.
+        if max_dbid > 0 {
+            DBID_COUNTER.fetch_max(max_dbid.saturating_add(1), Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Snapshot the in-memory state for `channel_keys_id` and fire-and-
+    /// forget write it to the store on a tokio task. No-op when no store
+    /// is bound. Failures are logged but never propagated — Postgres is
+    /// the journal, the in-memory map is authoritative for live calls.
+    fn persist_meta(&self, channel_keys_id: [u8; 32]) {
+        let Some(store) = self.meta_store.as_ref().cloned() else {
+            return;
+        };
+        let Some(meta_ref) = self.channel_meta.get(&channel_keys_id) else {
+            return;
+        };
+        let pubkeys_blob = self
+            .channel_keys
+            .get(&channel_keys_id)
+            .map(|c| encode_pubkeys_blob(&c.pubkeys));
+        let snapshot = StoredChannelMeta {
+            channel_keys_id,
+            dbid: meta_ref.dbid,
+            peer_id: meta_ref.peer_id,
+            setup_funding: meta_ref.setup_funding,
+            push_value_msat: meta_ref.push_value_msat,
+            pubkeys: pubkeys_blob,
+        };
+        drop(meta_ref);
+        let ctx = self.lookup.context_id().to_string();
+        tokio::spawn(async move {
+            if let Err(e) = store.upsert(snapshot).await {
+                tracing::warn!(
+                    target: "wick_vls",
+                    ctx = %ctx,
+                    error = %e,
+                    "ChannelMetaStore::upsert failed (write-through; in-memory state still authoritative)"
+                );
+            }
+        });
     }
 
     /// Negotiate VLS `HsmdInit2` + fetch LDK-only node keys. Must run after
@@ -373,6 +487,7 @@ impl SignerSession {
             },
             channel_meta: Arc::clone(&self.channel_meta),
             signer_unblock: Arc::clone(&self.signer_unblock),
+            meta_store: self.meta_store.clone(),
             failed: true,
         }
     }
@@ -547,6 +662,7 @@ impl SignerProvider for SignerSession {
                 pubkeys: keys.pubkeys.clone(),
                 channel_meta: Arc::clone(&self.channel_meta),
                 signer_unblock: Arc::clone(&self.signer_unblock),
+                meta_store: self.meta_store.clone(),
                 failed: false,
             };
         }
@@ -568,6 +684,7 @@ impl SignerProvider for SignerSession {
                         push_value_msat: self.drain_pending_push(&channel_keys_id),
                     },
                 );
+                self.persist_meta(channel_keys_id);
                 return self.make_failed_channel_signer(channel_keys_id, dbid);
             }
         };
@@ -614,6 +731,7 @@ impl SignerProvider for SignerSession {
                         destination_script,
                     },
                 );
+                self.persist_meta(channel_keys_id);
                 VlsRemoteChannelSigner {
                     lookup: self.lookup.clone(),
                     channel_keys_id,
@@ -622,6 +740,7 @@ impl SignerProvider for SignerSession {
                     pubkeys,
                     channel_meta: Arc::clone(&self.channel_meta),
                     signer_unblock: Arc::clone(&self.signer_unblock),
+                    meta_store: self.meta_store.clone(),
                     failed: false,
                 }
             }
@@ -756,6 +875,35 @@ impl OutputSpender for SignerSession {
     }
 }
 
+/// Concatenate the 5 channel basepoints into a flat 165-byte blob for
+/// persistence. Order is fixed: funding, revocation, payment,
+/// delayed_payment, htlc — matches the layout of
+/// `vls_protocol::msgs::GetChannelBasepointsReply` so reads are stable
+/// across restarts.
+fn encode_pubkeys_blob(pubkeys: &ChannelPublicKeys) -> [u8; 165] {
+    let mut out = [0u8; 165];
+    out[0..33].copy_from_slice(&pubkeys.funding_pubkey.serialize());
+    out[33..66].copy_from_slice(&pubkeys.revocation_basepoint.0.serialize());
+    out[66..99].copy_from_slice(&pubkeys.payment_point.serialize());
+    out[99..132].copy_from_slice(&pubkeys.delayed_payment_basepoint.0.serialize());
+    out[132..165].copy_from_slice(&pubkeys.htlc_basepoint.0.serialize());
+    out
+}
+
+/// Inverse of [`encode_pubkeys_blob`]. Returns `None` if any of the five
+/// 33-byte slots fail to parse — the row is then logged + skipped by
+/// `rehydrate`.
+fn decode_pubkeys_blob(blob: &[u8; 165]) -> Option<ChannelPublicKeys> {
+    let parse = |off: usize| PublicKey::from_slice(&blob[off..off + 33]).ok();
+    Some(ChannelPublicKeys {
+        funding_pubkey: parse(0)?,
+        revocation_basepoint: RevocationBasepoint::from(parse(33)?),
+        payment_point: parse(66)?,
+        delayed_payment_basepoint: DelayedPaymentBasepoint::from(parse(99)?),
+        htlc_basepoint: HtlcBasepoint::from(parse(132)?),
+    })
+}
+
 fn estimate_p2wpkh_tx_vbytes(num_inputs: usize, num_outputs: usize) -> u64 {
     // P2WPKH approximation: base 10, ~68 vB/input, ~31 vB/output.
     10 + (num_inputs as u64) * 68 + (num_outputs as u64) * 31
@@ -798,6 +946,11 @@ pub struct VlsRemoteChannelSigner {
     /// signing call returns `Err(())` immediately so LDK force-closes the
     /// channel cleanly rather than producing invalid signatures.
     failed: bool,
+
+    /// Optional durable backing — fired from
+    /// [`Self::maybe_setup_channel`] once `setup_funding` is promoted so
+    /// a restart sees the SetupChannel-completed state.
+    meta_store: Option<ChannelMetaStoreRef>,
 }
 
 impl std::fmt::Debug for VlsRemoteChannelSigner {
@@ -852,6 +1005,44 @@ impl VlsRemoteChannelSigner {
         if let Some(cb) = self.signer_unblock.get() {
             cb();
         }
+    }
+
+    /// Snapshot the post-`SetupChannel` `ChannelMeta` and write it to the
+    /// store on a tokio task. No-op when no store is bound. Failures are
+    /// logged-and-swallowed; the in-memory map is authoritative for live
+    /// calls (Postgres is the journal).
+    fn persist_meta_after_setup(&self) {
+        let Some(store) = self.meta_store.as_ref().cloned() else {
+            return;
+        };
+        let Some(meta_ref) = self.channel_meta.get(&self.channel_keys_id) else {
+            return;
+        };
+        let snapshot = StoredChannelMeta {
+            channel_keys_id: self.channel_keys_id,
+            dbid: meta_ref.dbid,
+            peer_id: meta_ref.peer_id,
+            setup_funding: meta_ref.setup_funding,
+            push_value_msat: meta_ref.push_value_msat,
+            // The basepoints blob doesn't change at SetupChannel time;
+            // the prior `derive_channel_signer` row already persisted
+            // them. Leave it `None` to keep the upsert column count
+            // small — the store is expected to preserve `pubkeys` if
+            // already set (see `PgChannelMetaStore::upsert`).
+            pubkeys: Some(encode_pubkeys_blob(&self.pubkeys)),
+        };
+        drop(meta_ref);
+        let ctx = self.lookup.context_id().to_string();
+        tokio::spawn(async move {
+            if let Err(e) = store.upsert(snapshot).await {
+                tracing::warn!(
+                    target: "wick_vls",
+                    ctx = %ctx,
+                    error = %e,
+                    "ChannelMetaStore::upsert (setup) failed"
+                );
+            }
+        });
     }
 
     /// Ensure the VLS-side channel is promoted to its real counterparty
@@ -923,6 +1114,7 @@ impl VlsRemoteChannelSigner {
         if let Some(mut meta) = self.channel_meta.get_mut(&self.channel_keys_id) {
             meta.setup_funding = Some(target_funding);
         }
+        self.persist_meta_after_setup();
 
         // Setup just landed — wake any `ChannelSigner` calls that returned
         // `Err(())` (via `await_setup`) while `setup_funding` was still
@@ -1576,5 +1768,161 @@ impl EcdsaChannelSigner for VlsRemoteChannelSigner {
             }
         };
         Signature::from_compact(&sig64).unwrap_or_else(|_| sentinel_signature())
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    //! Restart-load coverage for the persisted-meta path.
+    //!
+    //! These are pure unit tests — no Postgres, no SDK. They exercise
+    //! the in-memory state machine of `SignerSession` against a faked
+    //! [`crate::ChannelMetaStore`] and verify that:
+    //!
+    //! 1. `derive_channel_signer` writes through to the store on every
+    //!    insert / update.
+    //! 2. A fresh session pointed at the same store rehydrates the
+    //!    `(channel_keys_id → dbid, peer_id, pubkeys, setup_funding)`
+    //!    map and a subsequent `derive_channel_signer` returns a
+    //!    Ready signer (not a `failed` placeholder) without re-issuing
+    //!    `GetChannelBasepoints` to a (possibly absent) signer
+    //!    connection.
+    //! 3. The global `DBID_COUNTER` is lifted past the highest
+    //!    persisted dbid.
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use lightning::sign::SignerProvider as _;
+
+    use super::*;
+    use crate::meta_store::{ChannelMetaStore, StoredChannelMeta};
+    use crate::registry::SignerSessionRegistry;
+
+    /// Minimal in-memory [`ChannelMetaStore`] that mirrors the Postgres
+    /// upsert semantics (last-write-wins on `channel_keys_id`, with
+    /// `pubkeys` preserved if a later upsert passes `None`).
+    #[derive(Debug, Default)]
+    struct FakeStore {
+        rows: Mutex<Vec<StoredChannelMeta>>,
+    }
+
+    impl FakeStore {
+        fn snapshot(&self) -> Vec<StoredChannelMeta> {
+            self.rows.lock().expect("fake store mutex").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ChannelMetaStore for FakeStore {
+        async fn load_all(&self) -> anyhow::Result<Vec<StoredChannelMeta>> {
+            Ok(self.snapshot())
+        }
+        async fn upsert(&self, meta: StoredChannelMeta) -> anyhow::Result<()> {
+            let mut rows = self.rows.lock().expect("fake store mutex");
+            if let Some(existing) =
+                rows.iter_mut().find(|r| r.channel_keys_id == meta.channel_keys_id)
+            {
+                let preserved_pubkeys = meta.pubkeys.or(existing.pubkeys);
+                *existing = StoredChannelMeta {
+                    pubkeys: preserved_pubkeys,
+                    ..meta
+                };
+            } else {
+                rows.push(meta);
+            }
+            Ok(())
+        }
+    }
+
+    fn fresh_session_with_store(store: Arc<FakeStore>) -> Arc<SignerSession> {
+        let registry = Arc::new(SignerSessionRegistry::new());
+        let lookup = ConnLookup::new(format!("ctx-{}", rand::random::<u64>()), registry);
+        Arc::new(SignerSession::new(lookup).with_meta_store(store))
+    }
+
+    /// Persisting a row offline (signer not attached) lets a fresh
+    /// session reattach to the same `(channel_keys_id, dbid)` after
+    /// rehydrate. The new `derive_channel_signer` short-circuits on
+    /// the cache hit (we wrote pubkeys synthetically) and does NOT
+    /// allocate a fresh dbid.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rehydrate_restores_dbid_and_pubkeys() {
+        let store = Arc::new(FakeStore::default());
+        let channel_keys_id = [0xAAu8; 32];
+
+        // Hand-craft a row that mimics what the live path persists
+        // after `GetChannelBasepoints` returns. We use the sentinel
+        // pubkey for all 5 basepoints — this test only cares about
+        // the round-trip, not the cryptographic validity.
+        let pubkey = SENTINEL_PUBKEY;
+        let mut blob = [0u8; 165];
+        for chunk in blob.chunks_mut(33) {
+            chunk.copy_from_slice(&pubkey);
+        }
+        store
+            .upsert(StoredChannelMeta {
+                channel_keys_id,
+                dbid: 4242,
+                peer_id: SENTINEL_PUBKEY,
+                setup_funding: None,
+                push_value_msat: 100_000,
+                pubkeys: Some(blob),
+            })
+            .await
+            .expect("seed");
+
+        let session = fresh_session_with_store(Arc::clone(&store));
+        session.rehydrate().await.expect("rehydrate");
+
+        // dbid floor lifted past the persisted value.
+        assert!(DBID_COUNTER.load(Ordering::Relaxed) >= 4243);
+
+        // Cache hit on derive_channel_signer — no SDK call, returns a
+        // non-failed signer bound to the persisted dbid.
+        let signer = session.derive_channel_signer(channel_keys_id);
+        assert_eq!(signer.dbid, 4242);
+        assert!(!signer.failed, "expected Ready signer after rehydrate");
+
+        // Pubkeys faithfully reconstructed.
+        assert_eq!(
+            signer.pubkeys.funding_pubkey.serialize(),
+            SENTINEL_PUBKEY,
+            "funding_pubkey should round-trip via blob"
+        );
+    }
+
+    /// `derive_channel_signer` writes through on the offline-derive
+    /// path so an immediate restart sees the row even if the SDK was
+    /// never reachable for `GetChannelBasepoints`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn offline_derive_persists_dbid_binding() {
+        let store = Arc::new(FakeStore::default());
+        let session = fresh_session_with_store(Arc::clone(&store));
+
+        // No SDK attached → `active_conn_if_ready` returns Err →
+        // session takes the offline branch.
+        let channel_keys_id = [0x55u8; 32];
+        let signer = session.derive_channel_signer(channel_keys_id);
+        assert!(signer.failed, "expected failed signer in offline branch");
+
+        // Yield so the spawned upsert future runs.
+        tokio::task::yield_now().await;
+        // Sometimes the runtime needs a small nudge for the spawned
+        // task to flush; spin with `yield_now` up to 50 times.
+        for _ in 0..50 {
+            if !store.snapshot().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let rows = store.snapshot();
+        assert_eq!(rows.len(), 1, "exactly one row persisted");
+        assert_eq!(rows[0].channel_keys_id, channel_keys_id);
+        assert_eq!(rows[0].dbid, signer.dbid);
+        assert!(
+            rows[0].pubkeys.is_none(),
+            "offline derive has no basepoints to persist yet"
+        );
     }
 }

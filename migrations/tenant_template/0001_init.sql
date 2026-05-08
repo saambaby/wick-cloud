@@ -82,3 +82,32 @@ CREATE TABLE IF NOT EXISTS "{{SCHEMA}}".pending_funding (
 
 CREATE INDEX IF NOT EXISTS pending_funding_parked_at_idx
     ON "{{SCHEMA}}".pending_funding(parked_at);
+
+-- Per-tenant signer state needed to reattach a VLS-backed `SignerSession`
+-- after a wick-server restart. LDK rehydrates `ChannelMonitor`s + the
+-- `ChannelManager` from `monitors` / `channel_manager_state`; for every
+-- restored channel it then calls `SignerProvider::derive_channel_signer`,
+-- which must hand back a signer bound to the SAME `dbid` + cached
+-- pubkeys the SDK last used — otherwise VLS sees a fresh `dbid` and
+-- rejects every subsequent signing call with "channel not found".
+--
+-- One row per VLS channel; `channel_keys_id` is the canonical identity
+-- LDK uses, `dbid` is the protocol-level field VLS keys per-channel
+-- state on. `pubkeys` is the 5×33-byte concatenation of
+-- (funding, revocation, payment, delayed_payment, htlc) basepoints
+-- returned by the SDK's `GetChannelBasepoints` reply. `peer_id` stays
+-- the SENTINEL_PUBKEY until `SetupChannel` lands; once it does,
+-- `setup_funding_txid` + `setup_funding_index` mark the channel as
+-- promoted so a fresh `SignerSession` skips the redundant SetupChannel
+-- on restart.
+CREATE TABLE IF NOT EXISTS "{{SCHEMA}}".signer_channel_meta (
+    channel_keys_id      BYTEA PRIMARY KEY,
+    dbid                 BIGINT NOT NULL,
+    peer_id              BYTEA NOT NULL,
+    setup_funding_txid   BYTEA,
+    setup_funding_index  INTEGER,
+    push_value_msat      BIGINT NOT NULL DEFAULT 0,
+    pubkeys              BYTEA,
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+

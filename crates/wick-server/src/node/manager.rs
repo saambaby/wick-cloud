@@ -1243,6 +1243,25 @@ impl NodeManager {
                 r#"CREATE INDEX IF NOT EXISTS pending_funding_parked_at_idx
    ON "{schema}".pending_funding(parked_at)"#
             ),
+            // Signer-side per-channel state. Lets `SignerSession` rehydrate
+            // its `(channel_keys_id → dbid, peer_id, pubkeys, setup_funding)`
+            // map after a wick-server restart so LDK's
+            // `derive_channel_signer` returns a signer bound to the SAME
+            // `dbid` + cached pubkeys the SDK last used. Without this, every
+            // post-restart signing call would allocate a fresh `dbid` and
+            // VLS would reject with "channel not found".
+            format!(
+                r#"CREATE TABLE IF NOT EXISTS "{schema}".signer_channel_meta (
+    channel_keys_id      BYTEA PRIMARY KEY,
+    dbid                 BIGINT NOT NULL,
+    peer_id              BYTEA NOT NULL,
+    setup_funding_txid   BYTEA,
+    setup_funding_index  INTEGER,
+    push_value_msat      BIGINT NOT NULL DEFAULT 0,
+    pubkeys              BYTEA,
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+)"#
+            ),
         ]
     }
 }

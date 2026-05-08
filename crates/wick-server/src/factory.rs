@@ -24,9 +24,10 @@ use anyhow::Context as _;
 use bitcoin::secp256k1::PublicKey;
 use wick_core::TenantId;
 use wick_lightning::{NodeApi, NodeBuilder, NodeDeps};
-use wick_vls::{ConnLookup, SignerSession, SignerSessionRegistry};
+use wick_vls::{ChannelMetaStoreRef, ConnLookup, SignerSession, SignerSessionRegistry};
 
 use crate::node::manager::NodeFactory;
+use crate::signer_meta_store::PgChannelMetaStore;
 
 /// Build a remote-signer-backed `NodeFactory` capturing the shared
 /// [`NodeDeps`] + [`SignerSessionRegistry`] via closure.
@@ -60,7 +61,28 @@ pub fn node_factory_with_lsp(
                 );
             }
 
-            let signer = Arc::new(SignerSession::new(lookup));
+            // Bind a Postgres-backed `ChannelMetaStore` so the
+            // session's per-channel `(dbid, peer_id, pubkeys,
+            // setup_funding)` map survives a wick-server restart. LDK
+            // calls `derive_channel_signer` for every persisted channel
+            // during `ChannelManager::read`, and that path needs the
+            // ORIGINAL `dbid` — otherwise VLS rejects every signing
+            // call after restart with "channel not found".
+            let meta_store: ChannelMetaStoreRef = Arc::new(PgChannelMetaStore::new(
+                tenant_id,
+                deps.pg_pool.clone(),
+            ));
+            let signer =
+                Arc::new(SignerSession::new(lookup).with_meta_store(Arc::clone(&meta_store)));
+
+            // Rehydrate BEFORE init() / NodeBuilder::build so LDK's
+            // first `derive_channel_signer` call hits the cache that
+            // `rehydrate` populates rather than allocating a fresh dbid.
+            signer
+                .rehydrate()
+                .await
+                .with_context(|| format!("signer rehydrate failed for tenant {tenant_id}"))?;
+
             signer
                 .init(deps.network.into())
                 .await

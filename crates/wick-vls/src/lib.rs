@@ -35,11 +35,13 @@
 //!   so the LDK adapter stays free of `vls_protocol` types.
 
 mod connection;
+mod meta_store;
 mod registry;
 mod session;
 
 pub mod rpc;
 
 pub use connection::SignerConnection;
+pub use meta_store::{ChannelMetaStore, ChannelMetaStoreRef, StoredChannelMeta};
 pub use registry::{ConnLookup, OutboundSignerFrame, SignerSessionRegistry, StateSyncChannel};
 pub use session::{SignerSession, VlsRemoteChannelSigner};
