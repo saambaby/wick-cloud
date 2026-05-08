@@ -25,7 +25,14 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Process-wide dbid allocator. VLS keys per-channel state on `dbid`; two
+/// tenants in the same `wick-server` process previously seeded their
+/// per-session counters from `unix_ts * 100_000` and could collide when
+/// constructed inside the same second. A single atomic eliminates the
+/// collision and is cheaper than the per-session field. Starts at 1
+/// because VLS reserves 0 for the node-level dbid.
+static DBID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 use bitcoin::hashes::Hash as _;
 use bitcoin::psbt::Psbt;
@@ -87,13 +94,6 @@ fn sentinel_pubkey() -> PublicKey {
 fn sentinel_signature() -> Signature {
     Signature::from_der(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01])
         .expect("sentinel DER is always valid")
-}
-
-fn now_unix_ts() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 /// Derive the P2WPKH shutdown script from a node pubkey. Matches the
@@ -172,11 +172,13 @@ pub struct SignerSession {
     /// will move into the new `ChannelMeta::push_value_msat`.
     pending_outbound_push_by_channel_keys_id: DashMap<[u8; 32], u64>,
 
-    /// Monotonic dbid counter seeded from `unix_ts * 100_000` so distinct
-    /// process restarts allocate non-overlapping dbid ranges. VLS's
-    /// per-channel state is keyed on dbid; collisions across restarts would
-    /// confuse the signer's history.
-    dbid_counter: AtomicU64,
+    /// Callback fired when a `SetupChannel` lands and unblocks any
+    /// previously-parked `ChannelSigner` calls. The builder wires this to
+    /// `ChannelManager::signer_unblocked(None)` so LDK retries the parked
+    /// channel instead of waiting on a 1s timer. Shared with each
+    /// [`VlsRemoteChannelSigner`] vended out of this session so the
+    /// callback can fire from inside `maybe_setup_channel`.
+    signer_unblock: Arc<OnceLock<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl std::fmt::Debug for SignerSession {
@@ -194,7 +196,6 @@ impl SignerSession {
     /// material; the SDK-side stream attaches via the registry separately.
     #[must_use]
     pub fn new(lookup: ConnLookup) -> Self {
-        let seed = now_unix_ts().saturating_mul(100_000);
         Self {
             lookup,
             node_pubkey: OnceLock::new(),
@@ -205,7 +206,7 @@ impl SignerSession {
             channel_meta: Arc::new(DashMap::new()),
             pending_outbound_push_by_user_channel_id: DashMap::new(),
             pending_outbound_push_by_channel_keys_id: DashMap::new(),
-            dbid_counter: AtomicU64::new(seed),
+            signer_unblock: Arc::new(OnceLock::new()),
         }
     }
 
@@ -250,6 +251,15 @@ impl SignerSession {
     #[must_use]
     pub fn is_signer_active(&self) -> bool {
         self.lookup.is_ready()
+    }
+
+    /// Install a callback fired by [`VlsRemoteChannelSigner::maybe_setup_channel`]
+    /// once `SetupChannel` lands and unblocks previously-parked
+    /// `ChannelSigner` calls. The builder wires this to
+    /// `ChannelManager::signer_unblocked(None)` so LDK retries the parked
+    /// channel via the async-signer-pending protocol.
+    pub fn set_signer_unblock(&self, cb: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.signer_unblock.set(cb);
     }
 
     /// Stage a push-msat for an outbound channel open. Called by
@@ -340,7 +350,7 @@ impl SignerSession {
     }
 
     fn alloc_dbid(&self) -> u64 {
-        self.dbid_counter.fetch_add(1, Ordering::Relaxed)
+        DBID_COUNTER.fetch_add(1, Ordering::Relaxed)
     }
 
     fn make_failed_channel_signer(
@@ -362,6 +372,7 @@ impl SignerSession {
                 htlc_basepoint: HtlcBasepoint::from(sentinel),
             },
             channel_meta: Arc::clone(&self.channel_meta),
+            signer_unblock: Arc::clone(&self.signer_unblock),
             failed: true,
         }
     }
@@ -387,6 +398,10 @@ impl wick_lightning::WickSigner for SignerSession {
 
     fn clear_outbound_channel_open(&self, user_channel_id: u128) {
         SignerSession::clear_outbound_channel_open(self, user_channel_id);
+    }
+
+    fn set_signer_unblock_callback(&self, cb: Box<dyn Fn() + Send + Sync>) {
+        SignerSession::set_signer_unblock(self, cb);
     }
 }
 
@@ -472,7 +487,7 @@ impl NodeSigner for SignerSession {
         let conn = self.active_conn_if_ready()?;
         let sig64 =
             block_vls!(rpc::rpc_sign_bolt12_invoice(&conn, merkle_root)).map_err(|e| {
-                tracing::error!(target: "wick_vls", %e, "sign_bolt12_invoice failed");
+                tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, "sign_bolt12_invoice failed");
             })?;
         schnorr::Signature::from_slice(&sig64).map_err(|_| ())
     }
@@ -531,6 +546,7 @@ impl SignerProvider for SignerSession {
                 peer_id: meta.peer_id,
                 pubkeys: keys.pubkeys.clone(),
                 channel_meta: Arc::clone(&self.channel_meta),
+                signer_unblock: Arc::clone(&self.signer_unblock),
                 failed: false,
             };
         }
@@ -605,12 +621,14 @@ impl SignerProvider for SignerSession {
                     peer_id: SENTINEL_PUBKEY,
                     pubkeys,
                     channel_meta: Arc::clone(&self.channel_meta),
+                    signer_unblock: Arc::clone(&self.signer_unblock),
                     failed: false,
                 }
             }
             Err(e) => {
                 tracing::error!(
                     target: "wick_vls",
+                    ctx = %self.lookup.context_id(),
                     ?channel_keys_id,
                     dbid,
                     %e,
@@ -684,6 +702,7 @@ impl OutputSpender for SignerSession {
                 _ => {
                     tracing::warn!(
                         target: "wick_vls",
+                        ctx = %self.lookup.context_id(),
                         "spend_spendable_outputs: unsupported descriptor variant (channel-key sweep not implemented)"
                     );
                     return Err(());
@@ -729,7 +748,7 @@ impl OutputSpender for SignerSession {
             withdrawal_utxos
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, "rpc_sign_withdrawal failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, "rpc_sign_withdrawal failed");
         })?;
 
         let signed = Psbt::deserialize(&signed_psbt_bytes).map_err(|_| ())?;
@@ -769,6 +788,12 @@ pub struct VlsRemoteChannelSigner {
     /// promotions land here without rebuilding the signer.
     channel_meta: Arc<DashMap<[u8; 32], ChannelMeta>>,
 
+    /// Shared signer-unblock callback (installed by the builder on the
+    /// parent `SignerSession`). Fired from `maybe_setup_channel` once
+    /// `SetupChannel` lands so LDK retries the parked channel via
+    /// `ChannelManager::signer_unblocked`.
+    signer_unblock: Arc<OnceLock<Box<dyn Fn() + Send + Sync>>>,
+
     /// `true` if `GetChannelBasepoints` failed at construction — every
     /// signing call returns `Err(())` immediately so LDK force-closes the
     /// channel cleanly rather than producing invalid signatures.
@@ -805,28 +830,28 @@ impl VlsRemoteChannelSigner {
             .unwrap_or(false)
     }
 
-    /// Wait (up to ~5s) for `SetupChannel` to land before serving a
+    /// Probe whether `SetupChannel` has landed before serving a
     /// `ChannelSigner` method that has no `ChannelTransactionParameters`
     /// argument (and therefore can't call `maybe_setup_channel` itself).
     ///
-    /// Returning `Err(())` from a `ChannelSigner` method causes LDK to
-    /// disable the channel rather than retry, so this short async wait
-    /// is the safest gap-filler when the underlying race resolves quickly
-    /// (the concurrent `EcdsaChannelSigner` call holds a `block_vls!`
-    /// future that flips `setup_funding` shortly after this fires).
+    /// Non-blocking: returns `Err(())` immediately when setup hasn't
+    /// landed yet. LDK 0.2's async-signer-pending protocol will retry
+    /// once `maybe_setup_channel` (running concurrently from a sibling
+    /// `EcdsaChannelSigner` call that *does* receive
+    /// `ChannelTransactionParameters`) flips `setup_funding` and fires
+    /// the signer-unblock callback wired by the builder.
     fn await_setup(&self) -> Result<(), ()> {
         if self.channel_is_set_up() {
-            return Ok(());
-        }
-        block_vls!(async {
-            for _ in 0..100 {
-                if self.channel_is_set_up() {
-                    return Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
+            Ok(())
+        } else {
             Err(())
-        })
+        }
+    }
+
+    fn fire_signer_unblock(&self) {
+        if let Some(cb) = self.signer_unblock.get() {
+            cb();
+        }
     }
 
     /// Ensure the VLS-side channel is promoted to its real counterparty
@@ -892,12 +917,19 @@ impl VlsRemoteChannelSigner {
             channel_type,
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, "setup_channel failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, "setup_channel failed");
         })?;
 
         if let Some(mut meta) = self.channel_meta.get_mut(&self.channel_keys_id) {
             meta.setup_funding = Some(target_funding);
         }
+
+        // Setup just landed — wake any `ChannelSigner` calls that returned
+        // `Err(())` (via `await_setup`) while `setup_funding` was still
+        // `None`. LDK 0.2's async-signer-pending protocol retries them on
+        // `ChannelManager::signer_unblocked`, which the builder wires to
+        // this callback.
+        self.fire_signer_unblock();
 
         Ok(())
     }
@@ -929,7 +961,7 @@ impl ChannelSigner for VlsRemoteChannelSigner {
             &conn, self.dbid, peer_id, idx
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, idx, "get_per_commitment_point failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, idx, "get_per_commitment_point failed");
         })?;
         PublicKey::from_slice(&bytes).map_err(|_| ())
     }
@@ -946,7 +978,7 @@ impl ChannelSigner for VlsRemoteChannelSigner {
             &conn, self.dbid, peer_id, idx
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, idx, "release_commitment_secret failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, idx, "release_commitment_secret failed");
         })
     }
 
@@ -969,6 +1001,7 @@ impl ChannelSigner for VlsRemoteChannelSigner {
         if !self.channel_is_set_up() {
             tracing::debug!(
                 target: "wick_vls",
+                ctx = %self.lookup.context_id(),
                 dbid = self.dbid,
                 "validate_holder_commitment: channel not set up — deferring to sign_holder_commitment"
             );
@@ -1014,7 +1047,7 @@ impl ChannelSigner for VlsRemoteChannelSigner {
             htlc_sigs,
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, commitment_number, "validate_holder_commitment failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, commitment_number, "validate_holder_commitment failed");
         })?;
         Ok(())
     }
@@ -1033,7 +1066,7 @@ impl ChannelSigner for VlsRemoteChannelSigner {
             secret.secret_bytes(),
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, idx, "validate_counterparty_revocation failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, idx, "validate_counterparty_revocation failed");
         })
     }
 
@@ -1056,7 +1089,7 @@ impl ChannelSigner for VlsRemoteChannelSigner {
         )) {
             Ok(pk) => PublicKey::from_slice(&pk).unwrap_or(self.pubkeys.funding_pubkey),
             Err(e) => {
-                tracing::warn!(target: "wick_vls", %e, dbid = self.dbid, "new_funding_pubkey extension unavailable; using cached funding key");
+                tracing::warn!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, "new_funding_pubkey extension unavailable; using cached funding key");
                 self.pubkeys.funding_pubkey
             }
         }
@@ -1128,7 +1161,7 @@ impl EcdsaChannelSigner for VlsRemoteChannelSigner {
             htlcs,
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, commitment_number, "sign_counterparty_commitment failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, commitment_number, "sign_counterparty_commitment failed");
         })?;
 
         let commitment_sig = Signature::from_compact(&commitment_sig_bytes).map_err(|_| ())?;
@@ -1160,7 +1193,7 @@ impl EcdsaChannelSigner for VlsRemoteChannelSigner {
             commitment_number
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, commitment_number, "sign_holder_commitment failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, commitment_number, "sign_holder_commitment failed");
         })?;
         Signature::from_compact(&sig_bytes).map_err(|_| ())
     }
@@ -1222,7 +1255,7 @@ impl EcdsaChannelSigner for VlsRemoteChannelSigner {
             wscript.to_bytes(),
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, input, "sign_justice_revoked_output failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, input, "sign_justice_revoked_output failed");
         })?;
         Signature::from_compact(&sig_bytes).map_err(|_| ())
     }
@@ -1279,7 +1312,7 @@ impl EcdsaChannelSigner for VlsRemoteChannelSigner {
             wscript.to_bytes(),
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, input, "sign_justice_revoked_htlc failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, input, "sign_justice_revoked_htlc failed");
         })?;
         Signature::from_compact(&sig_bytes).map_err(|_| ())
     }
@@ -1309,7 +1342,7 @@ impl EcdsaChannelSigner for VlsRemoteChannelSigner {
             htlc_descriptor.htlc.payment_hash.0,
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, input, "sign_holder_htlc_transaction failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, input, "sign_holder_htlc_transaction failed");
         })?;
         Signature::from_compact(&sig_bytes).map_err(|_| ())
     }
@@ -1368,7 +1401,7 @@ impl EcdsaChannelSigner for VlsRemoteChannelSigner {
                 .supports_anchors_zero_fee_htlc_tx(),
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, input, "sign_counterparty_htlc_transaction failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, input, "sign_counterparty_htlc_transaction failed");
         })?;
         Signature::from_compact(&sig_bytes).map_err(|_| ())
     }
@@ -1395,7 +1428,7 @@ impl EcdsaChannelSigner for VlsRemoteChannelSigner {
             closing_tx.to_counterparty_script().to_bytes(),
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, "sign_closing_transaction failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, "sign_closing_transaction failed");
         })?;
         Signature::from_compact(&sig_bytes).map_err(|_| ())
     }
@@ -1443,7 +1476,7 @@ impl EcdsaChannelSigner for VlsRemoteChannelSigner {
             vec![utxo],
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, input, "sign_holder_keyed_anchor_input failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, input, "sign_holder_keyed_anchor_input failed");
         })?;
 
         let signed_psbt = Psbt::deserialize(&signed_psbt_bytes).map_err(|_| ())?;
@@ -1474,7 +1507,7 @@ impl EcdsaChannelSigner for VlsRemoteChannelSigner {
             bytes,
         ))
         .map_err(|e| {
-            tracing::error!(target: "wick_vls", %e, dbid = self.dbid, "sign_channel_announcement failed");
+            tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, "sign_channel_announcement failed");
         })?;
         Signature::from_compact(&sig_bytes).map_err(|_| ())
     }
@@ -1538,7 +1571,7 @@ impl EcdsaChannelSigner for VlsRemoteChannelSigner {
         )) {
             Ok(sig) => sig,
             Err(e) => {
-                tracing::error!(target: "wick_vls", %e, dbid = self.dbid, input_index, "sign_splice_shared_input failed");
+                tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, input_index, "sign_splice_shared_input failed");
                 return sentinel_signature();
             }
         };

@@ -57,6 +57,18 @@ pub trait WickSigner:
     /// error or a `OpenChannelInit` timeout) so the staging map doesn't
     /// leak. No-op for non-VLS signers.
     fn clear_outbound_channel_open(&self, _user_channel_id: u128) {}
+
+    /// Install a callback the signer invokes whenever an internal state
+    /// transition (e.g. delivery of `SetupChannel` on a VLS-backed signer)
+    /// has unblocked previously-pending `ChannelSigner` calls. The builder
+    /// wires this to `ChannelManager::signer_unblocked(None)` so LDK's
+    /// async-signer-pending protocol retries the parked channel.
+    ///
+    /// Called at most once per session by the builder, after the
+    /// `ChannelManager` is built. Default is a no-op — local
+    /// `KeysManager`-backed signers never park work and so don't need
+    /// the unblock pump.
+    fn set_signer_unblock_callback(&self, _cb: Box<dyn Fn() + Send + Sync>) {}
 }
 
 // Explicit impl for LDK's KeysManager (used by tests + the dev signer).

@@ -661,6 +661,22 @@ where
             jit_registry: jit_registry.clone(),
         });
 
+        // Wire signer-unblock callback. LDK 0.2's async-signer protocol
+        // marks a channel as "signer pending" whenever any `ChannelSigner`
+        // method returns `Err(())`, and only retries when the user calls
+        // `ChannelManager::signer_unblocked`. Our VLS-backed signer can
+        // legitimately error on the `get_per_commitment_point` ↔
+        // `SetupChannel` race during channel-open; the signer fires this
+        // callback once `SetupChannel` lands so LDK retries the parked
+        // call without the previous timer-driven nudge. No-op for
+        // local-keys signers (default trait impl).
+        {
+            let channel_manager_for_unblock = Arc::clone(&channel_manager);
+            signer.set_signer_unblock_callback(Box::new(move || {
+                channel_manager_for_unblock.signer_unblocked(None);
+            }));
+        }
+
         // ── Spawn tasks ──────────────────────────────────────────────────────
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(5);
 
