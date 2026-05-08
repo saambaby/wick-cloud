@@ -15,7 +15,7 @@
 //! server (custodial pre-Phase-4).
 
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
-use bitcoin::secp256k1::{PublicKey, Secp256k1};
+use bitcoin::secp256k1::{Message, PublicKey, Secp256k1};
 use wick_core::WickNetwork;
 use zeroize::Zeroize;
 
@@ -33,9 +33,15 @@ fn identity_path(network: WickNetwork) -> String {
 /// carries its own secrecy via `bitcoin::bip32::Xpriv` (the inner
 /// `SecretKey` is not zeroized by the `bitcoin` crate, but dropping the
 /// `Identity` releases it and it is not retained elsewhere).
+///
+/// `identity_xprv` is retained alongside the master so we can sign
+/// registration challenges (D5: gotcha #509) without re-deriving on
+/// every call. The matching `node_id` is published as the tenant's
+/// public identity.
 pub(crate) struct Identity {
     seed: [u8; 64],
     xprv: Xpriv,
+    identity_xprv: Xpriv,
     node_id: PublicKey,
     fingerprint: [u8; 4],
 }
@@ -79,9 +85,34 @@ impl Identity {
         Ok(Self {
             seed,
             xprv,
+            identity_xprv,
             node_id,
             fingerprint,
         })
+    }
+
+    /// ECDSA-sign the server's registration challenge with the device's
+    /// identity secret key. Closes gotcha #509: only a caller who
+    /// controls the secret matching `node_id` can register a tenant.
+    ///
+    /// Returns the DER-encoded signature over
+    /// `sha256(b"wick-tenant-register" || nonce)`. The server applies
+    /// the same hash and runs `verify_ecdsa` against `node_id`.
+    pub(crate) fn sign_register_challenge(&self, nonce: &[u8]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"wick-tenant-register");
+        hasher.update(nonce);
+        let digest = hasher.finalize();
+        // `from_digest` panics only on a non-32-byte input; SHA-256
+        // output is always 32 bytes, so this is infallible here.
+        #[allow(clippy::expect_used)]
+        let msg = Message::from_digest_slice(digest.as_ref())
+            .expect("sha256 output is exactly 32 bytes");
+        let secp = Secp256k1::signing_only();
+        secp.sign_ecdsa(&msg, &self.identity_xprv.private_key)
+            .serialize_der()
+            .to_vec()
     }
 
     /// 33-byte compressed secp256k1 identity pubkey.

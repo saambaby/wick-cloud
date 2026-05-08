@@ -37,8 +37,9 @@ use wick_proto::wick::{
     LspFinalizeFundingResponse, LspPendingFunding, LspWatchPendingFundingRequest,
     Lsps2GetInfoRequest, Lsps2GetInfoResponse, OpenChannelFinalizeRequest,
     OpenChannelFinalizeResponse, OpenChannelInitRequest, OpenChannelInitResponse, Payment,
-    ReceivePaymentRequest, ReceivePaymentResponse, RegisterLspIdentityRequest,
-    RegisterLspIdentityResponse, SendPaymentRequest, SendPaymentResponse,
+    ReceivePaymentRequest, ReceivePaymentResponse, RegisterChallengeRequest,
+    RegisterChallengeResponse, RegisterLspIdentityRequest, RegisterLspIdentityResponse,
+    SendPaymentRequest, SendPaymentResponse,
 };
 
 use crate::auth::Auth;
@@ -46,6 +47,7 @@ use crate::node::{
     manager::{DispatchError, NodeManager, ProvisionError},
     NodeCmd,
 };
+use crate::nonce_store::{NonceError, NonceStore, REGISTER_DOMAIN};
 
 /// Metadata header carrying the admin shared secret. Compared against
 /// `WICK_ADMIN_SECRET` config / env at handler entry. Slice 3.3a auth
@@ -111,6 +113,9 @@ pub struct WickGrpcService {
     /// `None` when the slot is empty; `GetLspInfo` reads it to surface
     /// the `ready` flag dynamically.
     lsp_daemon_slot: Option<Arc<RwLock<Option<LspDaemon>>>>,
+    /// In-memory store of issued-but-not-yet-redeemed registration
+    /// nonces. See [`NonceStore`].
+    nonce_store: Arc<NonceStore>,
 }
 
 impl std::fmt::Debug for WickGrpcService {
@@ -132,6 +137,7 @@ impl WickGrpcService {
             pool,
             lsp_info: None,
             lsp_daemon_slot: None,
+            nonce_store: Arc::new(NonceStore::new()),
         }
     }
 
@@ -149,14 +155,68 @@ impl WickGrpcService {
             pool,
             lsp_info: Some(lsp_info),
             lsp_daemon_slot: Some(lsp_daemon_slot),
+            nonce_store: Arc::new(NonceStore::new()),
         }
     }
+
+    /// Test seam: borrow the nonce store. Used by integration-style
+    /// tests that need to advance time or inject fake challenges.
+    #[cfg(test)]
+    #[must_use]
+    pub fn nonce_store(&self) -> &Arc<NonceStore> {
+        &self.nonce_store
+    }
+}
+
+/// Verify a registration challenge ECDSA signature. Pure function so
+/// unit tests don't need a running gRPC server. Returns `Ok(())` iff
+/// `signature` is a valid DER-encoded ECDSA signature over
+/// `sha256(REGISTER_DOMAIN || nonce)` against `pubkey`.
+fn verify_register_signature(
+    pubkey: &bitcoin::secp256k1::PublicKey,
+    nonce: &[u8],
+    signature: &[u8],
+) -> Result<(), String> {
+    use bitcoin::secp256k1::{ecdsa::Signature, Message, Secp256k1};
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(REGISTER_DOMAIN);
+    hasher.update(nonce);
+    let digest = hasher.finalize();
+    let msg = Message::from_digest_slice(digest.as_ref())
+        .map_err(|e| format!("digest is not a valid secp message: {e}"))?;
+    let sig = Signature::from_der(signature)
+        .map_err(|e| format!("signature is not valid DER ECDSA: {e}"))?;
+    let secp = Secp256k1::verification_only();
+    secp.verify_ecdsa(&msg, &sig, pubkey)
+        .map_err(|e| format!("signature verification failed: {e}"))
 }
 
 // ── WalletService impl ────────────────────────────────────────────────────────
 
 #[tonic::async_trait]
 impl WalletService for WickGrpcService {
+    async fn register_challenge(
+        &self,
+        request: Request<RegisterChallengeRequest>,
+    ) -> Result<Response<RegisterChallengeResponse>, Status> {
+        let req = request.into_inner();
+        if req.pubkey.len() != 33 {
+            return Err(Status::invalid_argument(
+                "pubkey must be 33 bytes (compressed SEC1)",
+            ));
+        }
+        // Validate as a real curve point so we don't issue nonces for
+        // garbage keys that could never produce a valid signature.
+        bitcoin::secp256k1::PublicKey::from_slice(&req.pubkey)
+            .map_err(|_| Status::invalid_argument("pubkey is not a valid secp256k1 public key"))?;
+        let mut pk = [0u8; 33];
+        pk.copy_from_slice(&req.pubkey);
+        let nonce = self.nonce_store.issue(pk);
+        Ok(Response::new(RegisterChallengeResponse { nonce }))
+    }
+
     async fn create_tenant(
         &self,
         request: Request<CreateTenantRequest>,
@@ -176,9 +236,37 @@ impl WalletService for WickGrpcService {
                 "pubkey_hex must be a 33-byte compressed SEC1 pubkey (66 hex chars)",
             ));
         }
-        bitcoin::secp256k1::PublicKey::from_slice(&pubkey_bytes).map_err(|_| {
+        let pubkey = bitcoin::secp256k1::PublicKey::from_slice(&pubkey_bytes).map_err(|_| {
             Status::invalid_argument("pubkey_hex is not a valid secp256k1 public key")
         })?;
+
+        // Signature challenge gate (gotcha #509). Reject before touching
+        // the database so a flood of invalid registrations can't burn
+        // pool connections.
+        if req.nonce.is_empty() || req.signature.is_empty() {
+            return Err(Status::invalid_argument(
+                "nonce and signature are required (call RegisterChallenge first)",
+            ));
+        }
+        let mut pk_arr = [0u8; 33];
+        pk_arr.copy_from_slice(&pubkey_bytes);
+        // Verify the signature *before* consuming the nonce — a wrong
+        // signature must not burn the challenge.
+        verify_register_signature(&pubkey, &req.nonce, &req.signature)
+            .map_err(|e| Status::invalid_argument(format!("invalid registration signature: {e}")))?;
+        match self.nonce_store.consume(&pk_arr, &req.nonce) {
+            Ok(()) => {}
+            Err(NonceError::Unknown) | Err(NonceError::Mismatch) => {
+                return Err(Status::invalid_argument(
+                    "nonce does not match an outstanding challenge for this pubkey",
+                ));
+            }
+            Err(NonceError::Expired) => {
+                return Err(Status::invalid_argument(
+                    "registration challenge expired; call RegisterChallenge again",
+                ));
+            }
+        }
 
         // Validate plan_tier against the known allowlist.
         let plan_tier = if req.plan_tier.is_empty() {
@@ -727,6 +815,75 @@ mod tests {
             dispatch_error_to_status(DispatchError::Internal(anyhow::anyhow!("boom"))).code(),
             Code::Internal
         );
+    }
+
+    // ── Signature-challenge unit tests (D5 / gotcha #509) ───────────────────
+    //
+    // The full create_tenant path needs a Postgres pool, so we exercise the
+    // signature-verification half via the pure helper. Nonce TTL/replay
+    // semantics are covered alongside `NonceStore` in `nonce_store::tests`.
+
+    fn signing_keypair() -> (
+        bitcoin::secp256k1::SecretKey,
+        bitcoin::secp256k1::PublicKey,
+    ) {
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        // Deterministic for repeatability — non-trivial scalar.
+        let sk = SecretKey::from_slice(&[0x42u8; 32]).expect("valid scalar");
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        (sk, pk)
+    }
+
+    fn sign_for_test(sk: &bitcoin::secp256k1::SecretKey, nonce: &[u8]) -> Vec<u8> {
+        use bitcoin::secp256k1::{Message, Secp256k1};
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(REGISTER_DOMAIN);
+        hasher.update(nonce);
+        let digest = hasher.finalize();
+        let msg = Message::from_digest_slice(digest.as_ref()).unwrap();
+        Secp256k1::signing_only()
+            .sign_ecdsa(&msg, sk)
+            .serialize_der()
+            .to_vec()
+    }
+
+    #[test]
+    fn verify_register_signature_accepts_valid_sig() {
+        let (sk, pk) = signing_keypair();
+        let nonce = vec![7u8; 32];
+        let sig = sign_for_test(&sk, &nonce);
+        assert!(verify_register_signature(&pk, &nonce, &sig).is_ok());
+    }
+
+    #[test]
+    fn verify_register_signature_rejects_wrong_sig_for_pubkey() {
+        let (_sk, pk) = signing_keypair();
+        // Signature produced by a *different* key over the same nonce.
+        let other_sk = bitcoin::secp256k1::SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let nonce = vec![7u8; 32];
+        let sig = sign_for_test(&other_sk, &nonce);
+        assert!(verify_register_signature(&pk, &nonce, &sig).is_err());
+    }
+
+    #[test]
+    fn verify_register_signature_rejects_sig_over_different_nonce() {
+        let (sk, pk) = signing_keypair();
+        let nonce = vec![7u8; 32];
+        let other_nonce = vec![8u8; 32];
+        let sig = sign_for_test(&sk, &other_nonce);
+        assert!(verify_register_signature(&pk, &nonce, &sig).is_err());
+    }
+
+    #[test]
+    fn verify_register_signature_rejects_garbage_signature_bytes() {
+        let (_sk, pk) = signing_keypair();
+        let nonce = vec![7u8; 32];
+        // Not even valid DER — must be rejected before any curve work.
+        assert!(verify_register_signature(&pk, &nonce, &[0u8; 8]).is_err());
+        // Empty signature also rejected.
+        assert!(verify_register_signature(&pk, &nonce, &[]).is_err());
     }
 }
 

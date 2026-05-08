@@ -9,6 +9,7 @@ pub mod factory;
 pub mod grpc;
 pub mod lsp_bridge;
 pub mod node;
+pub mod nonce_store;
 pub mod signer_service;
 
 /// Bound on the in-flight outbound frame mpsc between

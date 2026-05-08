@@ -112,10 +112,18 @@ impl WickClient {
     /// overwrites any previous one.
     pub async fn register(&self, plan_tier: impl Into<String>) -> Result<CreateTenantOutcome> {
         let pubkey_hex = self.inner.identity.node_id_hex();
+        // D5 (gotcha #509): two-step signature challenge. Step 1 fetches
+        // a fresh nonce keyed on our pubkey; step 2 submits the
+        // ECDSA-signed nonce alongside the create-tenant request. The
+        // public `register()` API stays unchanged — internal RPC count
+        // is now 2.
+        let pubkey_bytes = self.inner.identity.node_id().serialize().to_vec();
+        let nonce = self.inner.ln.register_challenge(&pubkey_bytes).await?;
+        let signature = self.inner.identity.sign_register_challenge(&nonce);
         let outcome = self
             .inner
             .ln
-            .create_tenant(&pubkey_hex, &plan_tier.into())
+            .create_tenant(&pubkey_hex, &plan_tier.into(), nonce, signature)
             .await?;
         *self.inner.token.write() = Some(outcome.api_token.clone());
         *self.inner.tenant_id.write() = Some(outcome.tenant_id.clone());

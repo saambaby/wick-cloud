@@ -9,7 +9,17 @@ option java_package = "cloud.wick.v1";
 // Phase 1: tenant management + balance/payment stubs.
 // Phase 3+: real LDK-backed implementations.
 service WalletService {
-  // CreateTenant provisions a new wallet tenant.
+  // RegisterChallenge issues a single-use nonce the SDK must sign before
+  // calling CreateTenant. Closes the token-rotation hole where any
+  // caller who knew a tenant's pubkey could rotate its bearer token.
+  // The nonce expires 60 seconds after issue and is consumed on first
+  // successful CreateTenant. Last-writer-wins on duplicate challenges
+  // for the same pubkey.
+  rpc RegisterChallenge(RegisterChallengeRequest) returns (RegisterChallengeResponse);
+
+  // CreateTenant provisions a new wallet tenant. Requires a fresh
+  // nonce + ECDSA signature obtained via RegisterChallenge — proves
+  // the caller controls the secp256k1 secret key for `pubkey`.
   // Returns the tenant_id which identifies this wallet in all subsequent calls.
   rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
 
@@ -63,6 +73,20 @@ service WalletService {
   rpc GetJitInvoice(GetJitInvoiceRequest) returns (GetJitInvoiceResponse);
 }
 
+// ── RegisterChallenge ────────────────────────────────────────────────────────
+
+message RegisterChallengeRequest {
+  // 33-byte compressed SEC1 secp256k1 pubkey the caller wants to register.
+  bytes pubkey = 1;
+}
+
+message RegisterChallengeResponse {
+  // 32 random bytes the caller must sign and submit alongside
+  // CreateTenantRequest within 60s. Single-use: consumed on first
+  // successful CreateTenant.
+  bytes nonce = 1;
+}
+
 // ── CreateTenant ─────────────────────────────────────────────────────────────
 
 message CreateTenantRequest {
@@ -71,6 +95,15 @@ message CreateTenantRequest {
 
   // Subscription plan tier: "free" | "standard" | "premium".
   string plan_tier = 2;
+
+  // Nonce previously issued by RegisterChallenge for this pubkey. Must
+  // match an outstanding (un-consumed, non-expired) nonce.
+  bytes nonce = 3;
+
+  // DER-encoded ECDSA signature over
+  // `sha256(b"wick-tenant-register" || nonce)` produced by the secret
+  // key matching `pubkey_hex`.
+  bytes signature = 4;
 }
 
 message CreateTenantResponse {

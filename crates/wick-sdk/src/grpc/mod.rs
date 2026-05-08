@@ -41,16 +41,34 @@ impl LightningClient {
         Ok(Self { inner })
     }
 
+    /// Step 1 of registration: ask the server for a fresh nonce keyed
+    /// on this device's pubkey. The SDK signs the nonce locally and
+    /// submits the signature in [`Self::create_tenant`].
+    pub(crate) async fn register_challenge(&self, pubkey: &[u8]) -> Result<Vec<u8>> {
+        let mut client = self.inner.clone();
+        let resp = client
+            .register_challenge(pb::RegisterChallengeRequest {
+                pubkey: pubkey.to_vec(),
+            })
+            .await?
+            .into_inner();
+        Ok(resp.nonce)
+    }
+
     pub(crate) async fn create_tenant(
         &self,
         pubkey_hex: &str,
         plan_tier: &str,
+        nonce: Vec<u8>,
+        signature: Vec<u8>,
     ) -> Result<CreateTenantOutcome> {
         let mut client = self.inner.clone();
         let resp = client
             .create_tenant(pb::CreateTenantRequest {
                 pubkey_hex: pubkey_hex.to_owned(),
                 plan_tier: plan_tier.to_owned(),
+                nonce,
+                signature,
             })
             .await?
             .into_inner();
