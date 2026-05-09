@@ -772,18 +772,26 @@ impl SignerProvider for SignerSession {
 
 // ── OutputSpender ─────────────────────────────────────────────────────────────
 
-impl OutputSpender for SignerSession {
-    fn spend_spendable_outputs(
+/// Per-input bundle built from a list of [`SpendableOutputDescriptor`]s.
+/// Pulled out of [`SignerSession::spend_spendable_outputs`] so the
+/// tx-construction logic is unit-testable without a live signer.
+struct DescriptorInputs {
+    tx_ins: Vec<bitcoin::TxIn>,
+    psbt_inputs: Vec<bitcoin::psbt::Input>,
+    withdrawal_utxos: Vec<rpc::WithdrawalUtxo>,
+    total_in_sat: u64,
+}
+
+impl SignerSession {
+    /// Convert a slice of [`SpendableOutputDescriptor`]s into the per-input
+    /// vectors that drive `rpc_sign_withdrawal`. Returns `Err(())` if any
+    /// channel-key descriptor references a `channel_keys_id` that this
+    /// session has never persisted (i.e. the channel was never opened on
+    /// this signer instance).
+    fn build_descriptor_inputs(
         &self,
         descriptors: &[&SpendableOutputDescriptor],
-        outputs: Vec<bitcoin::TxOut>,
-        change_destination_script: bitcoin::ScriptBuf,
-        feerate_sat_per_1000_weight: u32,
-        locktime: Option<bitcoin::absolute::LockTime>,
-        _secp_ctx: &Secp256k1<bitcoin::secp256k1::All>,
-    ) -> Result<bitcoin::Transaction, ()> {
-        let lock_time = locktime.unwrap_or(bitcoin::absolute::LockTime::ZERO);
-
+    ) -> Result<DescriptorInputs, ()> {
         let mut tx_ins = Vec::new();
         let mut psbt_inputs = Vec::new();
         let mut withdrawal_utxos = Vec::new();
@@ -816,18 +824,160 @@ impl OutputSpender for SignerSession {
                         is_p2sh: false,
                         script_pubkey: output.script_pubkey.to_bytes(),
                         is_in_coinbase: false,
+                        close_info: None,
                     });
                 }
-                _ => {
-                    tracing::warn!(
-                        target: "wick_vls",
-                        ctx = %self.lookup.context_id(),
-                        "spend_spendable_outputs: unsupported descriptor variant (channel-key sweep not implemented)"
-                    );
-                    return Err(());
+                SpendableOutputDescriptor::DelayedPaymentOutput(d) => {
+                    // `to_local` recovery from a channel close. We must look up
+                    // the VLS-side channel binding (dbid + peer_id); without it
+                    // the signer can't unilaterally re-derive the per-channel
+                    // delayed-payment key.
+                    let Some(meta_ref) = self.channel_meta.get(&d.channel_keys_id) else {
+                        tracing::warn!(
+                            target: "wick_vls",
+                            ctx = %self.lookup.context_id(),
+                            channel_keys_id = ?d.channel_keys_id,
+                            "spend_spendable_outputs: unknown channel_keys_id for DelayedPaymentOutput",
+                        );
+                        return Err(());
+                    };
+                    let dbid = meta_ref.dbid;
+                    let peer_id = meta_ref.peer_id;
+                    drop(meta_ref);
+
+                    let is_anchors = d
+                        .channel_transaction_parameters
+                        .as_ref()
+                        .map(|p| p.channel_type_features.supports_anchors_zero_fee_htlc_tx())
+                        .unwrap_or(false);
+
+                    total_in_sat = total_in_sat.saturating_add(d.output.value.to_sat());
+                    tx_ins.push(bitcoin::TxIn {
+                        previous_output: bitcoin::OutPoint {
+                            txid: d.outpoint.txid,
+                            vout: u32::from(d.outpoint.index),
+                        },
+                        script_sig: bitcoin::ScriptBuf::new(),
+                        // BIP68 relative time-lock — required for the OP_CSV
+                        // check inside the to_local revocable redeemscript.
+                        sequence: bitcoin::Sequence(u32::from(d.to_self_delay)),
+                        witness: bitcoin::Witness::new(),
+                    });
+                    psbt_inputs.push(bitcoin::psbt::Input {
+                        witness_utxo: Some(d.output.clone()),
+                        ..Default::default()
+                    });
+                    withdrawal_utxos.push(rpc::WithdrawalUtxo {
+                        txid: d.outpoint.txid,
+                        outnum: u32::from(d.outpoint.index),
+                        amount_sat: d.output.value.to_sat(),
+                        keyindex: 0,
+                        is_p2sh: false,
+                        script_pubkey: d.output.script_pubkey.to_bytes(),
+                        is_in_coinbase: false,
+                        close_info: Some(rpc::WithdrawalCloseInfo {
+                            channel_id: dbid,
+                            peer_id,
+                            commitment_point: Some(d.per_commitment_point.serialize()),
+                            is_anchors,
+                            csv: u32::from(d.to_self_delay),
+                        }),
+                    });
+                }
+                SpendableOutputDescriptor::StaticPaymentOutput(s) => {
+                    // `to_remote` from a channel close paid to our static
+                    // payment key. On anchor-outputs channels, the output is a
+                    // P2WSH wrapping a `1 OP_CSV` script and requires
+                    // `nSequence >= 1`; on legacy channels it's plain P2WPKH.
+                    let Some(meta_ref) = self.channel_meta.get(&s.channel_keys_id) else {
+                        tracing::warn!(
+                            target: "wick_vls",
+                            ctx = %self.lookup.context_id(),
+                            channel_keys_id = ?s.channel_keys_id,
+                            "spend_spendable_outputs: unknown channel_keys_id for StaticPaymentOutput",
+                        );
+                        return Err(());
+                    };
+                    let dbid = meta_ref.dbid;
+                    let peer_id = meta_ref.peer_id;
+                    drop(meta_ref);
+
+                    let is_anchors = s
+                        .channel_transaction_parameters
+                        .as_ref()
+                        .map(|p| p.channel_type_features.supports_anchors_zero_fee_htlc_tx())
+                        .unwrap_or(false);
+                    let csv: u32 = if is_anchors { 1 } else { 0 };
+                    let sequence = if is_anchors {
+                        bitcoin::Sequence(1)
+                    } else {
+                        bitcoin::Sequence::ZERO
+                    };
+
+                    total_in_sat = total_in_sat.saturating_add(s.output.value.to_sat());
+                    tx_ins.push(bitcoin::TxIn {
+                        previous_output: bitcoin::OutPoint {
+                            txid: s.outpoint.txid,
+                            vout: u32::from(s.outpoint.index),
+                        },
+                        script_sig: bitcoin::ScriptBuf::new(),
+                        sequence,
+                        witness: bitcoin::Witness::new(),
+                    });
+                    psbt_inputs.push(bitcoin::psbt::Input {
+                        witness_utxo: Some(s.output.clone()),
+                        witness_script: s.witness_script(),
+                        ..Default::default()
+                    });
+                    withdrawal_utxos.push(rpc::WithdrawalUtxo {
+                        txid: s.outpoint.txid,
+                        outnum: u32::from(s.outpoint.index),
+                        amount_sat: s.output.value.to_sat(),
+                        keyindex: 0,
+                        is_p2sh: false,
+                        script_pubkey: s.output.script_pubkey.to_bytes(),
+                        is_in_coinbase: false,
+                        close_info: Some(rpc::WithdrawalCloseInfo {
+                            channel_id: dbid,
+                            peer_id,
+                            // No per-commitment point: VLS uses the static
+                            // payment basepoint directly.
+                            commitment_point: None,
+                            is_anchors,
+                            csv,
+                        }),
+                    });
                 }
             }
         }
+
+        Ok(DescriptorInputs {
+            tx_ins,
+            psbt_inputs,
+            withdrawal_utxos,
+            total_in_sat,
+        })
+    }
+}
+
+impl OutputSpender for SignerSession {
+    fn spend_spendable_outputs(
+        &self,
+        descriptors: &[&SpendableOutputDescriptor],
+        outputs: Vec<bitcoin::TxOut>,
+        change_destination_script: bitcoin::ScriptBuf,
+        feerate_sat_per_1000_weight: u32,
+        locktime: Option<bitcoin::absolute::LockTime>,
+        _secp_ctx: &Secp256k1<bitcoin::secp256k1::All>,
+    ) -> Result<bitcoin::Transaction, ()> {
+        let lock_time = locktime.unwrap_or(bitcoin::absolute::LockTime::ZERO);
+
+        let DescriptorInputs {
+            tx_ins,
+            psbt_inputs,
+            withdrawal_utxos,
+            total_in_sat,
+        } = self.build_descriptor_inputs(descriptors)?;
 
         let mut tx_outs = outputs;
         let total_out_sat: u64 = tx_outs.iter().map(|o| o.value.to_sat()).sum();

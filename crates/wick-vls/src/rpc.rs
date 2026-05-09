@@ -249,6 +249,7 @@ pub async fn rpc_sign_bolt12_invoice(
 
 // ── SignerProvider operations ─────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
 pub struct ChannelBasepointsResult {
     pub revocation: [u8; 33],
     pub payment: [u8; 33],
@@ -609,6 +610,23 @@ pub async fn rpc_sign_channel_announcement(
 
 // ── Wallet / on-chain signing ─────────────────────────────────────────────────
 
+/// Channel-key sweep metadata for a [`WithdrawalUtxo`].
+///
+/// Set on the per-input `Utxo` when the input is the `to_local`
+/// (`DelayedPaymentOutput`) or `to_remote` (`StaticPaymentOutput`) of a
+/// closed channel. VLS uses this to switch from wallet-key signing to
+/// per-channel unilateral-close-key signing in `sign_withdrawal`.
+#[derive(Debug, Clone)]
+pub struct WithdrawalCloseInfo {
+    pub channel_id: u64,
+    pub peer_id: [u8; 33],
+    /// `Some(per_commitment_point)` for `to_local` (DelayedPaymentOutput);
+    /// `None` for `to_remote` (StaticPaymentOutput).
+    pub commitment_point: Option<[u8; 33]>,
+    pub is_anchors: bool,
+    pub csv: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct WithdrawalUtxo {
     pub txid: Txid,
@@ -618,6 +636,8 @@ pub struct WithdrawalUtxo {
     pub is_p2sh: bool,
     pub script_pubkey: Vec<u8>,
     pub is_in_coinbase: bool,
+    /// `Some(..)` for channel-key sweep inputs; `None` for ordinary wallet UTXOs.
+    pub close_info: Option<WithdrawalCloseInfo>,
 }
 
 pub async fn rpc_sign_withdrawal(
@@ -626,6 +646,7 @@ pub async fn rpc_sign_withdrawal(
     utxos: Vec<WithdrawalUtxo>,
 ) -> anyhow::Result<Vec<u8>> {
     use serde_bolt::WithSize;
+    use vls_protocol::model::CloseInfo;
     use vls_protocol::psbt::StreamedPSBT;
 
     let psbt =
@@ -641,7 +662,13 @@ pub async fn rpc_sign_withdrawal(
                 keyindex: u.keyindex,
                 is_p2sh: u.is_p2sh,
                 script: Octets(u.script_pubkey),
-                close_info: None,
+                close_info: u.close_info.map(|ci| CloseInfo {
+                    channel_id: ci.channel_id,
+                    peer_id: PubKey(ci.peer_id),
+                    commitment_point: ci.commitment_point.map(PubKey),
+                    is_anchors: ci.is_anchors,
+                    csv: ci.csv,
+                }),
                 is_in_coinbase: u.is_in_coinbase,
             })
             .collect(),
