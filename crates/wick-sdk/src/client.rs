@@ -27,7 +27,7 @@ use crate::types::{
     Balance, ChannelSummary, CreateTenantOutcome, JitInvoice, JitQuote, LspInfo, NodeInfo,
     PaymentRecord, PaymentResult, ReceiveInvoice,
 };
-use crate::signer::SignerLoop;
+use crate::signer::{ SignerHandle, SignerLoop };
 use crate::wallet::OnchainWallet;
 
 /// Canonical Wick Cloud client.
@@ -45,6 +45,10 @@ struct Inner {
     config: WickConfig,
     token: SharedToken,
     tenant_id: RwLock<Option<String>>,
+    /// Background reconnecting signer loop. `Some` after `register()`.
+    /// Dropped when the last `WickClient` clone is released, which fires
+    /// the watch-channel shutdown signal inside `SignerHandle::drop`.
+    signer: RwLock<Option<SignerHandle>>,
 }
 
 impl WickClient {
@@ -72,6 +76,7 @@ impl WickClient {
                 config,
                 token,
                 tenant_id: RwLock::new(None),
+                signer: RwLock::new(None),
             }),
         })
     }
@@ -141,12 +146,11 @@ impl WickClient {
         let endpoint = self.inner.config.server_endpoint.clone();
         let token = Arc::clone(&self.inner.token);
         let network = self.inner.config.network;
-        tokio::spawn(async move {
-            let loop_inst = SignerLoop::new(endpoint, token, seed, xprv, network);
-            if let Err(e) = loop_inst.run().await {
-                tracing::warn!(target: "wick_sdk::client", %e, "signer loop terminated");
-            }
-        });
+        // Spawn the reconnecting signer loop. The returned handle owns a
+        // watch-channel sender; storing it on `Inner` ties the loop's
+        // lifetime to the last `WickClient` clone (B5).
+        let handle = SignerLoop::new(endpoint, token, seed, xprv, network).spawn();
+        *self.inner.signer.write() = Some(handle);
 
         Ok(outcome)
     }

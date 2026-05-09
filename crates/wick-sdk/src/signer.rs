@@ -34,6 +34,7 @@
 //!   BIP32 index from the master xprv (matches the on-chain wallet).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bitcoin::bip32::{ ChildNumber, DerivationPath, Xpriv };
 use bitcoin::secp256k1::Secp256k1;
@@ -41,7 +42,7 @@ use futures::StreamExt;
 use hmac::{ Hmac, Mac };
 use parking_lot::Mutex;
 use sha2::Sha256;
-use tokio::sync::mpsc;
+use tokio::sync::{ mpsc, watch };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{ Channel, Endpoint };
 use tonic::Request;
@@ -59,15 +60,67 @@ use crate::grpc::SharedToken;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Initial backoff after the first failed connect / stream-drop. Doubled
+/// on each subsequent failure up to [`BACKOFF_CAP`].
+const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+/// Maximum backoff between reconnection attempts.
+const BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// Compute the next backoff delay for a reconnection attempt index.
+///
+/// `failures = 0` ⇒ no failures yet (caller should not sleep). For
+/// `failures ≥ 1` we double from [`BACKOFF_INITIAL`] up to [`BACKOFF_CAP`]:
+/// `1s, 2s, 4s, 8s, 16s, 30s, 30s …`. Pulled out as a free function so
+/// the schedule can be unit-tested without spinning up a gRPC stack.
+#[must_use]
+pub fn next_backoff(failures: u32) -> Duration {
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    // Bounded shift: failures-1 acts as the doubling exponent. Clamp at
+    // 20 so the multiplication never overflows even on long outages.
+    let shift = failures.saturating_sub(1).min(20);
+    let base_nanos = BACKOFF_INITIAL.as_nanos() as u64;
+    let nanos = base_nanos.checked_shl(shift).unwrap_or(u64::MAX);
+    let dur = Duration::from_nanos(nanos);
+    if dur > BACKOFF_CAP { BACKOFF_CAP } else { dur }
+}
+
+/// Handle returned by [`SignerLoop::spawn`]. Holding it keeps the loop
+/// alive; dropping it (or calling [`SignerHandle::shutdown`]) signals the
+/// outer reconnection loop to exit promptly via a `watch` channel.
+#[derive(Debug)]
+pub struct SignerHandle {
+    shutdown_tx: watch::Sender<bool>,
+}
+
+impl SignerHandle {
+    /// Signal the loop to exit at the next await point. Idempotent.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+}
+
+impl Drop for SignerHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// The tenant signer loop. Construct with [`SignerLoop::new`] and drive
-/// with [`SignerLoop::run`]. Drops the loop cleanly when the underlying
-/// stream ends; the caller is responsible for re-spawning on auth refresh.
+/// with [`SignerLoop::run`]. The outer reconnection loop reopens the
+/// `Attach` bidi stream with exponential backoff after transport errors
+/// or clean stream-end, replaying the VLS init handshake against the
+/// fresh server-side `SignerConnection`. Auth-rejection
+/// (`Unauthenticated`) is terminal — the loop exits so the caller can
+/// re-`register` with a fresh token rather than tight-looping.
 pub struct SignerLoop {
     endpoint: String,
     token: SharedToken,
     seed: [u8; 32],
     xprv: Xpriv,
     network: WickNetwork,
+    shutdown_rx: Option<watch::Receiver<bool>>,
 }
 
 impl std::fmt::Debug for SignerLoop {
@@ -98,56 +151,194 @@ impl SignerLoop {
             seed,
             xprv,
             network,
+            shutdown_rx: None,
         }
     }
 
-    /// Connect, attach, and process frames until the stream ends or errors.
-    /// Returns `Ok(())` on a clean stream-end, `Err` on transport/auth
-    /// failure. Intended to run on a dedicated background task.
-    pub async fn run(self) -> Result<()> {
-        let ep = Endpoint::from_shared(self.endpoint.clone()).map_err(|e|
-            Error::Config(format!("invalid signer endpoint: {e}"))
-        )?;
-        let channel: Channel = ep
-            .connect().await
-            .map_err(|e| Error::Config(format!("signer connect: {e}")))?;
+    /// Spawn the loop on the current tokio runtime and return a handle
+    /// that, when dropped, signals the outer reconnect loop to exit.
+    pub fn spawn(mut self) -> SignerHandle {
+        let (tx, rx) = watch::channel(false);
+        self.shutdown_rx = Some(rx);
+        tokio::spawn(async move {
+            if let Err(e) = self.run().await {
+                tracing::warn!(target: "wick_sdk::signer", %e, "signer loop terminated");
+            }
+        });
+        SignerHandle { shutdown_tx: tx }
+    }
+
+    /// Run the outer reconnection loop until the stream survives or a
+    /// terminal condition (auth rejection / shutdown) is reached.
+    ///
+    /// Each iteration: connect, attach, replay the VLS init handshake
+    /// against the fresh server-side `SignerConnection`, and pump frames
+    /// until the stream ends. Transient errors retry with exponential
+    /// backoff (`1s → 2s → … → 30s` cap). `Unauthenticated` is terminal.
+    /// A successful frame received resets the failure counter.
+    pub async fn run(mut self) -> Result<()> {
+        let mut shutdown_rx = self.shutdown_rx.take();
+        let mut failures: u32 = 0;
+        let mut reconnects: u64 = 0;
+
+        loop {
+            // Sleep before retrying (no-op on the first iteration).
+            let delay = next_backoff(failures);
+            if !delay.is_zero() {
+                tracing::info!(
+                    target: "wick_sdk::signer",
+                    backoff_ms = delay.as_millis() as u64,
+                    failures,
+                    reconnects,
+                    "signer loop reconnecting"
+                );
+                if Self::sleep_or_shutdown(delay, shutdown_rx.as_mut()).await {
+                    return Ok(());
+                }
+            }
+
+            // Bail fast if the handle was dropped before we even tried.
+            if Self::is_shutdown(shutdown_rx.as_ref()) {
+                return Ok(());
+            }
+
+            match self.run_once(shutdown_rx.as_mut()).await {
+                RunOutcome::Shutdown => return Ok(()),
+                RunOutcome::Unauthenticated => {
+                    tracing::error!(
+                        target: "wick_sdk::signer",
+                        "signer loop received UNAUTHENTICATED — not reconnecting"
+                    );
+                    return Err(Error::Config(
+                        "signer loop: server rejected bearer token (UNAUTHENTICATED)".to_owned(),
+                    ));
+                }
+                RunOutcome::CleanEnd { saw_frame } => {
+                    reconnects += 1;
+                    if saw_frame {
+                        failures = 0;
+                    } else {
+                        failures = failures.saturating_add(1);
+                    }
+                }
+                RunOutcome::TransportError { saw_frame } => {
+                    reconnects += 1;
+                    if saw_frame {
+                        // Saw at least one frame this attempt — treat the
+                        // disconnect as a transient blip and retry quickly.
+                        failures = 1;
+                    } else {
+                        failures = failures.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Single connect+attach+pump pass. Returns the reason the pass ended.
+    async fn run_once(
+        &self,
+        shutdown_rx: Option<&mut watch::Receiver<bool>>,
+    ) -> RunOutcome {
+        let ep = match Endpoint::from_shared(self.endpoint.clone()) {
+            Ok(ep) => ep,
+            Err(e) => {
+                tracing::warn!(target: "wick_sdk::signer", %e, "invalid signer endpoint");
+                return RunOutcome::TransportError { saw_frame: false };
+            }
+        };
+        let channel: Channel = match ep.connect().await {
+            Ok(ch) => ch,
+            Err(e) => {
+                tracing::warn!(target: "wick_sdk::signer", %e, "signer connect failed");
+                return RunOutcome::TransportError { saw_frame: false };
+            }
+        };
 
         let mut client = SignerServiceClient::new(channel);
 
-        // Outbound channel: this SDK's responses → server.
         let (resp_tx, resp_rx) = mpsc::channel::<SignerInbound>(crate::SIGNER_OUTBOUND_CAPACITY);
         let outbound_stream = ReceiverStream::new(resp_rx);
 
-        // Attach the bearer token via request metadata. tonic only invokes
-        // unary interceptors; for streaming RPCs we attach manually.
         let mut attach_req = Request::new(outbound_stream);
-        let token_value = self.token
-            .read()
-            .clone()
-            .ok_or_else(|| Error::Config("signer loop requires bearer token".to_owned()))?;
-        attach_req.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {token_value}")
-                .parse()
-                .map_err(|e| Error::Config(format!("invalid auth metadata: {e}")))?
-        );
-        let mut inbound = client
-            .attach(attach_req).await
-            .map_err(|e| Error::Config(format!("signer attach: {e}")))?
-            .into_inner();
+        let Some(token_value) = self.token.read().clone() else {
+            tracing::warn!(
+                target: "wick_sdk::signer",
+                "signer loop has no bearer token — skipping attempt"
+            );
+            return RunOutcome::TransportError { saw_frame: false };
+        };
+        let auth_value: tonic::metadata::MetadataValue<_> =
+            match format!("Bearer {token_value}").parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(target: "wick_sdk::signer", %e, "invalid auth metadata");
+                    return RunOutcome::TransportError { saw_frame: false };
+                }
+            };
+        attach_req.metadata_mut().insert("authorization", auth_value);
 
-        // VLS handler state machine — Init → Ready on `done = true` from
-        // `InitHandler::handle`.
-        let state = Arc::new(Mutex::new(SignerState::new(self.seed, self.network.into())?));
+        let mut inbound = match client.attach(attach_req).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) => {
+                if status.code() == tonic::Code::Unauthenticated {
+                    return RunOutcome::Unauthenticated;
+                }
+                tracing::warn!(
+                    target: "wick_sdk::signer",
+                    code = ?status.code(),
+                    msg = %status.message(),
+                    "signer attach failed"
+                );
+                return RunOutcome::TransportError { saw_frame: false };
+            }
+        };
 
-        while let Some(item) = inbound.next().await {
+        // Fresh handler state for each connection — server-side
+        // `SignerConnection` is also fresh, so init must be re-driven.
+        let state = match SignerState::new(self.seed, self.network.into()) {
+            Ok(s) => Arc::new(Mutex::new(s)),
+            Err(e) => {
+                tracing::error!(target: "wick_sdk::signer", %e, "VLS handler init failed");
+                return RunOutcome::TransportError { saw_frame: false };
+            }
+        };
+
+        let mut saw_frame = false;
+        // Re-borrow into an Option<&mut _> so we can re-use across loop iters.
+        let mut shutdown_rx = shutdown_rx;
+        loop {
+            let next_item = match shutdown_rx.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        biased;
+                        res = rx.changed() => {
+                            if res.is_err() || *rx.borrow() {
+                                return RunOutcome::Shutdown;
+                            }
+                            continue;
+                        }
+                        item = inbound.next() => item,
+                    }
+                }
+                None => inbound.next().await,
+            };
+
+            let Some(item) = next_item else {
+                tracing::info!(target: "wick_sdk::signer", "signer stream ended cleanly");
+                return RunOutcome::CleanEnd { saw_frame };
+            };
             let msg = match item {
                 Ok(m) => m,
                 Err(e) => {
+                    if e.code() == tonic::Code::Unauthenticated {
+                        return RunOutcome::Unauthenticated;
+                    }
                     tracing::info!(target: "wick_sdk::signer", %e, "signer stream errored");
-                    break;
+                    return RunOutcome::TransportError { saw_frame };
                 }
             };
+            saw_frame = true;
             let Some(signer_outbound::Kind::VlsCall(encoded)) = msg.kind else {
                 tracing::warn!(target: "wick_sdk::signer", "SignerOutbound with empty kind — skipping");
                 continue;
@@ -170,12 +361,43 @@ impl SignerLoop {
                     }).await
                     .is_err()
             {
-                tracing::info!(target: "wick_sdk::signer", "outbound channel closed; ending loop");
-                break;
+                tracing::info!(target: "wick_sdk::signer", "outbound channel closed; ending pass");
+                return RunOutcome::TransportError { saw_frame };
             }
         }
-        Ok(())
     }
+
+    async fn sleep_or_shutdown(
+        delay: Duration,
+        shutdown_rx: Option<&mut watch::Receiver<bool>>,
+    ) -> bool {
+        if let Some(rx) = shutdown_rx {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => false,
+                res = rx.changed() => res.is_err() || *rx.borrow(),
+            }
+        } else {
+            tokio::time::sleep(delay).await;
+            false
+        }
+    }
+
+    fn is_shutdown(rx: Option<&watch::Receiver<bool>>) -> bool {
+        rx.is_some_and(|r| *r.borrow())
+    }
+}
+
+/// Outcome of a single `run_once` attempt.
+#[derive(Debug)]
+enum RunOutcome {
+    /// Stream ended without a transport error (server hung up cleanly).
+    CleanEnd { saw_frame: bool },
+    /// Connect / attach / stream errored.
+    TransportError { saw_frame: bool },
+    /// Server rejected the bearer token — terminal.
+    Unauthenticated,
+    /// Outer shutdown signal fired.
+    Shutdown,
 }
 
 // ── VLS handler state machine ─────────────────────────────────────────────────
@@ -596,5 +818,60 @@ mod tests {
         assert_eq!(frame[..4], [0x00, 0x00, 0x00, 0x01]);
         assert_eq!(frame[4], 0x01);
         assert_eq!(&frame[5..], b"boom");
+    }
+
+    // ── Reconnection backoff (B5) ────────────────────────────────────────
+    //
+    // Mocking a tonic bidi stream end-to-end is heavy; the backoff schedule
+    // is the load-bearing piece of the reconnection logic, so we extract
+    // it as a free function and verify the doubling + cap directly.
+    // Stream-close behavior is exercised by the integration tests in
+    // `crates/wick-sdk/tests/restart_flow.rs`.
+
+    #[test]
+    fn backoff_starts_at_one_second_and_doubles() {
+        assert_eq!(next_backoff(0), Duration::ZERO);
+        assert_eq!(next_backoff(1), Duration::from_secs(1));
+        assert_eq!(next_backoff(2), Duration::from_secs(2));
+        assert_eq!(next_backoff(3), Duration::from_secs(4));
+        assert_eq!(next_backoff(4), Duration::from_secs(8));
+        assert_eq!(next_backoff(5), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn backoff_caps_at_thirty_seconds() {
+        // 32s would be the next double — must clamp to BACKOFF_CAP.
+        assert_eq!(next_backoff(6), Duration::from_secs(30));
+        assert_eq!(next_backoff(10), Duration::from_secs(30));
+        assert_eq!(next_backoff(100), Duration::from_secs(30));
+        // Saturating: a pathological huge failure count must not panic.
+        assert_eq!(next_backoff(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn backoff_doubles_monotonically_until_cap() {
+        let mut prev = next_backoff(1);
+        for failures in 2..=6 {
+            let cur = next_backoff(failures);
+            assert!(
+                cur >= prev,
+                "backoff went backwards at failures={failures}: {prev:?} → {cur:?}"
+            );
+            prev = cur;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn signer_handle_drop_signals_shutdown() {
+        // The watch channel inside `SignerHandle` is the cancellation
+        // primitive for the outer reconnect loop — verify drop flips it.
+        let (tx, mut rx) = watch::channel(false);
+        let handle = SignerHandle { shutdown_tx: tx };
+        assert!(!*rx.borrow());
+        drop(handle);
+        // After drop, `changed()` returns Err (sender gone) — we treat
+        // both `Err` and `*rx.borrow() == true` as a shutdown signal.
+        let res = rx.changed().await;
+        assert!(res.is_err() || *rx.borrow());
     }
 }
