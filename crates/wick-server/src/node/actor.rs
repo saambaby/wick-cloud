@@ -307,6 +307,9 @@ impl NodeActor {
             NodeCmd::ListChannels { resp } => {
                 let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
             }
+            NodeCmd::CloseChannel { resp, .. } => {
+                let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
+            }
             NodeCmd::Lsps2GetInfo { resp, .. } => {
                 let _ = resp.send(Err(anyhow::anyhow!("node {tid} is parked")));
             }
@@ -420,6 +423,17 @@ impl NodeActor {
             NodeCmd::ListChannels { resp } => {
                 if resp.send(node.list_channels().await).is_err() {
                     warn!(tenant = %self.tenant_id, "ListChannels: caller dropped response receiver");
+                }
+            }
+
+            NodeCmd::CloseChannel {
+                channel_id,
+                counterparty,
+                resp,
+            } => {
+                let result = node.close_channel(&channel_id, &counterparty).await;
+                if resp.send(result).is_err() {
+                    warn!(tenant = %self.tenant_id, "CloseChannel: caller dropped response receiver");
                 }
             }
 

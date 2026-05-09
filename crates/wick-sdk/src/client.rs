@@ -246,6 +246,21 @@ impl WickClient {
         self.inner.ln.list_channels().await
     }
 
+    /// Cooperatively close a channel by `channel_id`. Phase-4: the
+    /// closing transaction is signed via the on-device VLS signer over
+    /// `SignerService::Attach`. The on-chain refund lands on the
+    /// server-side change destination configured at node-build time;
+    /// it is not (yet) wired through to the client-side BDK wallet,
+    /// so the spendable refund manifests as
+    /// [`Self::lightning_balance`]'s `onchain_sats`.
+    pub async fn close_channel(
+        &self,
+        channel_id: [u8; 32],
+        counterparty: PublicKey,
+    ) -> Result<()> {
+        self.inner.ln.close_channel(channel_id, counterparty).await
+    }
+
     // ── LSP / LSPS2 (Phase 3) ────────────────────────────────────────────────
 
     /// Server-side LSP identity. Returns `LspInfo { pubkey: None, ... }`

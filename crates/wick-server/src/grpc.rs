@@ -33,7 +33,8 @@ use wick_proto::wick::{
     CreateTenantRequest, CreateTenantResponse, GetBalanceRequest, GetBalanceResponse,
     GetJitInvoiceRequest, GetJitInvoiceResponse, GetLspInfoRequest, GetLspInfoResponse,
     GetNodeInfoRequest, GetNodeInfoResponse, GetTransactionsRequest, GetTransactionsResponse,
-    ListChannelsRequest, ListChannelsResponse, LspFinalizeFundingRequest,
+    CloseChannelRequest, CloseChannelResponse, ListChannelsRequest, ListChannelsResponse,
+    LspFinalizeFundingRequest,
     LspFinalizeFundingResponse, LspPendingFunding, LspWatchPendingFundingRequest,
     Lsps2GetInfoRequest, Lsps2GetInfoResponse, OpenChannelFinalizeRequest,
     OpenChannelFinalizeResponse, OpenChannelInitRequest, OpenChannelInitResponse, Payment,
@@ -668,6 +669,48 @@ impl WalletService for WickGrpcService {
             .collect();
 
         Ok(Response::new(ListChannelsResponse { channels }))
+    }
+
+    async fn close_channel(
+        &self,
+        request: Request<CloseChannelRequest>,
+    ) -> Result<Response<CloseChannelResponse>, Status> {
+        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let req = request.into_inner();
+
+        if req.channel_id.len() != 32 {
+            return Err(Status::invalid_argument("channel_id must be 32 bytes"));
+        }
+        let mut cid = [0u8; 32];
+        cid.copy_from_slice(&req.channel_id);
+        let channel_id = lightning::ln::types::ChannelId(cid);
+
+        let peer_bytes = hex::decode(&req.counterparty_pubkey_hex).map_err(|_| {
+            Status::invalid_argument("counterparty_pubkey_hex is not valid hex")
+        })?;
+        let counterparty =
+            bitcoin::secp256k1::PublicKey::from_slice(&peer_bytes).map_err(|_| {
+                Status::invalid_argument("counterparty_pubkey_hex is not a valid secp256k1 key")
+            })?;
+
+        let (tx, rx) = oneshot::channel();
+        self.manager
+            .dispatch(
+                tenant_id,
+                NodeCmd::CloseChannel {
+                    channel_id,
+                    counterparty,
+                    resp: tx,
+                },
+            )
+            .await
+            .map_err(dispatch_error_to_status)?;
+
+        rx.await
+            .map_err(|_| Status::internal("node actor dropped the response channel"))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(CloseChannelResponse {}))
     }
 
     async fn get_lsp_info(

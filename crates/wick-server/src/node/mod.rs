@@ -199,6 +199,16 @@ pub enum NodeCmd {
         /// Response channel.
         resp: oneshot::Sender<anyhow::Result<Vec<ChannelSummary>>>,
     },
+    /// Cooperatively close a channel. Phase-4: the closing transaction is
+    /// signed via the on-device VLS signer over `SignerService::Attach`.
+    CloseChannel {
+        /// 32-byte channel id of the channel to close.
+        channel_id: lightning::ln::types::ChannelId,
+        /// Counterparty pubkey carried on the channel.
+        counterparty: bitcoin::secp256k1::PublicKey,
+        /// Response channel.
+        resp: oneshot::Sender<anyhow::Result<()>>,
+    },
     /// Negotiate LSPS2 `lsps2.get_info` and return a fee quote.
     Lsps2GetInfo {
         /// Optional payment size to filter the LSP's fee menu against.

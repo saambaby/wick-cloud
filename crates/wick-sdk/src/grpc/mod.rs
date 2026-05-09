@@ -216,6 +216,22 @@ impl LightningClient {
         Ok(())
     }
 
+    pub(crate) async fn close_channel(
+        &self,
+        channel_id: [u8; 32],
+        counterparty: bitcoin::secp256k1::PublicKey,
+    ) -> Result<()> {
+        let mut client = self.inner.clone();
+        client
+            .close_channel(pb::CloseChannelRequest {
+                tenant_id: 0,
+                channel_id: channel_id.to_vec(),
+                counterparty_pubkey_hex: hex::encode(counterparty.serialize()),
+            })
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn list_channels(&self) -> Result<Vec<ChannelSummary>> {
         let mut client = self.inner.clone();
         let resp = client

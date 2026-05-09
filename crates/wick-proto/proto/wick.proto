@@ -57,6 +57,16 @@ service WalletService {
   // ListChannels returns a snapshot of the tenant's current channels.
   rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
 
+  // CloseChannel cooperatively closes a channel by `channel_id`. The
+  // counterparty pubkey must match the one carried on the channel.
+  // Phase-4: closing-tx signing round-trips through VLS over
+  // `SignerService::Attach`; the on-chain refund lands on the
+  // server-side `OutputSweeperSync` change destination if one is
+  // wired (see project gotchas — Phase 4 promises this routes to
+  // client BDK addresses; current builder leaves the destination
+  // unwired so refunds materialise as `lightning_balance().onchain_sats`).
+  rpc CloseChannel(CloseChannelRequest) returns (CloseChannelResponse);
+
   // GetLspInfo returns the operator-mode LSP's pubkey + listen address
   // so SDK clients can connect their tenant Node directly. Server-mode
   // deployments without an LSP enabled return an empty pubkey.
@@ -319,6 +329,21 @@ message ChannelSummary {
   // `true` once the channel is funded, confirmed, and ready for payments.
   bool is_usable = 6;
 }
+
+// ── CloseChannel ──────────────────────────────────────────────────────────────
+
+message CloseChannelRequest {
+  uint64 tenant_id = 1;
+
+  // 32-byte channel id of the channel to close.
+  bytes channel_id = 2;
+
+  // 33-byte compressed SEC1 counterparty pubkey hex. Must match the
+  // counterparty stored on the channel; otherwise LDK rejects.
+  string counterparty_pubkey_hex = 3;
+}
+
+message CloseChannelResponse {}
 
 // ── LSP / LSPS2 (Phase 3) ─────────────────────────────────────────────────────
 
