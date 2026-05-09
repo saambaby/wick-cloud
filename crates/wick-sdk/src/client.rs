@@ -20,9 +20,10 @@ use parking_lot::RwLock;
 
 use crate::chain::EsploraChain;
 use crate::config::WickConfig;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::grpc::{empty_token, LightningClient, SharedToken};
 use crate::identity::Identity;
+use crate::pinning::{self, PinWitness, TransparencyLog};
 use crate::types::{
     Balance, ChannelSummary, CreateTenantOutcome, JitInvoice, JitQuote, LspInfo, NodeInfo,
     PaymentRecord, PaymentResult, ReceiveInvoice,
@@ -49,6 +50,9 @@ struct Inner {
     /// Dropped when the last `WickClient` clone is released, which fires
     /// the watch-channel shutdown signal inside `SignerHandle::drop`.
     signer: RwLock<Option<SignerHandle>>,
+    /// Phase-4 transparency-log handle. Default is `NoOpLog`; tests can
+    /// install a stub via `with_transparency_log`.
+    transparency_log: Arc<dyn TransparencyLog>,
 }
 
 impl WickClient {
@@ -77,9 +81,11 @@ impl WickClient {
                 token,
                 tenant_id: RwLock::new(None),
                 signer: RwLock::new(None),
+                transparency_log: pinning::default_log(),
             }),
         })
     }
+
 
     // ── Identity ─────────────────────────────────────────────────────────────
 
@@ -132,6 +138,36 @@ impl WickClient {
             .await?;
         *self.inner.token.write() = Some(outcome.api_token.clone());
         *self.inner.tenant_id.write() = Some(outcome.tenant_id.clone());
+
+        // Phase-4 server pubkey pinning. Skipped on `Regtest` (no pin)
+        // and when the operator hasn't supplied an override on a
+        // network that has no release const yet. On signet / mutinynet
+        // / bitcoin we constant-time-compare the server's tenant LN
+        // pubkey against the expected pin and hand a witness to the
+        // installed transparency log. The default `NoOpLog` always Oks.
+        let node_info = self.inner.ln.get_node_info().await?;
+        let actual_pubkey = node_info.pubkey.serialize();
+        if let Some((expected, source)) =
+            pinning::expected_pubkey(self.inner.config.network, self.inner.config.expected_server_pubkey)
+        {
+            if !pinning::ct_eq_pubkey(&actual_pubkey, &expected) {
+                return Err(Error::ServerPubkeyMismatch {
+                    expected: pinning::fingerprint(&expected),
+                    actual: pinning::fingerprint(&actual_pubkey),
+                    pin_source: source,
+                });
+            }
+            let witness = PinWitness {
+                source,
+                pubkey: actual_pubkey,
+                observed_at: std::time::SystemTime::now(),
+            };
+            self.inner
+                .transparency_log
+                .verify(&witness)
+                .await
+                .map_err(|e| Error::TransparencyVerify(e.to_string()))?;
+        }
 
         // Phase-4: spawn the on-device signer loop on a background task as
         // soon as we have a bearer token. The server's per-tenant
@@ -194,6 +230,15 @@ impl WickClient {
     /// Required so other clients can [`Self::connect_peer`] to this tenant.
     pub async fn node_info(&self) -> Result<NodeInfo> {
         self.inner.ln.get_node_info().await
+    }
+
+    /// Short hex SHA-256 fingerprint of the server's tenant LN pubkey
+    /// (first 16 hex chars). Suitable for the user-facing settings UI
+    /// — pair it with the expected pin's [`pinning::fingerprint`] so a
+    /// user can eyeball-verify a self-hosted endpoint.
+    pub async fn server_fingerprint(&self) -> Result<String> {
+        let info = self.node_info().await?;
+        Ok(pinning::fingerprint(&info.pubkey.serialize()))
     }
 
     /// Connect to a Lightning peer over P2P and persist it for reconnection.

@@ -43,6 +43,16 @@ pub struct WickConfig {
 
     /// Parallel Esplora HTTP requests during sync.
     pub parallel_esplora_requests: usize,
+
+    /// Operator-supplied override for the expected server pubkey.
+    ///
+    /// Phase-4 server-pubkey pinning: when `Some`, this 33-byte
+    /// compressed secp256k1 pubkey takes precedence over the SDK's
+    /// release-pinned const for the configured network. Set this when
+    /// dialing a self-hosted `wick-server` whose pubkey isn't in the
+    /// upstream SDK release pin. `None` means "use the release pin
+    /// for `network`" (or, on `Regtest`, no pin at all).
+    pub expected_server_pubkey: Option<[u8; 33]>,
 }
 
 impl WickConfig {
@@ -57,6 +67,7 @@ impl WickConfig {
             esplora_url: network.default_esplora().to_owned(),
             gap_limit: DEFAULT_GAP_LIMIT,
             parallel_esplora_requests: DEFAULT_PARALLEL_ESPLORA_REQUESTS,
+            expected_server_pubkey: None,
         }
     }
 

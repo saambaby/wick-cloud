@@ -8,6 +8,8 @@
 
 use thiserror::Error;
 
+use crate::pinning::PinSource;
+
 /// Convenience alias used throughout the SDK.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -58,6 +60,27 @@ pub enum Error {
     /// [`crate::WickConfig`] validation failure.
     #[error("config error: {0}")]
     Config(String),
+
+    /// The server pubkey returned at register-time did not match the
+    /// expected pin (release const or operator override). Both
+    /// fingerprints are short hex SHA-256 prefixes.
+    #[error(
+        "server pubkey mismatch (expected fingerprint {expected}, got {actual}, pin {pin_source:?})"
+    )]
+    ServerPubkeyMismatch {
+        /// Short hex SHA-256 fingerprint of the *expected* pubkey.
+        expected: String,
+        /// Short hex SHA-256 fingerprint of the pubkey the server
+        /// actually returned.
+        actual: String,
+        /// Where the expected pubkey came from.
+        pin_source: PinSource,
+    },
+
+    /// The transparency-log inclusion check failed for the observed
+    /// server pubkey. The inner string is the upstream error message.
+    #[error("transparency log verification failed: {0}")]
+    TransparencyVerify(String),
 }
 
 impl From<tonic::Status> for Error {

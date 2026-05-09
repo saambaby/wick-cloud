@@ -30,6 +30,7 @@ mod error;
 mod grpc;
 mod identity;
 mod operator;
+pub mod pinning;
 pub mod signer;
 mod types;
 mod wallet;
