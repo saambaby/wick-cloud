@@ -12,8 +12,12 @@ description = "Macaroon HMAC chain + nonce revocation set + spend-window caveat.
 workspace = true
 
 [dependencies]
-wick-core = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
+rand = { workspace = true }
+subtle = "2"
+
+[dev-dependencies]
+proptest = { workspace = true }

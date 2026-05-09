@@ -4438,9 +4438,11 @@ name = "wick-macaroon"
 version = "0.1.0"
 dependencies = [
  "hmac",
+ "proptest",
+ "rand 0.8.5",
  "sha2",
+ "subtle",
  "thiserror 1.0.69",
- "wick-core",
  "zeroize",
 ]
 
