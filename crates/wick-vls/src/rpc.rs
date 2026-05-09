@@ -534,6 +534,11 @@ pub async fn rpc_setup_channel_from_primitives(
 ///
 /// Wire — request:  `[0xFD05 BE][u8 version=1][u32 LE index]`
 /// Wire — response: `[u16 LE addr_len][addr_bytes][script_pubkey]`
+///
+/// `version=1` derives `m/<index>` from the master xprv (legacy path —
+/// retained for backwards compatibility with older SDKs). Prefer
+/// [`rpc_get_wallet_address_v2`] which uses the BIP84 keychain so addresses
+/// match the SDK's BDK wallet.
 pub async fn rpc_get_wallet_address(
     conn: &SignerConnection,
     index: u32,
@@ -559,6 +564,50 @@ pub async fn rpc_get_wallet_address(
     }
     let address = String::from_utf8(reply[2..2 + addr_len].to_vec())
         .map_err(|e| anyhow::anyhow!("rpc_get_wallet_address: invalid UTF-8 address: {e}"))?;
+    let script_pubkey = reply[2 + addr_len..].to_vec();
+    Ok((address, script_pubkey))
+}
+
+/// Wick extension `0xFD05` v2: derive a wallet address on the BIP84
+/// keychain so the script lands on the SDK's on-device BDK wallet.
+///
+/// Wire — request:  `[0xFD05 BE][u8 version=2][u8 change][u32 LE index]`
+/// Wire — response: `[u16 LE addr_len][addr_bytes][script_pubkey]`
+///
+/// `change == false` ⇒ external keychain (`m/84'/coin'/0'/0/<index>`);
+/// `change == true`  ⇒ internal/change keychain (`m/84'/coin'/0'/1/<index>`).
+/// Use the change keychain for refund / sweep destinations so addresses
+/// stay off the user-visible receive list.
+pub async fn rpc_get_wallet_address_v2(
+    conn: &SignerConnection,
+    index: u32,
+    change: bool,
+) -> anyhow::Result<(String, Vec<u8>)> {
+    const TYPE_BE: [u8; 2] = 0xFD05u16.to_be_bytes();
+    const VERSION: u8 = 2;
+    let mut request = Vec::with_capacity(2 + 1 + 1 + 4);
+    request.extend_from_slice(&TYPE_BE);
+    request.push(VERSION);
+    request.push(u8::from(change));
+    request.extend_from_slice(&index.to_le_bytes());
+
+    let reply = conn.dispatch_node_call(request, VLS_TIMEOUT).await?;
+    if reply.len() < 2 {
+        anyhow::bail!(
+            "rpc_get_wallet_address_v2: reply too short ({}B)",
+            reply.len()
+        );
+    }
+    let addr_len = u16::from_le_bytes([reply[0], reply[1]]) as usize;
+    if reply.len() < 2 + addr_len {
+        anyhow::bail!(
+            "rpc_get_wallet_address_v2: expected {}B for address, got {}B",
+            2 + addr_len,
+            reply.len()
+        );
+    }
+    let address = String::from_utf8(reply[2..2 + addr_len].to_vec())
+        .map_err(|e| anyhow::anyhow!("rpc_get_wallet_address_v2: invalid UTF-8 address: {e}"))?;
     let script_pubkey = reply[2 + addr_len..].to_vec();
     Ok((address, script_pubkey))
 }

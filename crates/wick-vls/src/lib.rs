@@ -34,6 +34,7 @@
 //!   Inputs/outputs are plain primitives (`[u8;33]`, `[u8;64]`, `Vec<u8>`),
 //!   so the LDK adapter stays free of `vls_protocol` types.
 
+mod change_destination;
 mod connection;
 mod meta_store;
 mod registry;
@@ -41,6 +42,7 @@ mod session;
 
 pub mod rpc;
 
+pub use change_destination::VlsChangeDestination;
 pub use connection::SignerConnection;
 pub use meta_store::{ChannelMetaStore, ChannelMetaStoreRef, StoredChannelMeta};
 pub use registry::{ConnLookup, OutboundSignerFrame, SignerSessionRegistry, StateSyncChannel};

@@ -518,6 +518,14 @@ impl wick_lightning::WickSigner for SignerSession {
     fn set_signer_unblock_callback(&self, cb: Box<dyn Fn() + Send + Sync>) {
         SignerSession::set_signer_unblock(self, cb);
     }
+
+    fn change_destination_source(
+        &self,
+    ) -> Option<Arc<dyn lightning::sign::ChangeDestinationSourceSync + Send + Sync>> {
+        Some(Arc::new(crate::change_destination::VlsChangeDestination::new(
+            self.lookup.clone(),
+        )))
+    }
 }
 
 // ── EntropySource ─────────────────────────────────────────────────────────────

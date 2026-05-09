@@ -751,9 +751,25 @@ where
         let event_handler = Arc::new(event_handler);
 
         // Build a real OutputSweeperSync when a change destination is
-        // configured; otherwise pass `None` and park any SpendableOutputs
+        // available; otherwise pass `None` and park any SpendableOutputs
         // in LDK's monitor state until a destination is configured.
-        let sweeper: Option<Arc<LnOutputSweeper<S>>> = change_destination.map(|script| {
+        //
+        // Resolution order:
+        //   1. Signer-supplied source (`WickSigner::change_destination_source`).
+        //      VLS-backed signers return a `VlsChangeDestination` that asks
+        //      the SDK for a fresh BIP84 change address per sweep — Phase-4
+        //      promise that refunds land on the user's on-device BDK wallet.
+        //   2. Caller-supplied fixed script (`with_change_destination`). Used
+        //      by `KeysManager`-backed dev / regtest signers + tests.
+        //   3. None — sweeper disabled, outputs park in LDK monitor state.
+        let change_source: Option<Arc<dyn ChangeDestinationSourceSync + Send + Sync>> =
+            signer.change_destination_source().or_else(|| {
+                change_destination.map(|script| {
+                    Arc::new(FixedChangeDest(script))
+                        as Arc<dyn ChangeDestinationSourceSync + Send + Sync>
+                })
+            });
+        let sweeper: Option<Arc<LnOutputSweeper<S>>> = change_source.map(|src| {
             let best_block_for_sweeper = BestBlock::new(
                 best_block_header.header.block_hash(),
                 best_block_header.height,
@@ -764,7 +780,7 @@ where
                 deps.fee_estimator.clone(),
                 None::<Arc<dyn Filter + Send + Sync>>,
                 signer.clone(),
-                Arc::new(FixedChangeDest(script)),
+                src,
                 kv_store.clone(),
                 deps.logger.clone(),
             ))
@@ -1092,14 +1108,13 @@ impl ChangeDestinationSourceSync for FixedChangeDest {
 
 /// Concrete [`OutputSweeperSync`] type over our signer `S`.
 ///
-/// `NoChangeDest` is kept here (as a dead struct) as a compatibility
-/// placeholder for paths that still construct the type for `None::<_>`
-/// inference — but the real instance uses `FixedChangeDest`. We declare
-/// `LnOutputSweeper` with `FixedChangeDest` so the `Some(sweeper)` branch
-/// types cleanly.
+/// The change-destination slot is a runtime-pluggable trait object so the
+/// same `OutputSweeperSync<...>` type covers both:
+///   * `FixedChangeDest` (caller-supplied script, dev / regtest path), and
+///   * [`wick_vls::VlsChangeDestination`] (Phase-4 SDK BDK path).
 type LnOutputSweeper<S> = OutputSweeperSync<
     Arc<crate::chain::EsploraBroadcaster>,
-    Arc<FixedChangeDest>,
+    Arc<dyn ChangeDestinationSourceSync + Send + Sync>,
     Arc<crate::chain::FeeEstimator>,
     Arc<dyn Filter + Send + Sync>,
     Arc<PgKvStore>,

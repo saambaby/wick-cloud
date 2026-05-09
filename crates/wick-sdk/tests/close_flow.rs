@@ -10,15 +10,15 @@
 //!   signing of the closing tx → broadcast → confirmation → channel
 //!   removal from the LDK `list_channels` snapshot.
 //!
-//! ## Phase-4 refund destination — known gap
+//! ## Phase-4 refund destination
 //!
-//! Phase 4 promises that the on-chain refund lands on the *client-side*
-//! BDK wallet (Alice's `next_address_p2wpkh()` / `onchain_spendable_sat`).
-//! The current `wick-lightning` builder leaves `OutputSweeperSync`'s
-//! change destination wired to the server-held BDK so the refund still
-//! materialises as `lightning_balance().onchain_sats`. The assertion
-//! below accepts *either* outcome and documents the gap; flipping the
-//! destination is out of scope for B4.
+//! Phase 4 routes the on-chain refund to the *client-side* BDK wallet
+//! (Alice's `next_address_p2wpkh()` / `onchain_spendable_sat`). The
+//! `wick-lightning` builder wires the background `OutputSweeperSync`'s
+//! change destination to a `VlsChangeDestination` that asks the SDK for
+//! a fresh BIP84 change address per sweep via the `0xFD05` v2 extension
+//! RPC, so closes drop the refund directly onto the user's on-device
+//! wallet — the assertion below requires it.
 //!
 //! ## Prerequisites
 //!
@@ -239,10 +239,13 @@ async fn mutual_close_routes_refund_to_client_wallet() {
 
     // ── Phase-4 promise: refund to client-side BDK ────────────────────────
     //
-    // The test accepts either side: the on-chain refund either lands
-    // on Alice's client-side BDK wallet (the Phase-4 goal) OR on the
-    // server-side wallet exposed via `lightning_balance().onchain_sats`.
-    // See the file-level docstring for the gap details.
+    // The refund must land on Alice's client-side BDK wallet via the
+    // `VlsChangeDestination` route (`0xFD05` v2). After a coop close of
+    // a 200k-sat channel funded from a 1M-sat wallet, ignoring fees,
+    // Alice should recover most of the original 1M minus mining fees —
+    // require ≥ `FUNDING_TRANSFER_SAT - CHANNEL_VALUE_SAT - 50_000`
+    // (i.e. she funded a 200k channel, the close refunded it, fees
+    // bounded at ~50k sats end-to-end).
     alice.sync_onchain().await.expect("alice sync_onchain");
     let client_onchain = alice.onchain_spendable_sat().expect("alice onchain_spendable_sat");
     let server_onchain = alice
@@ -251,26 +254,14 @@ async fn mutual_close_routes_refund_to_client_wallet() {
         .expect("alice lightning_balance")
         .onchain_sats;
 
-    // After a coop close of a 200k-sat channel funded from a 1M-sat
-    // wallet (and ignoring fees), one of these two paths should hold:
-    //   • client-side: client wallet recovered ≥ ~150k sats of refund
-    //     (we lost ~CHANNEL_VALUE_SAT to the channel, then got most of
-    //     it back)
-    //   • server-side: server wallet shows non-zero onchain_sats
-    let refund_client_side = client_onchain
-        > FUNDING_TRANSFER_SAT.saturating_sub(CHANNEL_VALUE_SAT) + (CHANNEL_VALUE_SAT / 2);
-    let refund_server_side = server_onchain > 0;
-
-    assert!(
-        refund_client_side || refund_server_side,
-        "refund landed neither client-side nor server-side: \
-         client_onchain={client_onchain} server_onchain={server_onchain} \
-         (CHANNEL_VALUE_SAT={CHANNEL_VALUE_SAT}, FUNDING_TRANSFER_SAT={FUNDING_TRANSFER_SAT})"
+    eprintln!(
+        "mutual_close: client_onchain={client_onchain} server_onchain={server_onchain}"
     );
 
-    eprintln!(
-        "mutual_close: client_onchain={client_onchain} server_onchain={server_onchain} \
-         (refund_client_side={refund_client_side}, refund_server_side={refund_server_side})"
+    assert!(
+        client_onchain > FUNDING_TRANSFER_SAT - CHANNEL_VALUE_SAT - 50_000,
+        "refund did not land on client-side BDK after VLS close: \
+         client_onchain={client_onchain} server_onchain={server_onchain}"
     );
 
     let _ = server; // keep alive until end; Drop kills the subprocess

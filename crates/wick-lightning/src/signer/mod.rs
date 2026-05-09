@@ -19,7 +19,12 @@ pub mod keys_manager;
 
 pub use keys_manager::{from_seed, LocalKeysManager};
 
-use lightning::sign::{EntropySource, KeysManager, NodeSigner, OutputSpender, SignerProvider};
+use std::sync::Arc;
+
+use lightning::sign::{
+    ChangeDestinationSourceSync, EntropySource, KeysManager, NodeSigner, OutputSpender,
+    SignerProvider,
+};
 
 /// Unified capability boundary required by [`crate::Node`].
 ///
@@ -69,6 +74,24 @@ pub trait WickSigner:
     /// `KeysManager`-backed signers never park work and so don't need
     /// the unblock pump.
     fn set_signer_unblock_callback(&self, _cb: Box<dyn Fn() + Send + Sync>) {}
+
+    /// Optional [`ChangeDestinationSourceSync`] this signer wants the
+    /// background [`OutputSweeperSync`](lightning::util::sweep::OutputSweeperSync)
+    /// to use for force-close / HTLC-timeout / sweep change outputs.
+    ///
+    /// `Some(..)` overrides any caller-supplied
+    /// [`NodeBuilder::with_change_destination`](crate::NodeBuilder::with_change_destination)
+    /// fixed script — e.g. VLS-backed signers return a source that asks
+    /// the SDK for a fresh BIP84 change address per sweep so refunds
+    /// land on the user's on-device BDK wallet.
+    ///
+    /// Default `None` keeps the legacy fixed-script behaviour for
+    /// `KeysManager`-backed dev signers.
+    fn change_destination_source(
+        &self,
+    ) -> Option<Arc<dyn ChangeDestinationSourceSync + Send + Sync>> {
+        None
+    }
 }
 
 // Explicit impl for LDK's KeysManager (used by tests + the dev signer).

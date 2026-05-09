@@ -656,31 +656,80 @@ fn handle_get_ldk_node_keys(
     Ok((req_id, body))
 }
 
-/// Wire — request:  `[u8 version=1][u32 LE index]`
+/// Wire — request:
+///   v1:  `[u8 version=1][u32 LE index]`               — legacy, derives `m/<index>` from master
+///   v2:  `[u8 version=2][u8 change][u32 LE index]`    — BIP84: `m/84'/coin'/0'/<change>/<index>`
 /// Wire — response: `[u16 LE addr_len][addr_bytes][script_pubkey]`
+///
+/// v2 is what the Phase-4 server-side `VlsChangeDestination` issues for
+/// channel-close refund / sweep change outputs so addresses match the
+/// SDK's BDK BIP84 wallet keychain.
 fn handle_get_wallet_address(
     req_id: u32,
     payload: &[u8],
     xprv: &Xpriv,
-    network: WickNetwork,
+    network: WickNetwork
 ) -> std::result::Result<(u32, Vec<u8>), (u32, String)> {
-    if payload.len() < 5 {
+    if payload.is_empty() {
         return Err((req_id, "GetWalletAddress: payload too short".to_owned()));
     }
-    if payload[0] != 1 {
-        return Err((req_id, "GetWalletAddress: unsupported version".to_owned()));
-    }
-    let index = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    let version = payload[0];
+
+    // Resolve `(change_idx, index)` based on version. Both versions
+    // produce a P2WPKH address; v2 just routes through the BIP84
+    // keychain so the BDK wallet recognises the script.
+    let (use_bip84, change_idx, index) = match version {
+        1 => {
+            if payload.len() < 5 {
+                return Err((req_id, "GetWalletAddress v1: payload too short".to_owned()));
+            }
+            let index = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+            (false, 0u32, index)
+        }
+        2 => {
+            if payload.len() < 6 {
+                return Err((req_id, "GetWalletAddress v2: payload too short".to_owned()));
+            }
+            let change_byte = payload[1];
+            let change_idx = match change_byte {
+                0 => 0u32,
+                1 => 1u32,
+                _ => {
+                    return Err((
+                        req_id,
+                        format!("GetWalletAddress v2: invalid change byte {change_byte}"),
+                    ))
+                }
+            };
+            let index = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+            (true, change_idx, index)
+        }
+        _ => return Err((req_id, format!("GetWalletAddress: unsupported version {version}"))),
+    };
 
     let secp = Secp256k1::new();
-    let path = DerivationPath::from(
-        vec![
-            ChildNumber::from_normal_idx(index).map_err(|e| (
-                req_id,
-                format!("derive index {index}: {e}"),
-            ))?
-        ]
-    );
+    let path: DerivationPath = if use_bip84 {
+        // m/84'/coin'/0'/<change>/<index> — must match the BDK
+        // descriptor in `wallet::descriptors_bip84` so the address is
+        // recognised as belonging to the wallet's change keychain.
+        let coin = network.bip84_coin_type();
+        DerivationPath::from(vec![
+            ChildNumber::from_hardened_idx(84)
+                .map_err(|e| (req_id, format!("derive 84': {e}")))?,
+            ChildNumber::from_hardened_idx(coin)
+                .map_err(|e| (req_id, format!("derive coin {coin}': {e}")))?,
+            ChildNumber::from_hardened_idx(0)
+                .map_err(|e| (req_id, format!("derive 0': {e}")))?,
+            ChildNumber::from_normal_idx(change_idx)
+                .map_err(|e| (req_id, format!("derive change {change_idx}: {e}")))?,
+            ChildNumber::from_normal_idx(index)
+                .map_err(|e| (req_id, format!("derive index {index}: {e}")))?,
+        ])
+    } else {
+        DerivationPath::from(vec![ChildNumber::from_normal_idx(index)
+            .map_err(|e| (req_id, format!("derive index {index}: {e}")))?])
+    };
+
     let derived = xprv
         .derive_priv(&secp, &path)
         .map_err(|e| (req_id, format!("derive priv: {e}")))?;
