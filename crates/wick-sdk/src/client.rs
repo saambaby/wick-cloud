@@ -20,6 +20,10 @@ use parking_lot::RwLock;
 
 use crate::chain::EsploraChain;
 use crate::config::WickConfig;
+use crate::credential::{
+    self, Credential, CredentialKind, CredentialStore, InMemoryStore, RotationConfig,
+    RotationHandle, RotationLoop,
+};
 use crate::error::{Error, Result};
 use crate::grpc::{empty_token, LightningClient, SharedToken};
 use crate::identity::Identity;
@@ -53,6 +57,15 @@ struct Inner {
     /// Phase-4 transparency-log handle. Default is `NoOpLog`; tests can
     /// install a stub via `with_transparency_log`.
     transparency_log: Arc<dyn TransparencyLog>,
+    /// D3 M4 — pluggable credential storage. Default in-memory; callers
+    /// can install a keychain/file-backed impl via
+    /// [`WickClient::with_credential_store`] before [`WickClient::register`].
+    /// Wrapped in `RwLock` so the builder doesn't need to rebuild `Inner`.
+    credential_store: RwLock<Arc<dyn CredentialStore>>,
+    /// Background credential-rotation task. `Some` after `register()`
+    /// once the server returns a macaroon; `None` while the SDK still
+    /// holds a legacy bearer (no expiry to watch).
+    rotation: RwLock<Option<RotationHandle>>,
 }
 
 impl WickClient {
@@ -82,8 +95,28 @@ impl WickClient {
                 tenant_id: RwLock::new(None),
                 signer: RwLock::new(None),
                 transparency_log: pinning::default_log(),
+                credential_store: RwLock::new(Arc::new(InMemoryStore::default())),
+                rotation: RwLock::new(None),
             }),
         })
+    }
+
+    /// Install a custom credential store (keychain / file / etc).
+    ///
+    /// Must be called before [`Self::register`] — registration is what
+    /// writes the first credential, and the rotation loop binds to the
+    /// store that was installed at that moment. The store is swapped on
+    /// the existing `Inner` so all clones of this client see the change.
+    #[must_use]
+    pub fn with_credential_store(self, store: Arc<dyn CredentialStore>) -> Self {
+        *self.inner.credential_store.write() = store;
+        self
+    }
+
+    /// Snapshot the currently installed [`CredentialStore`].
+    #[must_use]
+    pub fn credential_store(&self) -> Arc<dyn CredentialStore> {
+        Arc::clone(&*self.inner.credential_store.read())
     }
 
 
@@ -138,6 +171,38 @@ impl WickClient {
             .await?;
         *self.inner.token.write() = Some(outcome.api_token.clone());
         *self.inner.tenant_id.write() = Some(outcome.tenant_id.clone());
+
+        // D3 M4 — persist the credential into the swappable store and
+        // (if it's a macaroon with an expiry caveat) spawn the rotation
+        // loop. Bytes today are the legacy bearer token's UTF-8 form;
+        // D3 M3 will start returning serialised macaroon bytes here,
+        // detected via [`credential::classify`]. Both code paths share
+        // the same store + interceptor plumbing.
+        let bytes = outcome.api_token.as_bytes().to_vec();
+        let (kind, expires_at) = credential::classify(&bytes);
+        let cred = Credential {
+            bytes,
+            kind,
+            expires_at,
+        };
+        let store = self.credential_store();
+        store.save(cred).await;
+
+        if kind == CredentialKind::Macaroon && expires_at.is_some() {
+            // Wire the rotation loop with the placeholder closure — the
+            // server-side `RotateCredential` RPC ships in D3 M3. Until
+            // then the loop will get `Unimplemented` from the closure
+            // and retry on the standard backoff schedule. When M3 lands,
+            // swap `unimplemented_rotate_fn()` for a closure that calls
+            // the real RPC and the SDK starts rotating without changes.
+            let handle = RotationLoop::new(
+                Arc::clone(&store),
+                credential::unimplemented_rotate_fn(),
+                RotationConfig::default(),
+            )
+            .spawn();
+            *self.inner.rotation.write() = Some(handle);
+        }
 
         // Phase-4 server pubkey pinning. Skipped on `Regtest` (no pin)
         // and when the operator hasn't supplied an override on a

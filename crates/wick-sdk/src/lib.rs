@@ -26,6 +26,7 @@
 mod chain;
 mod client;
 mod config;
+pub mod credential;
 mod error;
 mod grpc;
 mod identity;
@@ -45,6 +46,10 @@ pub mod regtest;
 
 pub use client::WickClient;
 pub use config::WickConfig;
+pub use credential::{
+    Credential, CredentialKind, CredentialStore, InMemoryStore, RotationConfig, RotationHandle,
+    RotationLoop,
+};
 pub use error::{Error, Result};
 pub use operator::{
     compute_operator_lsp_pubkey, run_funding_loop, OperatorClient, PendingFundingEvent,

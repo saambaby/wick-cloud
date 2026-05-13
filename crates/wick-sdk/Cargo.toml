@@ -59,7 +59,7 @@ rand                = { workspace = true }
 bitcoincore-rpc = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio             = { workspace = true, features = ["macros", "rt-multi-thread", "process"] }
+tokio             = { workspace = true, features = ["macros", "rt-multi-thread", "process", "test-util"] }
 rand              = { workspace = true }
 lightning         = { workspace = true }
 lightning-invoice = { workspace = true }
