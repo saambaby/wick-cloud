@@ -81,6 +81,13 @@ service WalletService {
   // Internally negotiates `lsps2.get_info` + `lsps2.buy` then embeds
   // the LSP's intercept SCID as a private route hint in the invoice.
   rpc GetJitInvoice(GetJitInvoiceRequest) returns (GetJitInvoiceResponse);
+
+  // RotateCredential mints a fresh macaroon under the same root key /
+  // scope as the supplied (currently-valid) old macaroon. The old
+  // macaroon's nonce is added to the global revocation set with a 30s
+  // TTL grace, so in-flight RPCs finish but replays fail. Returns the
+  // new macaroon bytes and its server-derived expiry. D3 M3.
+  rpc RotateCredential(RotateCredentialRequest) returns (RotateCredentialResponse);
 }
 
 // ── RegisterChallenge ────────────────────────────────────────────────────────
@@ -125,7 +132,15 @@ message CreateTenantResponse {
   // never re-issued. Include in all subsequent requests as:
   //   Authorization: Bearer <token>
   // Phase 4 replaces this with a macaroon (architecture §5.4).
+  // Transitional: retained alongside `macaroon` until D3 M5 retires it.
   string api_token = 2;
+
+  // D3 M3 — server-issued user-scoped macaroon. If non-empty, new SDK
+  // builds prefer this over `api_token`. The macaroon carries the same
+  // tenant identity as `tenant_id` (Scope::User { tenant_id }) and a
+  // 24-hour Expiry caveat. The SDK auto-rotates via `RotateCredential`
+  // before the expiry.
+  bytes macaroon = 3;
 }
 
 // ── GetBalance ────────────────────────────────────────────────────────────────
@@ -406,6 +421,23 @@ message GetJitInvoiceResponse {
 
   // 33-byte LSP pubkey hex (for display / verification).
   string lsp_pubkey_hex = 4;
+}
+
+// ── RotateCredential (D3 M3) ──────────────────────────────────────────────────
+
+message RotateCredentialRequest {
+  // Old macaroon — must be currently valid (chain verifies, not revoked,
+  // not expired). Server uses it to authenticate the request and then
+  // adds its nonce to revocation with a 30s TTL grace.
+  bytes old_macaroon = 1;
+}
+
+message RotateCredentialResponse {
+  // Freshly-minted macaroon under the same scope as the old one.
+  bytes new_macaroon = 1;
+  // Convenience: server-derived expiry of the new macaroon, unix seconds.
+  // The SDK can also parse this from the macaroon directly.
+  int64 expires_at_unix = 2;
 }
 
 // ── AdminService (slice 3.3a) ─────────────────────────────────────────────────

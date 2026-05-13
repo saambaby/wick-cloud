@@ -40,10 +40,13 @@ use wick_proto::wick::{
     OpenChannelFinalizeResponse, OpenChannelInitRequest, OpenChannelInitResponse, Payment,
     ReceivePaymentRequest, ReceivePaymentResponse, RegisterChallengeRequest,
     RegisterChallengeResponse, RegisterLspIdentityRequest, RegisterLspIdentityResponse,
-    SendPaymentRequest, SendPaymentResponse,
+    RotateCredentialRequest, RotateCredentialResponse, SendPaymentRequest, SendPaymentResponse,
 };
 
+use wick_macaroon::{Macaroon, Scope, USER_DEFAULT_LIFETIME};
+
 use crate::auth::Auth;
+use crate::macaroon_auth::{MacaroonAuth, ROTATION_GRACE_TTL};
 use crate::node::{
     manager::{DispatchError, NodeManager, ProvisionError},
     NodeCmd,
@@ -117,6 +120,11 @@ pub struct WickGrpcService {
     /// In-memory store of issued-but-not-yet-redeemed registration
     /// nonces. See [`NonceStore`].
     nonce_store: Arc<NonceStore>,
+    /// D3 M3 — macaroon verification + issuance. When present, the
+    /// service mints user-scoped macaroons at `create_tenant` and
+    /// serves the `rotate_credential` RPC. When `None` (legacy boot)
+    /// the bearer path is the only auth surface.
+    macaroon_auth: Option<MacaroonAuth>,
 }
 
 impl std::fmt::Debug for WickGrpcService {
@@ -139,6 +147,7 @@ impl WickGrpcService {
             lsp_info: None,
             lsp_daemon_slot: None,
             nonce_store: Arc::new(NonceStore::new()),
+            macaroon_auth: None,
         }
     }
 
@@ -157,7 +166,16 @@ impl WickGrpcService {
             lsp_info: Some(lsp_info),
             lsp_daemon_slot: Some(lsp_daemon_slot),
             nonce_store: Arc::new(NonceStore::new()),
+            macaroon_auth: None,
         }
+    }
+
+    /// Attach a macaroon auth surface. Builder-style so existing
+    /// `new` / `with_lsp` call sites stay backwards-compatible.
+    #[must_use]
+    pub fn with_macaroon_auth(mut self, auth: MacaroonAuth) -> Self {
+        self.macaroon_auth = Some(auth);
+        self
     }
 
     /// Test seam: borrow the nonce store. Used by integration-style
@@ -173,6 +191,23 @@ impl WickGrpcService {
 /// unit tests don't need a running gRPC server. Returns `Ok(())` iff
 /// `signature` is a valid DER-encoded ECDSA signature over
 /// `sha256(REGISTER_DOMAIN || nonce)` against `pubkey`.
+/// Extract the unix-second expiry from an issued macaroon, if present.
+/// `Macaroon::issue` always appends an `Expiry` caveat (tag 0x01) with
+/// an 8-byte BE unix timestamp, so this is infallible for macaroons we
+/// just minted; returning an `Option` keeps the helper honest for
+/// caveat-stripped inputs.
+fn expiry_from_macaroon(m: &Macaroon) -> Option<i64> {
+    const TAG_EXPIRY: u8 = 0x01;
+    for c in m.caveats() {
+        if c.tag() == TAG_EXPIRY && c.payload().len() == 8 {
+            let mut be = [0u8; 8];
+            be.copy_from_slice(c.payload());
+            return i64::try_from(u64::from_be_bytes(be)).ok();
+        }
+    }
+    None
+}
+
 fn verify_register_signature(
     pubkey: &bitcoin::secp256k1::PublicKey,
     nonce: &[u8],
@@ -342,10 +377,98 @@ impl WalletService for WickGrpcService {
             }
         }
 
+        // D3 M3 — also mint a user-scoped macaroon when the macaroon
+        // auth surface is wired. The bearer token is retained
+        // transitionally (until D3 M5) so old clients keep working.
+        let macaroon_bytes = match &self.macaroon_auth {
+            Some(auth) => {
+                let (identifier, root_key) =
+                    auth.ensure_user_root_key(tenant_id).await.map_err(|e| {
+                        warn!(?e, %tenant_id, "create_tenant: ensure_user_root_key failed");
+                        Status::internal("failed to mint macaroon")
+                    })?;
+                let mac = Macaroon::issue(
+                    auth.location(),
+                    identifier,
+                    &root_key,
+                    Scope::User {
+                        tenant_id: *tenant_id.as_uuid().as_bytes(),
+                    },
+                    USER_DEFAULT_LIFETIME,
+                );
+                mac.serialize()
+            }
+            None => Vec::new(),
+        };
+
         info!(%tenant_id, plan_tier, "tenant registered");
         Ok(Response::new(CreateTenantResponse {
             tenant_id: tenant_id.to_string(),
             api_token: raw_token,
+            macaroon: macaroon_bytes,
+        }))
+    }
+
+    async fn rotate_credential(
+        &self,
+        request: Request<RotateCredentialRequest>,
+    ) -> Result<Response<RotateCredentialResponse>, Status> {
+        let auth = self
+            .macaroon_auth
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("macaroon auth not configured"))?;
+
+        let req = request.into_inner();
+        if req.old_macaroon.is_empty() {
+            return Err(Status::invalid_argument("old_macaroon is required"));
+        }
+
+        // Verify the old macaroon (chain, expiry, revocation, scope).
+        let ctx = auth.authenticate_macaroon_bytes(&req.old_macaroon).await?;
+        let old_nonce = ctx
+            .nonce
+            .ok_or_else(|| Status::internal("verified macaroon has no nonce"))?;
+        let scope = ctx
+            .scope
+            .ok_or_else(|| Status::internal("verified macaroon has no scope"))?;
+
+        // Re-derive the user-scope root key (same root key as the old
+        // macaroon — `ensure_user_root_key` returns the active row).
+        let tenant_id = ctx.tenant_id;
+        let (identifier, root_key) = auth.ensure_user_root_key(tenant_id).await.map_err(|e| {
+            warn!(?e, %tenant_id, "rotate_credential: ensure_user_root_key failed");
+            Status::internal("failed to load root key")
+        })?;
+
+        // Mint a fresh macaroon — fresh random nonce + fresh expiry,
+        // same Scope. Caveat order is canonical (scope, expiry, nonce);
+        // see the M3 research note.
+        let new_mac = Macaroon::issue(
+            auth.location(),
+            identifier,
+            &root_key,
+            scope,
+            USER_DEFAULT_LIFETIME,
+        );
+
+        // Atomically revoke the old nonce with a 30s grace TTL so
+        // in-flight RPCs holding the old macaroon finish, but replays
+        // start failing immediately. The in-memory `RevocationSet`
+        // ignores TTL — see `RevocationSet::revoke_with_ttl` docs.
+        auth.revocation()
+            .revoke_with_ttl(auth.pool(), old_nonce, ROTATION_GRACE_TTL, Some("rotated"))
+            .await
+            .map_err(|e| {
+                warn!(?e, "rotate_credential: revoke_with_ttl failed");
+                Status::internal("failed to record revocation")
+            })?;
+
+        // Parse the expiry off the new macaroon for the convenience field.
+        let expires_at_unix = expiry_from_macaroon(&new_mac).unwrap_or(0);
+
+        Ok(Response::new(RotateCredentialResponse {
+            new_macaroon: new_mac.serialize(),
+            expires_at_unix,
         }))
     }
 
@@ -927,6 +1050,64 @@ mod tests {
         assert!(verify_register_signature(&pk, &nonce, &[0u8; 8]).is_err());
         // Empty signature also rejected.
         assert!(verify_register_signature(&pk, &nonce, &[]).is_err());
+    }
+
+    // ── D3 M3 macaroon helpers ────────────────────────────────────────────────
+
+    #[test]
+    fn expiry_from_macaroon_reads_unix_seconds_be() {
+        use wick_macaroon::{Macaroon, RootKey, Scope, USER_DEFAULT_LIFETIME};
+        let rk = RootKey::random();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let m = Macaroon::issue(
+            "wick.cloud",
+            [3u8; 16],
+            &rk,
+            Scope::User {
+                tenant_id: [1u8; 16],
+            },
+            USER_DEFAULT_LIFETIME,
+        );
+        let exp = expiry_from_macaroon(&m).expect("expiry caveat present");
+        // Expiry must be roughly now + USER_DEFAULT_LIFETIME, with slack for
+        // wall-clock drift between the two `SystemTime::now()` reads.
+        let expected_min = before + USER_DEFAULT_LIFETIME.as_secs() as i64 - 5;
+        let expected_max = before + USER_DEFAULT_LIFETIME.as_secs() as i64 + 5;
+        assert!(
+            exp >= expected_min && exp <= expected_max,
+            "expiry {exp} not in [{expected_min}, {expected_max}]",
+        );
+    }
+
+    #[test]
+    fn rotate_mints_fresh_nonce_and_preserves_scope() {
+        // Pure macaroon-layer check — no DB needed. The handler delegates
+        // nonce randomness + caveat-chain construction to `Macaroon::issue`,
+        // so verifying that two consecutive issues under the same root key /
+        // scope produce DIFFERENT nonces + DIFFERENT signatures suffices.
+        use wick_macaroon::{Macaroon, RootKey, Scope, USER_DEFAULT_LIFETIME};
+        let rk = RootKey::random();
+        let id = [7u8; 16];
+        let scope = Scope::User {
+            tenant_id: [9u8; 16],
+        };
+        let a = Macaroon::issue("wick.cloud", id, &rk, scope, USER_DEFAULT_LIFETIME);
+        let b = Macaroon::issue("wick.cloud", id, &rk, scope, USER_DEFAULT_LIFETIME);
+        // Serialized bytes differ (nonce caveat differs).
+        assert_ne!(a.serialize(), b.serialize());
+        // Scope preserved.
+        let ctx = wick_macaroon::VerifyContext {
+            now: std::time::SystemTime::now(),
+            revoked_nonces: &std::collections::HashSet::new(),
+            expected_scope: None,
+        };
+        let av = a.verify(&rk, &ctx).unwrap();
+        let bv = b.verify(&rk, &ctx).unwrap();
+        assert_eq!(av.scope, bv.scope);
+        assert_ne!(av.nonce, bv.nonce, "fresh random nonce per issuance");
     }
 }
 

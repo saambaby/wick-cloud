@@ -26,6 +26,7 @@ wick-proto     = { workspace = true }
 wick-lightning = { workspace = true }
 wick-lsp       = { workspace = true }
 wick-vls       = { workspace = true }
+wick-macaroon  = { workspace = true, features = ["postgres"] }
 futures        = { workspace = true }
 
 tokio      = { workspace = true }
