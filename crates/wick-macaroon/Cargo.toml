@@ -11,6 +11,13 @@ description = "Macaroon HMAC chain + nonce revocation set + spend-window caveat.
 [lints]
 workspace = true
 
+[features]
+default = []
+# Pulls in the Postgres-backed `RevocationSet` (LISTEN/NOTIFY) and
+# `SpendWindowStore` (atomic UPSERT). M1 primitives stay dep-light by
+# default; M3's gRPC interceptor enables the `postgres` feature.
+postgres = ["dep:sqlx", "dep:tokio", "dep:futures", "dep:parking_lot", "dep:hex", "dep:tracing"]
+
 [dependencies]
 hmac = { workspace = true }
 sha2 = { workspace = true }
@@ -18,6 +25,14 @@ zeroize = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 subtle = "2"
+
+# Optional — only compiled with `feature = "postgres"`.
+sqlx        = { workspace = true, optional = true }
+tokio       = { workspace = true, optional = true }
+futures     = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
+hex         = { workspace = true, optional = true }
+tracing     = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

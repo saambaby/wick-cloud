@@ -4437,12 +4437,18 @@ dependencies = [
 name = "wick-macaroon"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "hex",
  "hmac",
+ "parking_lot",
  "proptest",
  "rand 0.8.5",
  "sha2",
+ "sqlx",
  "subtle",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
  "zeroize",
 ]
 

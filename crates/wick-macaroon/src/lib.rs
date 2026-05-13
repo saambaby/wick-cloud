@@ -6,6 +6,9 @@
 //! See `architecture §5.4`. Spec lives in the project session note for D3 M1.
 #![warn(missing_docs)]
 
+#[cfg(feature = "postgres")]
+pub mod store;
+
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
