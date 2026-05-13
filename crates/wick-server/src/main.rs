@@ -31,10 +31,13 @@ use wick_lsp::daemon::GriefConfig;
 use wick_proto::wick::admin_service_server::AdminServiceServer;
 use wick_proto::wick::signer_service_server::SignerServiceServer;
 use wick_vls::SignerSessionRegistry;
+use wick_macaroon::store::RevocationSet;
 use wick_server::{
+    admin_mint::{mint_admin_macaroon, ADMIN_MACAROON_LIFETIME, DEFAULT_LOCATION},
     factory,
     grpc::{ LspInfo, WickAdminGrpcService, WickGrpcService },
     lsp_bridge::ManagerLspBridge,
+    macaroon_auth::MacaroonAuth,
     node::manager::{ ManagerConfig, NodeManager },
     signer_service::WickSignerGrpcService,
 };
@@ -76,14 +79,15 @@ struct Config {
     /// behaves identically to a Phase 2 deployment.
     #[serde(default)]
     lsp: LspConfig,
-    /// Shared secret used to authenticate the operator's admin gRPC
-    /// calls (`RegisterLspIdentity`, `LspWatchPendingFunding`,
-    /// `LspFinalizeFunding`). Required when `[lsp].enabled = true` —
-    /// the admin RPCs reject every call when the secret is missing or
-    /// empty. Read from `WICK_ADMIN_SECRET` env var if not set in
-    /// config; admin RPCs gate on a metadata header equal to this.
-    /// Macaroon scope plumbing replaces this in slice 3.3c.
+    /// Deprecated — retained only so legacy `admin_secret = "..."` keys
+    /// in operator config files don't fail TOML parsing during the
+    /// rollout. Ignored at runtime; the admin gRPC path now gates on a
+    /// `Scope::Admin` macaroon (mint via
+    /// `wick-server mint-admin-macaroon`). Will be removed once all
+    /// deployments are off the env-var path. The same applies to the
+    /// `WICK_ADMIN_SECRET` env var.
     #[serde(default)]
+    #[allow(dead_code)]
     admin_secret: Option<String>,
 }
 
@@ -210,6 +214,17 @@ fn resolve_lsp_identity(cfg: &Config) -> Result<ResolvedLsp> {
 async fn main() -> Result<()> {
     tracing_init::install();
 
+    // ── Subcommand routing ───────────────────────────────────────────
+    // `wick-server mint-admin-macaroon [--out <path>] [--config <path>]`
+    // bootstraps the operator's admin credential and exits. Replaces the
+    // old `WICK_ADMIN_SECRET` env-var bootstrap. Reads the database URL
+    // from the same config file as the long-running daemon path; the
+    // admin root key (and its identifier) is created on first call,
+    // then reused by every subsequent mint.
+    if std::env::args().nth(1).as_deref() == Some("mint-admin-macaroon") {
+        return run_mint_admin_macaroon().await;
+    }
+
     let config_path = std::env
         ::args()
         .nth(2)
@@ -333,36 +348,35 @@ async fn main() -> Result<()> {
         WickGrpcService::new(manager.clone(), pool.clone())
     };
 
+    // Surface a deprecation notice if operators still set the legacy
+    // env var — the admin path now gates on macaroons exclusively.
+    if std::env::var("WICK_ADMIN_SECRET").is_ok() || cfg.admin_secret.is_some() {
+        warn!(
+            "WICK_ADMIN_SECRET / [admin_secret] is deprecated and ignored — \
+             mint an admin macaroon via `wick-server mint-admin-macaroon` instead"
+        );
+    }
+
+    // Shared macaroon auth surface — same revocation set serves both
+    // the user-scoped tenant path and the admin path so a single
+    // `RotateCredential` revoke / sweep affects every issuance lane.
+    let revocation = RevocationSet::new();
+    let macaroon_auth = MacaroonAuth::new(
+        pool.raw().clone(),
+        revocation.clone(),
+        DEFAULT_LOCATION,
+    );
+
     // Admin service — only mounted when both an LSP slot and a builder
-    // exist. Auth gate is the configured `admin_secret` (or
-    // `WICK_ADMIN_SECRET` env var). Empty / missing secret leaves the
-    // admin service unmounted entirely so it's impossible to reach
-    // without explicit operator opt-in.
+    // exist. The macaroon auth surface is always available; calls
+    // without a valid `Scope::Admin` macaroon return Unauthenticated.
     let admin_service = match (lsp_builder.clone(), lsp_daemon_slot.clone()) {
-        (Some(builder), Some(slot)) => {
-            let secret = cfg.admin_secret
-                .clone()
-                .or_else(|| std::env::var("WICK_ADMIN_SECRET").ok())
-                .filter(|s| !s.is_empty());
-            match secret {
-                Some(secret) =>
-                    Some(
-                        WickAdminGrpcService::new(
-                            builder,
-                            slot,
-                            lsp_state.as_ref().map(|s| s.pubkey),
-                            secret
-                        )
-                    ),
-                None => {
-                    warn!(
-                        "[lsp].enabled = true but admin_secret / WICK_ADMIN_SECRET is unset — \
-                         admin service will not be mounted; LSP cannot be registered"
-                    );
-                    None
-                }
-            }
-        }
+        (Some(builder), Some(slot)) => Some(WickAdminGrpcService::new(
+            builder,
+            slot,
+            lsp_state.as_ref().map(|s| s.pubkey),
+            macaroon_auth.clone(),
+        )),
         _ => None,
     };
 
@@ -398,6 +412,59 @@ async fn main() -> Result<()> {
 
     manager.shutdown_all().await;
     info!("all node actors stopped — goodbye");
+    Ok(())
+}
+
+/// Subcommand: `wick-server mint-admin-macaroon [--config <path>] [--out <path>]`.
+///
+/// Reads the database URL from the named config (default
+/// `deploy/docker/config.dev.toml`), connects to Postgres, ensures the
+/// admin root key exists in `global.macaroon_root_keys` (inserting one
+/// with a random 16-byte identifier + 32-byte root key on first call),
+/// issues a fresh macaroon under `Scope::Admin` with
+/// [`ADMIN_MACAROON_LIFETIME`], and writes the serialized bytes to
+/// `--out` (or `./admin.macaroon` by default).
+///
+/// Also prints the root-key identifier as hex and the macaroon bytes as
+/// hex on stdout so operators driving the binary from a shell pipeline
+/// can capture the credential without reading the output file.
+async fn run_mint_admin_macaroon() -> Result<()> {
+    let mut args = std::env::args().skip(2);
+    let mut config_path: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--config" => config_path = args.next(),
+            "--out" => out_path = args.next(),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "unknown flag {other:?} for mint-admin-macaroon; \
+                     accepts --config <path> and --out <path>"
+                ));
+            }
+        }
+    }
+    let config_path = config_path
+        .or_else(|| std::env::var("WICK_CONFIG").ok())
+        .unwrap_or_else(|| "deploy/docker/config.dev.toml".to_owned());
+    let out_path = out_path.unwrap_or_else(|| "admin.macaroon".to_owned());
+
+    let cfg: Config = config::load(&config_path)?;
+    let pool = Pool::connect(&cfg.database_url, cfg.max_db_connections).await?;
+
+    let minted =
+        mint_admin_macaroon(pool.raw().clone(), DEFAULT_LOCATION, ADMIN_MACAROON_LIFETIME).await?;
+
+    std::fs::write(&out_path, &minted.macaroon_bytes)
+        .with_context(|| format!("write admin macaroon to {out_path}"))?;
+
+    println!("root_key_identifier_hex={}", hex::encode(minted.root_key_identifier));
+    println!("admin_macaroon_hex={}", hex::encode(&minted.macaroon_bytes));
+    println!("admin_macaroon_bytes_path={out_path}");
+    println!(
+        "admin_macaroon_lifetime_secs={}",
+        ADMIN_MACAROON_LIFETIME.as_secs()
+    );
     Ok(())
 }
 

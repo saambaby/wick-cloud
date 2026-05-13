@@ -36,6 +36,13 @@ const TAG_EXPIRY: u8 = 0x01;
 const TAG_SCOPE: u8 = 0x02;
 const TAG_NONCE: u8 = 0x03;
 const TAG_SPEND: u8 = 0x04;
+/// Phase-4 D1 N2 — pins the bearer's Noise transport static pubkey.
+/// When present the verifier MUST be supplied the observed remote Noise
+/// static pubkey (via `VerifyContext::noise_static_pk_observed`) and
+/// will reject the macaroon if it doesn't match. Absence of the caveat
+/// is opt-in for back-compat: legacy bearers without Noise binding
+/// keep working until M5/M6 retires the legacy path.
+const TAG_NOISE_PK: u8 = 0x05;
 
 // scope kinds
 const SCOPE_USER: u8 = 0;
@@ -228,6 +235,17 @@ impl Caveat {
         }
     }
 
+    /// Build a `NoiseStaticPk` caveat — pins the bearer's 32-byte
+    /// Curve25519 Noise static public key. The verifier rejects the
+    /// macaroon if the observed remote static doesn't match.
+    #[must_use]
+    pub fn noise_static_pk(pk: [u8; 32]) -> Self {
+        Self {
+            tag: TAG_NOISE_PK,
+            payload: pk.to_vec(),
+        }
+    }
+
     /// Bytes fed into the HMAC chain — the tag and payload, concatenated.
     #[must_use]
     pub fn bytes(&self) -> Vec<u8> {
@@ -309,6 +327,13 @@ pub struct VerifyContext<'a> {
     pub revoked_nonces: &'a HashSet<[u8; 16]>,
     /// Optional expected scope. If `Some`, mismatched scope returns `ScopeMismatch`.
     pub expected_scope: Option<ExpectedScope>,
+    /// Phase-4 D1 N2 — the Noise static pubkey of the peer on the
+    /// macaroon-bearing request. If `Some`, any `NoiseStaticPk` caveat
+    /// embedded in the macaroon is checked against this value. If
+    /// `None` (legacy bearer path, no Noise tunnel) a macaroon
+    /// carrying a `NoiseStaticPk` caveat fails closed — the caveat
+    /// can only be enforced when the request carries a tunneled pk.
+    pub noise_static_pk_observed: Option<[u8; 32]>,
 }
 
 /// What scope a verifier expects to see — coarse-grained match used by RPCs.
@@ -589,6 +614,35 @@ impl Macaroon {
                     win_b.copy_from_slice(&c.payload[8..12]);
                     spend = Some((u64::from_be_bytes(max_b), u32::from_be_bytes(win_b)));
                 }
+                TAG_NOISE_PK => {
+                    if c.payload.len() != 32 {
+                        return Err(MacaroonError::DecodeFailed("noise_static_pk len".into()));
+                    }
+                    let mut want = [0u8; 32];
+                    want.copy_from_slice(&c.payload);
+                    match ctx.noise_static_pk_observed {
+                        Some(observed) => {
+                            // Constant-time compare — the wire bytes are
+                            // public so timing leaks are non-load-bearing,
+                            // but using `ct_eq` keeps the policy in one
+                            // place with the chain-replay check above.
+                            if want.ct_eq(&observed).unwrap_u8() != 1 {
+                                return Err(MacaroonError::CaveatFailed(
+                                    "noise_static_pk mismatch".into(),
+                                ));
+                            }
+                        }
+                        None => {
+                            // Fail closed: caveat is present but the
+                            // verifier was given no observed pk (legacy
+                            // bearer path). Bearer auth cannot satisfy a
+                            // Noise-bound macaroon.
+                            return Err(MacaroonError::CaveatFailed(
+                                "noise_static_pk required but no Noise tunnel".into(),
+                            ));
+                        }
+                    }
+                }
                 t => {
                     return Err(MacaroonError::CaveatFailed(format!(
                         "unknown caveat tag {t}"
@@ -657,6 +711,7 @@ mod tests {
             now,
             revoked_nonces: revoked,
             expected_scope: None,
+            noise_static_pk_observed: None,
         }
     }
 
@@ -753,9 +808,77 @@ mod tests {
             now: SystemTime::now(),
             revoked_nonces: &revoked,
             expected_scope: Some(ExpectedScope::Admin),
+            noise_static_pk_observed: None,
         };
         let err = m.verify(&rk, &ctx).unwrap_err();
         assert_eq!(err, MacaroonError::ScopeMismatch);
+    }
+
+    #[test]
+    fn noise_static_pk_caveat_round_trip() {
+        let rk = RootKey::random();
+        let pk = [0xAB_u8; 32];
+        let mut m = Macaroon::issue(
+            "wick.cloud",
+            [0u8; 16],
+            &rk,
+            Scope::User { tenant_id: [1u8; 16] },
+            Duration::from_secs(3600),
+        );
+        m.add_caveat(Caveat::noise_static_pk(pk));
+        let bytes = m.serialize();
+        let m2 = Macaroon::deserialize(&bytes).unwrap();
+        // Caveat survives round-trip with the right tag + payload.
+        let pinned = m2.caveats().iter().find(|c| c.tag == TAG_NOISE_PK).unwrap();
+        assert_eq!(pinned.payload(), &pk[..]);
+
+        // Verify happy path — observed pk matches.
+        let revoked = HashSet::new();
+        let ctx = VerifyContext {
+            now: SystemTime::now(),
+            revoked_nonces: &revoked,
+            expected_scope: None,
+            noise_static_pk_observed: Some(pk),
+        };
+        let v = m2.verify(&rk, &ctx).unwrap();
+        assert!(matches!(v.scope, Scope::User { .. }));
+    }
+
+    #[test]
+    fn noise_pk_mismatch_rejected() {
+        let rk = RootKey::random();
+        let pk = [0xAB_u8; 32];
+        let mut m = Macaroon::issue(
+            "wick.cloud",
+            [0u8; 16],
+            &rk,
+            Scope::User { tenant_id: [1u8; 16] },
+            Duration::from_secs(3600),
+        );
+        m.add_caveat(Caveat::noise_static_pk(pk));
+
+        let revoked = HashSet::new();
+
+        // Wrong observed pk — caveat rejects.
+        let wrong = [0xCD_u8; 32];
+        let ctx = VerifyContext {
+            now: SystemTime::now(),
+            revoked_nonces: &revoked,
+            expected_scope: None,
+            noise_static_pk_observed: Some(wrong),
+        };
+        let err = m.verify(&rk, &ctx).unwrap_err();
+        assert!(matches!(err, MacaroonError::CaveatFailed(_)));
+
+        // No observed pk supplied (legacy bearer) — fail closed.
+        let ctx = VerifyContext {
+            now: SystemTime::now(),
+            revoked_nonces: &revoked,
+            expected_scope: None,
+            noise_static_pk_observed: None,
+        };
+        let err = m.verify(&rk, &ctx).unwrap_err();
+        assert!(matches!(err, MacaroonError::CaveatFailed(_)));
     }
 
     #[test]

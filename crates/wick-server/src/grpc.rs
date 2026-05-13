@@ -16,8 +16,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use subtle::ConstantTimeEq;
-
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -52,11 +50,6 @@ use crate::node::{
     NodeCmd,
 };
 use crate::nonce_store::{NonceError, NonceStore, REGISTER_DOMAIN};
-
-/// Metadata header carrying the admin shared secret. Compared against
-/// `WICK_ADMIN_SECRET` config / env at handler entry. Slice 3.3a auth
-/// stop-gap until macaroon scope plumbing arrives in 3.3c.
-const ADMIN_SECRET_METADATA: &str = "x-wick-admin-secret";
 
 /// Timeout for `OpenChannelInit` to wait on LDK's `FundingGenerationReady`.
 /// The event typically fires within hundreds of milliseconds after
@@ -1103,6 +1096,7 @@ mod tests {
             now: std::time::SystemTime::now(),
             revoked_nonces: &std::collections::HashSet::new(),
             expected_scope: None,
+            noise_static_pk_observed: None,
         };
         let av = a.verify(&rk, &ctx).unwrap();
         let bv = b.verify(&rk, &ctx).unwrap();
@@ -1113,8 +1107,11 @@ mod tests {
 
 // ── AdminService ──────────────────────────────────────────────────────────────
 //
-// Operator-scoped RPCs gated behind a shared admin secret. Slice 3.3a
-// implementation; macaroon scope plumbing arrives in 3.3c.
+// Operator-scoped RPCs gated behind an admin-scoped macaroon. Replaces
+// the `WICK_ADMIN_SECRET` shared-secret gate from slice 3.3a — mint
+// tokens with `wick-server mint-admin-macaroon`, present them as the
+// `x-wick-macaroon` metadata header (hex-encoded, same format as the
+// user-scoped macaroon path).
 
 /// Implements the operator-side admin gRPC.
 ///
@@ -1126,13 +1123,14 @@ mod tests {
 /// - The expected LSP pubkey from `[lsp].pubkey_hex` config (used to
 ///   validate that the operator's seed matches the published public
 ///   key) — `None` skips validation.
-/// - The shared admin secret used to gate every method.
+/// - The [`MacaroonAuth`] interceptor used to verify admin-scoped
+///   macaroons on every method.
 #[derive(Clone)]
 pub struct WickAdminGrpcService {
     pub(crate) lsp_builder: Arc<LspBuilder>,
     pub(crate) lsp_daemon_slot: Arc<RwLock<Option<LspDaemon>>>,
     pub(crate) expected_lsp_pubkey: Option<bitcoin::secp256k1::PublicKey>,
-    pub(crate) admin_secret: String,
+    pub(crate) macaroon_auth: MacaroonAuth,
 }
 
 impl std::fmt::Debug for WickAdminGrpcService {
@@ -1150,33 +1148,23 @@ impl WickAdminGrpcService {
         lsp_builder: Arc<LspBuilder>,
         lsp_daemon_slot: Arc<RwLock<Option<LspDaemon>>>,
         expected_lsp_pubkey: Option<bitcoin::secp256k1::PublicKey>,
-        admin_secret: String,
+        macaroon_auth: MacaroonAuth,
     ) -> Self {
         Self {
             lsp_builder,
             lsp_daemon_slot,
             expected_lsp_pubkey,
-            admin_secret,
+            macaroon_auth,
         }
     }
 
-    /// Reject the request unless the `x-wick-admin-secret` metadata
-    /// matches the configured shared secret.
-    fn authorize<T>(&self, req: &Request<T>) -> Result<(), Status> {
-        let presented = req
-            .metadata()
-            .get(ADMIN_SECRET_METADATA)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        let rhs = self.admin_secret.as_bytes();
-        if rhs.is_empty() {
-            return Err(Status::unauthenticated("admin secret not configured"));
-        }
-        if presented.as_bytes().ct_eq(rhs).into() {
-            Ok(())
-        } else {
-            Err(Status::unauthenticated("admin secret missing or invalid"))
-        }
+    /// Reject the request unless it carries a verified admin-scoped
+    /// macaroon. Returns `Unauthenticated` on missing/malformed/expired
+    /// tokens and `PermissionDenied` when the macaroon verifies but
+    /// holds a non-admin/non-root scope.
+    async fn authorize<T>(&self, req: &Request<T>) -> Result<(), Status> {
+        let _ctx = self.macaroon_auth.authenticate_admin(req).await?;
+        Ok(())
     }
 }
 
@@ -1186,7 +1174,7 @@ impl AdminService for WickAdminGrpcService {
         &self,
         request: Request<RegisterLspIdentityRequest>,
     ) -> Result<Response<RegisterLspIdentityResponse>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let req = request.into_inner();
 
         if req.lightning_seed.len() != 32 {
@@ -1264,7 +1252,7 @@ impl AdminService for WickAdminGrpcService {
         &self,
         request: Request<LspWatchPendingFundingRequest>,
     ) -> Result<Response<Self::LspWatchPendingFundingStream>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
 
         // Subscribe under the slot read lock so we don't race a fresh
         // `park` between snapshot and subscribe.
@@ -1334,7 +1322,7 @@ impl AdminService for WickAdminGrpcService {
         &self,
         request: Request<LspFinalizeFundingRequest>,
     ) -> Result<Response<LspFinalizeFundingResponse>, Status> {
-        self.authorize(&request)?;
+        self.authorize(&request).await?;
         let req = request.into_inner();
 
         if req.temp_channel_id.len() != 32 {

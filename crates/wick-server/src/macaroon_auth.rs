@@ -31,8 +31,16 @@ use sqlx::PgPool;
 use tonic::{Request, Status};
 use wick_core::TenantId;
 use wick_macaroon::{
-    store::RevocationSet, Macaroon, MacaroonError, RootKey, Scope, VerifyContext,
+    store::RevocationSet, ExpectedScope, Macaroon, MacaroonError, RootKey, Scope, VerifyContext,
 };
+
+/// Scope-kind value persisted in `global.macaroon_root_keys.scope_kind`
+/// for admin-scoped root keys. Tenant-scoped keys use `0`; this lane is
+/// distinct so an admin macaroon and a user macaroon can never collide
+/// even if they share an identifier (they can't — identifiers are
+/// random 16-byte values — but the scope_kind column makes that an
+/// invariant of the data model, not a probabilistic property).
+pub const SCOPE_KIND_ADMIN: i16 = 2;
 
 /// gRPC metadata header carrying a base64-encoded serialized macaroon.
 /// Distinct from `authorization` so the legacy bearer path is unaffected.
@@ -136,6 +144,19 @@ impl MacaroonAuth {
         &self,
         bytes: &[u8],
     ) -> Result<TenantContext, Status> {
+        self.authenticate_macaroon_bytes_with_pk(bytes, None).await
+    }
+
+    /// Phase-4 D1 N2 — variant of [`Self::authenticate_macaroon_bytes`]
+    /// that threads the Noise tunnel's observed remote static pubkey
+    /// into the macaroon verifier. The pk is checked against any
+    /// `NoiseStaticPk` caveat embedded in the macaroon; a mismatch (or
+    /// a caveat with `None` observed pk) fails closed.
+    pub async fn authenticate_macaroon_bytes_with_pk(
+        &self,
+        bytes: &[u8],
+        noise_static_pk_observed: Option<[u8; 32]>,
+    ) -> Result<TenantContext, Status> {
         let mac = Macaroon::deserialize(bytes).map_err(|e| {
             tracing::debug!(?e, "macaroon decode failed");
             Status::unauthenticated("invalid macaroon")
@@ -160,6 +181,7 @@ impl MacaroonAuth {
             // only proves "this macaroon verifies under our root key";
             // per-RPC scope gating belongs to per-RPC code.
             expected_scope: None,
+            noise_static_pk_observed,
         };
 
         // NOTE: `Macaroon::verify` replays caveats in array order — the
@@ -253,6 +275,125 @@ impl MacaroonAuth {
         .bind(&id[..])
         .bind(rk.as_bytes().as_slice())
         .bind(&subject)
+        .execute(&self.pool)
+        .await?;
+        Ok((id, rk))
+    }
+}
+
+/// Verified admin context — what an admin RPC handler gets back after
+/// `MacaroonAuth::authenticate_admin` accepts the request.
+#[derive(Debug, Clone)]
+pub struct AdminContext {
+    /// Resolved scope. Either `Scope::Admin` or `Scope::Root` (root
+    /// macaroons retain admin authority — they're a superset).
+    pub scope: Scope,
+    /// Per-token nonce — useful for audit logging and revocation.
+    pub nonce: [u8; 16],
+}
+
+impl MacaroonAuth {
+    /// Verify an *admin-scoped* macaroon attached to a gRPC request.
+    ///
+    /// Returns `PermissionDenied` if the macaroon verifies but carries a
+    /// non-admin scope (`Scope::User` / `Scope::Developer`).
+    /// Returns `Unauthenticated` if no header is present, the header is
+    /// malformed, or the macaroon fails signature/expiry/revocation
+    /// verification.
+    ///
+    /// The header (`x-wick-macaroon`) is shared with the user-auth path;
+    /// the two paths are distinguished by the embedded scope, not by
+    /// metadata key.
+    pub async fn authenticate_admin<T>(
+        &self,
+        req: &Request<T>,
+    ) -> Result<AdminContext, Status> {
+        let bytes = extract_macaroon_bytes(req)?
+            .ok_or_else(|| Status::unauthenticated("admin macaroon required"))?;
+
+        let mac = Macaroon::deserialize(&bytes).map_err(|e| {
+            tracing::debug!(?e, "admin macaroon decode failed");
+            Status::unauthenticated("invalid macaroon")
+        })?;
+
+        let identifier = mac.identifier();
+        let root_key = self.load_root_key(&identifier).await.map_err(|e| {
+            tracing::warn!(error = %e, "admin root key lookup failed");
+            Status::internal("auth lookup failed")
+        })?;
+        let root_key = root_key.ok_or_else(|| Status::unauthenticated("unknown macaroon"))?;
+
+        let revoked = self.revocation.snapshot();
+        let ctx = VerifyContext {
+            now: SystemTime::now(),
+            revoked_nonces: &revoked,
+            // Accept `Scope::Admin` strictly; `Scope::Root` is checked
+            // below as an explicit override so the verify error doesn't
+            // collapse the two cases.
+            expected_scope: Some(ExpectedScope::Admin),
+            noise_static_pk_observed: None,
+        };
+
+        // Try strict admin first; if that hits ScopeMismatch, retry as
+        // root. Anything else (signature failure, expired, revoked) is
+        // returned verbatim.
+        let verified = match mac.verify(&root_key, &ctx) {
+            Ok(v) => v,
+            Err(MacaroonError::ScopeMismatch) => {
+                let ctx_root = VerifyContext {
+                    now: SystemTime::now(),
+                    revoked_nonces: &revoked,
+                    expected_scope: Some(ExpectedScope::Root),
+                    noise_static_pk_observed: None,
+                };
+                mac.verify(&root_key, &ctx_root).map_err(|e| match e {
+                    MacaroonError::ScopeMismatch => {
+                        Status::permission_denied("macaroon scope is not admin/root")
+                    }
+                    other => map_macaroon_err(other),
+                })?
+            }
+            Err(e) => return Err(map_macaroon_err(e)),
+        };
+
+        Ok(AdminContext {
+            scope: verified.scope,
+            nonce: verified.nonce,
+        })
+    }
+
+    /// Look up (or mint) the active admin-scope root key. Mirrors
+    /// [`Self::ensure_user_root_key`] but uses `scope_kind = 2` and a
+    /// NULL subject — admin root keys aren't tied to a tenant.
+    pub async fn ensure_admin_root_key(&self) -> sqlx::Result<([u8; 16], RootKey)> {
+        let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT identifier, root_key FROM global.macaroon_root_keys \
+             WHERE scope_kind = $1 AND subject IS NULL AND rotated_at IS NULL \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(SCOPE_KIND_ADMIN)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some((id_bytes, rk_bytes)) = row {
+            if id_bytes.len() == 16 && rk_bytes.len() == 32 {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&id_bytes);
+                let mut rk = [0u8; 32];
+                rk.copy_from_slice(&rk_bytes);
+                return Ok((id, RootKey::from_bytes(rk)));
+            }
+        }
+
+        let rk = RootKey::random();
+        let id: [u8; 16] = rand::random();
+        sqlx::query(
+            "INSERT INTO global.macaroon_root_keys (identifier, root_key, scope_kind, subject) \
+             VALUES ($1, $2, $3, NULL)",
+        )
+        .bind(&id[..])
+        .bind(rk.as_bytes().as_slice())
+        .bind(SCOPE_KIND_ADMIN)
         .execute(&self.pool)
         .await?;
         Ok((id, rk))

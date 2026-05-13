@@ -4,6 +4,7 @@
 //! by integration tests and the binary entry point. All application logic
 //! lives here; `main.rs` is a thin boot shim.
 
+pub mod admin_mint;
 pub mod auth;
 pub mod factory;
 pub mod grpc;
