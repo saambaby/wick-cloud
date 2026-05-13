@@ -61,6 +61,7 @@ impl LightningClient {
         plan_tier: &str,
         nonce: Vec<u8>,
         signature: Vec<u8>,
+        noise_static_pk: Vec<u8>,
     ) -> Result<CreateTenantOutcome> {
         let mut client = self.inner.clone();
         let resp = client
@@ -69,6 +70,7 @@ impl LightningClient {
                 plan_tier: plan_tier.to_owned(),
                 nonce,
                 signature,
+                noise_static_pk,
             })
             .await?
             .into_inner();

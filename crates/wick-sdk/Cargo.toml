@@ -23,6 +23,7 @@ regtest = ["dep:bitcoincore-rpc"]
 [dependencies]
 wick-core      = { workspace = true }
 wick-proto     = { workspace = true }
+wick-noise     = { workspace = true }
 thiserror      = { workspace = true }
 tonic          = { workspace = true }
 prost          = { workspace = true }

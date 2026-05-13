@@ -164,10 +164,25 @@ impl WickClient {
         let pubkey_bytes = self.inner.identity.node_id().serialize().to_vec();
         let nonce = self.inner.ln.register_challenge(&pubkey_bytes).await?;
         let signature = self.inner.identity.sign_register_challenge(&nonce);
+
+        // Phase-4 D1 N2 — derive the tenant's Noise static pubkey from
+        // the same master xprv and submit it with `CreateTenant` so the
+        // server can authenticate future `SignerService.Attach` streams
+        // under the `Noise_KK` tunnel. Empty bytes mean "no Noise pk
+        // registered"; the server then falls back to legacy bearer-only
+        // attach. New SDK builds always populate it.
+        let noise_kp = wick_noise::derive_noise_static(
+            self.inner.identity.master_xprv(),
+            self.inner.config.network,
+            0,
+        )
+        .map_err(|e| Error::Config(format!("noise key derivation: {e}")))?;
+        let noise_pk_bytes = noise_kp.public.0.to_vec();
+
         let outcome = self
             .inner
             .ln
-            .create_tenant(&pubkey_hex, &plan_tier.into(), nonce, signature)
+            .create_tenant(&pubkey_hex, &plan_tier.into(), nonce, signature, noise_pk_bytes)
             .await?;
         *self.inner.token.write() = Some(outcome.api_token.clone());
         *self.inner.tenant_id.write() = Some(outcome.tenant_id.clone());
@@ -250,7 +265,12 @@ impl WickClient {
         // Spawn the reconnecting signer loop. The returned handle owns a
         // watch-channel sender; storing it on `Inner` ties the loop's
         // lifetime to the last `WickClient` clone (B5).
-        let handle = SignerLoop::new(endpoint, token, seed, xprv, network).spawn();
+        let mut loop_builder = SignerLoop::new(endpoint, token, seed, xprv, network);
+        if let Some(noise_pk_bytes) = self.inner.config.expected_noise_pubkey {
+            loop_builder = loop_builder
+                .with_noise_tunnel(wick_noise::NoisePublicKey(noise_pk_bytes), self.credential_store());
+        }
+        let handle = loop_builder.spawn();
         *self.inner.signer.write() = Some(handle);
 
         Ok(outcome)

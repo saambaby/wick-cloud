@@ -4733,6 +4733,7 @@ dependencies = [
  "vls-protocol-signer",
  "wick-core",
  "wick-lightning",
+ "wick-noise",
  "wick-proto",
  "zeroize",
 ]
@@ -4766,6 +4767,7 @@ dependencies = [
  "metrics",
  "parking_lot",
  "proptest",
+ "prost",
  "rand 0.8.5",
  "serde",
  "sha2",
@@ -4782,6 +4784,7 @@ dependencies = [
  "wick-lightning",
  "wick-lsp",
  "wick-macaroon",
+ "wick-noise",
  "wick-proto",
  "wick-vls",
 ]

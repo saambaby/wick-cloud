@@ -53,6 +53,16 @@ pub struct WickConfig {
     /// upstream SDK release pin. `None` means "use the release pin
     /// for `network`" (or, on `Regtest`, no pin at all).
     pub expected_server_pubkey: Option<[u8; 33]>,
+
+    /// Phase-4 D1 N2 — operator-supplied server Noise static public
+    /// key. When `Some`, the SDK will wrap every `SignerService.Attach`
+    /// stream in a `Noise_KK_25519_ChaChaPoly_SHA256` tunnel. The
+    /// server's matching keypair is configured via the server-side
+    /// TOML; tenants whose row carries a registered `noise_static_pk`
+    /// will then ride the encrypted lane. `None` leaves the legacy
+    /// bearer-only attach path in place — useful for development
+    /// against unconfigured servers.
+    pub expected_noise_pubkey: Option<[u8; 32]>,
 }
 
 impl WickConfig {
@@ -68,6 +78,7 @@ impl WickConfig {
             gap_limit: DEFAULT_GAP_LIMIT,
             parallel_esplora_requests: DEFAULT_PARALLEL_ESPLORA_REQUESTS,
             expected_server_pubkey: None,
+            expected_noise_pubkey: None,
         }
     }
 

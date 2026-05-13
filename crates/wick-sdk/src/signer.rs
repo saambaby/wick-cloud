@@ -51,9 +51,11 @@ use vls_protocol::model::{ ExtKey, PubKey };
 use vls_protocol_signer::approver::PositiveApprover;
 use vls_protocol_signer::handler::{ Handler, HandlerBuilder, InitHandler, RootHandler };
 use vls_protocol_signer::lightning_signer;
+use prost::Message as _;
 use wick_core::WickNetwork;
+use wick_noise::{NoiseFrame, NoiseInitiator, NoiseSession};
 use wick_proto::wick::signer_service_client::SignerServiceClient;
-use wick_proto::wick::{ signer_inbound, signer_outbound, SignerInbound };
+use wick_proto::wick::{ signer_inbound, signer_outbound, AttachInner, SignerInbound };
 
 use crate::error::{ Error, Result };
 use crate::grpc::SharedToken;
@@ -120,6 +122,16 @@ pub struct SignerLoop {
     seed: [u8; 32],
     xprv: Xpriv,
     network: WickNetwork,
+    /// Phase-4 D1 N2 — when `Some`, every `Attach` stream is wrapped in
+    /// a Noise_KK tunnel keyed by `(noise_local, noise_remote)`. The
+    /// SDK derives the local keypair from the master xprv via
+    /// `wick_noise::derive_noise_static`; the remote pubkey comes from
+    /// `WickConfig::expected_noise_pubkey`. `None` leaves the legacy
+    /// bearer-only path in place.
+    noise_remote: Option<wick_noise::NoisePublicKey>,
+    /// Pluggable credential store — the macaroon source for the inner
+    /// `AttachInner` envelope. Wired only when `noise_remote` is `Some`.
+    credentials: Option<std::sync::Arc<dyn crate::credential::CredentialStore>>,
     shutdown_rx: Option<watch::Receiver<bool>>,
 }
 
@@ -151,8 +163,26 @@ impl SignerLoop {
             seed,
             xprv,
             network,
+            noise_remote: None,
+            credentials: None,
             shutdown_rx: None,
         }
+    }
+
+    /// Enable the Phase-4 D1 N2 Noise_KK tunnel for every `Attach`
+    /// stream. The SDK derives its local Noise static keypair from the
+    /// master xprv on demand; `noise_remote` is the server's pinned
+    /// static. `credentials` is the macaroon source for the inner
+    /// `AttachInner` envelope — the rotation loop's store works.
+    #[must_use]
+    pub fn with_noise_tunnel(
+        mut self,
+        noise_remote: wick_noise::NoisePublicKey,
+        credentials: std::sync::Arc<dyn crate::credential::CredentialStore>,
+    ) -> Self {
+        self.noise_remote = Some(noise_remote);
+        self.credentials = Some(credentials);
+        self
     }
 
     /// Spawn the loop on the current tokio runtime and return a handle
@@ -294,6 +324,84 @@ impl SignerLoop {
             }
         };
 
+        // Phase-4 D1 N2 — if a Noise remote is configured, drive the
+        // KK handshake before the VLS init handshake. The first frame
+        // we send is the initiator message; the server replies with
+        // the responder message; after that we transition to transport
+        // and every frame is wrapped in an `AttachInner` envelope.
+        let mut noise: Option<NoiseInitiator> = None;
+        let mut tx_seq: u64 = 0;
+        let mut rx_seq: u64 = 0;
+        if let Some(remote) = self.noise_remote {
+            let local = match wick_noise::derive_noise_static(&self.xprv, self.network, 0) {
+                Ok(kp) => kp,
+                Err(e) => {
+                    tracing::error!(
+                        target: "wick_sdk::signer",
+                        %e,
+                        "noise local keypair derivation failed"
+                    );
+                    return RunOutcome::TransportError { saw_frame: false };
+                }
+            };
+            let mut init = match NoiseInitiator::new(local, remote) {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::error!(
+                        target: "wick_sdk::signer",
+                        %e,
+                        "noise initiator construction failed"
+                    );
+                    return RunOutcome::TransportError { saw_frame: false };
+                }
+            };
+            // -> e, es, ss
+            let msg1 = match init.write(&[]) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(target: "wick_sdk::signer", %e, "noise write(1) failed");
+                    return RunOutcome::TransportError { saw_frame: false };
+                }
+            };
+            if resp_tx
+                .send(SignerInbound {
+                    kind: Some(signer_inbound::Kind::NoiseFrame(msg1)),
+                })
+                .await
+                .is_err()
+            {
+                return RunOutcome::TransportError { saw_frame: false };
+            }
+            // <- e, ee, se
+            let reply = match inbound.next().await {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => {
+                    if e.code() == tonic::Code::Unauthenticated {
+                        return RunOutcome::Unauthenticated;
+                    }
+                    tracing::info!(target: "wick_sdk::signer", %e, "signer stream errored during handshake");
+                    return RunOutcome::TransportError { saw_frame: false };
+                }
+                None => return RunOutcome::CleanEnd { saw_frame: false },
+            };
+            let Some(signer_outbound::Kind::NoiseFrame(bytes)) = reply.kind else {
+                tracing::warn!(target: "wick_sdk::signer", "expected NoiseFrame during handshake");
+                return RunOutcome::TransportError { saw_frame: false };
+            };
+            match init.read(&bytes) {
+                Ok(NoiseFrame::HandshakeComplete) => {}
+                Ok(_) => {
+                    tracing::warn!(target: "wick_sdk::signer", "unexpected noise frame during handshake");
+                    return RunOutcome::TransportError { saw_frame: false };
+                }
+                Err(e) => {
+                    tracing::error!(target: "wick_sdk::signer", %e, "noise read(2) failed");
+                    return RunOutcome::TransportError { saw_frame: false };
+                }
+            }
+            noise = Some(init);
+        }
+
         // Fresh handler state for each connection — server-side
         // `SignerConnection` is also fresh, so init must be re-driven.
         let state = match SignerState::new(self.seed, self.network.into()) {
@@ -339,9 +447,51 @@ impl SignerLoop {
                 }
             };
             saw_frame = true;
-            let Some(signer_outbound::Kind::VlsCall(encoded)) = msg.kind else {
-                tracing::warn!(target: "wick_sdk::signer", "SignerOutbound with empty kind — skipping");
-                continue;
+
+            // Unwrap noise / AttachInner when the tunnel is active.
+            let encoded: Vec<u8> = if let Some(n) = noise.as_mut() {
+                let Some(signer_outbound::Kind::NoiseFrame(ct)) = msg.kind else {
+                    tracing::warn!(
+                        target: "wick_sdk::signer",
+                        "expected NoiseFrame on encrypted attach stream"
+                    );
+                    return RunOutcome::TransportError { saw_frame };
+                };
+                let pt = match n.read(&ct) {
+                    Ok(NoiseFrame::Plaintext(p)) => p,
+                    Ok(_) => {
+                        tracing::warn!(target: "wick_sdk::signer", "unexpected noise frame post-handshake");
+                        return RunOutcome::TransportError { saw_frame };
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "wick_sdk::signer", %e, "noise decrypt failed");
+                        return RunOutcome::TransportError { saw_frame };
+                    }
+                };
+                let inner = match AttachInner::decode(pt.as_slice()) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        tracing::warn!(target: "wick_sdk::signer", %e, "AttachInner decode failed");
+                        return RunOutcome::TransportError { saw_frame };
+                    }
+                };
+                rx_seq = rx_seq.saturating_add(1);
+                if inner.seq != rx_seq {
+                    tracing::warn!(
+                        target: "wick_sdk::signer",
+                        expected = rx_seq,
+                        got = inner.seq,
+                        "AttachInner seq mismatch"
+                    );
+                    return RunOutcome::TransportError { saw_frame };
+                }
+                inner.vls_payload
+            } else {
+                let Some(signer_outbound::Kind::VlsCall(encoded)) = msg.kind else {
+                    tracing::warn!(target: "wick_sdk::signer", "SignerOutbound with empty kind — skipping");
+                    continue;
+                };
+                encoded
             };
 
             let response = match
@@ -354,13 +504,39 @@ impl SignerLoop {
                 }
             };
 
-            if
-                resp_tx
-                    .send(SignerInbound {
-                        kind: Some(signer_inbound::Kind::VlsResponse(response)),
-                    }).await
-                    .is_err()
-            {
+            let outbound = if let Some(n) = noise.as_mut() {
+                tx_seq = tx_seq.saturating_add(1);
+                let mac_bytes = match self.credentials.as_ref() {
+                    Some(store) => store.load().await.map(|c| c.bytes).unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let inner = AttachInner {
+                    macaroon: mac_bytes,
+                    vls_payload: response,
+                    seq: tx_seq,
+                };
+                let mut buf = Vec::with_capacity(inner.encoded_len());
+                if let Err(e) = inner.encode(&mut buf) {
+                    tracing::warn!(target: "wick_sdk::signer", %e, "AttachInner encode failed");
+                    return RunOutcome::TransportError { saw_frame };
+                }
+                let ct = match n.write(&buf) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(target: "wick_sdk::signer", %e, "noise encrypt failed");
+                        return RunOutcome::TransportError { saw_frame };
+                    }
+                };
+                SignerInbound {
+                    kind: Some(signer_inbound::Kind::NoiseFrame(ct)),
+                }
+            } else {
+                SignerInbound {
+                    kind: Some(signer_inbound::Kind::VlsResponse(response)),
+                }
+            };
+
+            if resp_tx.send(outbound).await.is_err() {
                 tracing::info!(target: "wick_sdk::signer", "outbound channel closed; ending pass");
                 return RunOutcome::TransportError { saw_frame };
             }

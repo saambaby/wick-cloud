@@ -121,6 +121,14 @@ message CreateTenantRequest {
   // `sha256(b"wick-tenant-register" || nonce)` produced by the secret
   // key matching `pubkey_hex`.
   bytes signature = 4;
+
+  // Phase-4 D1 N2 — 32-byte Curve25519 Noise static public key the SDK
+  // will present on every `SignerService.Attach` stream. Optional for
+  // back-compat with pre-N2 clients; tenants without a registered pk
+  // bypass the Noise_KK tunnel and fall back to the legacy bearer-only
+  // attach. New clients MUST send this so the server can authenticate
+  // future signer streams under mutual-auth.
+  bytes noise_static_pk = 5;
 }
 
 message CreateTenantResponse {
@@ -532,7 +540,7 @@ service SignerService {
 
 // Server → SDK frame. `oneof` envelope so future control frames
 // (state-sync watermarks, keepalive) can land without breaking wire
-// format. Today only `vls_call` is populated.
+// format.
 message SignerOutbound {
   oneof kind {
     // Wire-encoded VLS frame produced by `SignerConnection::dispatch_*_call`:
@@ -540,15 +548,46 @@ message SignerOutbound {
     //   channel: `[4B req_id BE][0x02][3B reserved][8B dbid BE][33B peer_id][vls_bytes]`
     // `vls_bytes = [u16 type BE][data]` — `vls_protocol::msgs::SerBolt::as_vec`.
     bytes vls_call = 1;
+    // Phase-4 D1 N2 — opaque Noise_KK handshake/transport bytes. During
+    // handshake this carries the responder's reply (`<- e, ee, se`).
+    // During transport this carries the AEAD ciphertext of a serialised
+    // `AttachInner` envelope (which itself wraps `vls_call`).
+    bytes noise_frame = 2;
   }
 }
 
-// SDK → server frame. Today only `vls_response` is populated.
+// SDK → server frame.
 message SignerInbound {
   oneof kind {
     // Wire-encoded VLS reply: `[4B req_id BE][1B status][body]` — `status=0x00`
     // means success and `body` is the VLS reply bytes; otherwise `body` is a
     // UTF-8 error string. Routed through `SignerConnection::resolve_response`.
     bytes vls_response = 1;
+    // Phase-4 D1 N2 — opaque Noise_KK handshake/transport bytes. During
+    // handshake this carries the initiator messages (`-> e, es, ss`).
+    // During transport this carries the AEAD ciphertext of a serialised
+    // `AttachInner` envelope (which wraps a `vls_response`).
+    bytes noise_frame = 2;
   }
+}
+
+// Phase-4 D1 N2 — inner envelope encrypted inside a `noise_frame` once
+// the KK handshake completes. Carries the macaroon alongside the
+// VLS payload on every transport frame so the server can re-verify the
+// caller's identity (including the `NoiseStaticPk` caveat — see the
+// macaroon crate) against the observed Noise static. `seq` is a
+// monotonic per-direction counter; the server rejects out-of-order or
+// duplicate frames as a defense-in-depth replay check on top of the
+// AEAD nonce.
+message AttachInner {
+  // Serialised user-scoped macaroon (same encoding as the
+  // `x-wick-macaroon` header — raw bytes, not hex).
+  bytes macaroon = 1;
+  // Inner VLS payload. On the SDK→server direction this is the
+  // wire-encoded `[4B req_id BE][1B status][body]` reply; on the
+  // server→SDK direction it is the wire-encoded VLS call frame.
+  bytes vls_payload = 2;
+  // Monotonic per-direction sequence number, starting at 1 on the
+  // first transport frame.
+  uint64 seq = 3;
 }
