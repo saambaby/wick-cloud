@@ -60,9 +60,12 @@ arc-swap = "1"
 # crypto / security
 zeroize = { version = "1", features = ["zeroize_derive"] }
 hmac = "0.12"
+hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"
+snow = "0.10"
 uuid = { version = "1", features = ["v4", "v5", "std"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 bip39 = "2"
 
 # lightning (pinned to LDK 0.2 release train)
