@@ -37,3 +37,21 @@ uuid        = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Phase 4 acceptance: concurrent revocation/verification model checker.
+# Activated only under `RUSTFLAGS="--cfg loom"`; invisible to default
+# `cargo test`. See `tests/README.md`.
+loom = { workspace = true }
+# Multi-node revocation propagation integration test runs against a real
+# Postgres (gated behind `#[ignore]` + WICK_TEST_PG_URL).
+tokio = { workspace = true }
+sqlx = { workspace = true }
+rand = { workspace = true }
+
+[[test]]
+name = "loom_revocation"
+path = "tests/loom_revocation.rs"
+
+[[test]]
+name = "multi_node_revocation"
+path = "tests/multi_node_revocation.rs"
+required-features = ["postgres"]
