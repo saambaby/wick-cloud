@@ -1,0 +1,36 @@
+[package]
+name = "wick-vls-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wick-vls = { path = ".." }
+
+# Prevent this from being picked up by the parent workspace.
+[workspace]
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signer_dispatch"
+path = "fuzz_targets/signer_dispatch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extension_rpc"
+path = "fuzz_targets/extension_rpc.rs"
+test = false
+doc = false
+bench = false

@@ -41,6 +41,7 @@ mod registry;
 mod session;
 
 pub mod rpc;
+pub mod wire;
 
 pub use change_destination::VlsChangeDestination;
 pub use connection::SignerConnection;

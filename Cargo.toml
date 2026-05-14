@@ -18,6 +18,11 @@ members = [
     "crates/wick-sdk-wasm",
     "crates/wick-loom-models",
 ]
+exclude = [
+    # cargo-fuzz crates live outside the workspace so their nightly-only
+    # `-Z` rustflags don't leak into stable workspace builds.
+    "crates/wick-vls/fuzz",
+]
 
 [workspace.package]
 version = "0.1.0"
