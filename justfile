@@ -133,6 +133,20 @@ jit-signet-demo:
     cargo test -p wick-sdk --test integration_signet jit_receive \
         --features regtest -- --ignored --nocapture
 
+# --- phase 4 acceptance demo ---
+
+# Phase 4 acceptance demo: device-held seed signs payment, `kill -9`
+# server then payment-after-restart, revoke macaroon and assert
+# cluster-wide rejection in <1s. Requires `just regtest-up`.
+vls-demo:
+    @echo "Phase 4 acceptance demo — requires 'just regtest-up' first."
+    cargo test -p wick-sdk --test vls_demo --features regtest \
+        -- --ignored --nocapture --test-threads=1
+    @echo ""
+    @echo "============================================================"
+    @echo "PHASE 4 ACCEPTANCE DEMO: PASS"
+    @echo "============================================================"
+
 # --- housekeeping ---
 
 # Tidy up generated artefacts.

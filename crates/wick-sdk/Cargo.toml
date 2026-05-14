@@ -82,3 +82,8 @@ required-features = ["regtest"]
 name = "close_flow"
 path = "tests/close_flow.rs"
 required-features = ["regtest"]
+
+[[test]]
+name = "vls_demo"
+path = "tests/vls_demo.rs"
+required-features = ["regtest"]

@@ -119,6 +119,13 @@ impl WickClient {
         Arc::clone(&*self.inner.credential_store.read())
     }
 
+    /// Snapshot the currently stored credential, if any. Thin wrapper
+    /// around [`CredentialStore::load`] — useful for tests and ops tooling
+    /// that need to inspect (or revoke) the macaroon the SDK is using.
+    pub async fn current_credential(&self) -> Option<Credential> {
+        self.credential_store().load().await
+    }
+
 
     // ── Identity ─────────────────────────────────────────────────────────────
 
