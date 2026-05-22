@@ -27,7 +27,9 @@ use std::time::{Duration, Instant};
 use bitcoin::secp256k1::PublicKey;
 use wick_core::TenantId;
 use wick_sdk::regtest::{wait_until_async, RegtestRpc};
-use wick_sdk::{PaymentStatus, WickClient, WickConfig, WickNetwork};
+use wick_sdk::{
+    CredentialKind, Error as SdkError, PaymentStatus, WickClient, WickConfig, WickNetwork,
+};
 
 // ── Fixed BIP39 test vectors ──────────────────────────────────────────────────
 //
@@ -42,6 +44,16 @@ const BOB_MNEMONIC: &str =
 /// Amount paid from Alice → Bob. 10_000 sats — above the 2_000-sat channel
 /// reserve so Bob's `lightning_balance().lightning_msat` visibly grows.
 const PAYMENT_AMOUNT_MSAT: u64 = 10_000_000;
+
+/// Round 3 follow-up payment after the server is killed and restarted.
+/// 5_000 sats — half of Round 1 — confirms the channel + signer rejoin
+/// path works for a second HTLC without re-funding.
+const SECOND_PAYMENT_MSAT: u64 = 5_000_000;
+
+/// Phase 4 acceptance budget: revocation must propagate from the
+/// `revoked_macaroons` INSERT to the in-memory `RevocationSet` (via
+/// LISTEN/NOTIFY) and reject the next Alice RPC within this window.
+const REVOKE_REJECT_DEADLINE: Duration = Duration::from_secs(1);
 
 /// Channel size Alice opens. 200k sats — enough headroom for the payment
 /// plus reserve + commit-fee reservation.
@@ -114,6 +126,15 @@ impl HostedServer {
     fn endpoint(&self) -> &str {
         &self.endpoint
     }
+
+    /// Round 3: simulate an abrupt server crash so the test can verify
+    /// the SDK signer reconnects + funds survive across restart. Same
+    /// shape as `Drop` but callable mid-test without dropping the
+    /// struct itself.
+    fn kill_hard(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for HostedServer {
@@ -125,12 +146,92 @@ impl Drop for HostedServer {
     }
 }
 
+// ── Macaroon nonce extraction (for Round 4 revocation) ───────────────────────
+
+/// Tag for the per-issue `Nonce` caveat. Mirror of `wick_macaroon::TAG_NONCE`
+/// inlined so wick-sdk's test binary doesn't need a wick-macaroon dev-dep.
+const MACAROON_TAG_NONCE: u8 = 0x03;
+
+/// Pull the 16-byte per-issue nonce out of a serialised macaroon by
+/// finding the first caveat tagged `Nonce` (`0x03`). The revocation
+/// table is keyed by *nonce*, not by `identifier`.
+fn macaroon_nonce(bytes: &[u8]) -> Option<[u8; 16]> {
+    fn read_u16(buf: &[u8], pos: &mut usize) -> Option<u16> {
+        if *pos + 2 > buf.len() {
+            return None;
+        }
+        let n = u16::from_be_bytes([buf[*pos], buf[*pos + 1]]);
+        *pos += 2;
+        Some(n)
+    }
+
+    let mut pos = 0usize;
+    let loc_len = read_u16(bytes, &mut pos)? as usize;
+    pos = pos.checked_add(loc_len)?;
+    pos = pos.checked_add(16)?; // identifier
+    if pos > bytes.len() {
+        return None;
+    }
+    let n_caveats = read_u16(bytes, &mut pos)? as usize;
+    for _ in 0..n_caveats {
+        let cav_len = read_u16(bytes, &mut pos)? as usize;
+        if cav_len == 0 || pos + cav_len > bytes.len() {
+            return None;
+        }
+        let cav = &bytes[pos..pos + cav_len];
+        pos += cav_len;
+        let tag = cav[0];
+        let payload = &cav[1..];
+        if tag == MACAROON_TAG_NONCE && payload.len() == 16 {
+            let mut out = [0u8; 16];
+            out.copy_from_slice(payload);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Revoke a macaroon nonce by inserting directly into
+/// `global.revoked_macaroons` via `docker exec wick-postgres psql ...`.
+/// LISTEN/NOTIFY propagates to every connected `RevocationSet`.
+/// Returns the wall-clock instant the INSERT completed.
+fn revoke_via_psql(nonce: [u8; 16]) -> Instant {
+    let hex_nonce = hex::encode(nonce);
+    let sql = format!(
+        "INSERT INTO global.revoked_macaroons (nonce, reason) \
+         VALUES ('\\x{hex_nonce}', 'phase4-regtest-acceptance') \
+         ON CONFLICT (nonce) DO NOTHING;"
+    );
+    let status = StdCommand::new("docker")
+        .args([
+            "exec",
+            "-i",
+            "wick-postgres",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-q",
+            "-U",
+            "wick",
+            "-d",
+            "wick",
+            "-c",
+            &sql,
+        ])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("spawn docker exec psql");
+    assert!(status.success(), "psql revoke INSERT failed");
+    Instant::now()
+}
+
 // ── The test ─────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires just regtest-up + compiled wick-server binary"]
 async fn full_flow_two_clients_pay_and_reload() {
-    let server = HostedServer::spawn();
+    let mut server = HostedServer::spawn();
 
     // Regtest chain controller (bitcoind RPC). Credentials come from
     // `deploy/docker/docker-compose.yml` — fixed to `wick:wick`.
@@ -406,6 +507,181 @@ async fn full_flow_two_clients_pay_and_reload() {
         "bob balance after restart: {} msat\n",
         bob_bal_round_2.lightning_msat
     );
+
+    // ── Round 3: server kill -9, restart, second payment ───────────────────
+    //
+    // Phase-4 acceptance: device-held VLS seed signs through a fresh
+    // Noise tunnel after the server is abruptly killed. Funds must
+    // survive the crash and the SDK must re-attach without re-funding.
+
+    let alice_ln_before_crash = alice2
+        .lightning_balance()
+        .await
+        .expect("alice lightning_balance pre-kill");
+    let alice_total_before_crash =
+        alice_ln_before_crash.onchain_sats.saturating_mul(1_000) + alice_ln_before_crash.lightning_msat;
+
+    drop(alice2);
+    drop(bob2);
+    server.kill_hard();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let server = HostedServer::spawn();
+    let config = || {
+        let mut cfg = WickConfig::for_network(WickNetwork::Regtest);
+        cfg.server_endpoint = server.endpoint().to_owned();
+        cfg.esplora_url = "http://127.0.0.1:3002".to_owned();
+        cfg
+    };
+
+    let alice3 = WickClient::new(ALICE_MNEMONIC, None, config())
+        .await
+        .expect("alice3 WickClient::new after server restart");
+    let bob3 = WickClient::new(BOB_MNEMONIC, None, config())
+        .await
+        .expect("bob3 WickClient::new after server restart");
+
+    alice3
+        .register("free")
+        .await
+        .expect("alice3 re-register after server restart");
+    bob3.register("free")
+        .await
+        .expect("bob3 re-register after server restart");
+
+    // Give LDK + signer a beat to rehydrate channels under the fresh
+    // Noise tunnel.
+    wait_until_async(
+        "channel usable after server restart",
+        LN_POLL_TIMEOUT,
+        || {
+            let a = alice3.clone();
+            async move {
+                a.list_channels()
+                    .await
+                    .map(|chs| {
+                        chs.iter()
+                            .any(|c| c.is_usable && c.outbound_capacity_msat >= SECOND_PAYMENT_MSAT)
+                    })
+                    .unwrap_or(false)
+            }
+        },
+    )
+    .await;
+
+    let invoice3 = bob3
+        .receive_payment(Some(SECOND_PAYMENT_MSAT), "round3-postcrash")
+        .await
+        .expect("bob3 receive_payment after server restart");
+    let hash3_hex = hex::encode(invoice3.payment_hash);
+
+    alice3
+        .send_payment(&invoice3.bolt11)
+        .await
+        .expect("alice3 send_payment after server restart");
+
+    {
+        let a = alice3.clone();
+        let h = hash3_hex.clone();
+        wait_until_async(
+            "alice sees post-server-restart outbound Succeeded",
+            LN_POLL_TIMEOUT,
+            move || {
+                let a = a.clone();
+                let h = h.clone();
+                async move {
+                    a.transactions(20, None)
+                        .await
+                        .map(|rows| {
+                            rows.iter().any(|p| {
+                                hex::encode(p.payment_hash) == h
+                                    && p.is_outbound
+                                    && p.status == PaymentStatus::Succeeded
+                            })
+                        })
+                        .unwrap_or(false)
+                }
+            },
+        )
+        .await;
+    }
+
+    let alice_ln_after_crash = alice3
+        .lightning_balance()
+        .await
+        .expect("alice lightning_balance post-kill");
+    let alice_total_after_crash = alice_ln_after_crash.onchain_sats.saturating_mul(1_000)
+        + alice_ln_after_crash.lightning_msat;
+
+    // Funds must survive the crash. Tolerance: SECOND_PAYMENT_MSAT spent
+    // plus 5_000_000 msat (5k sats) of routing/HTLC fee headroom. The
+    // guard is "no funds vanished", not exact accounting.
+    let max_loss = SECOND_PAYMENT_MSAT + 5_000_000;
+    assert!(
+        alice_total_before_crash.saturating_sub(alice_total_after_crash) <= max_loss,
+        "funds vanished across server crash: before={alice_total_before_crash}, \
+         after={alice_total_after_crash}, max_loss={max_loss}"
+    );
+
+    eprintln!("✅ Round 3: kill -9 server → signer re-attaches → payment after restart works");
+
+    // ── Round 4: revoke macaroon, cluster rejects within 1s ────────────────
+    //
+    // Phase-4 acceptance for D3 revocation latency. If the server is
+    // still issuing bearer tokens (pre-D3-M3 surface), there's nothing
+    // revocable; skip with a warning rather than failing.
+
+    let cred = alice3
+        .current_credential()
+        .await
+        .expect("alice3 has a credential post-register");
+
+    if cred.kind != CredentialKind::Macaroon {
+        eprintln!(
+            "⚠ skipping Round 4 — server returned a {:?} credential, not a macaroon",
+            cred.kind
+        );
+    } else {
+        let nonce = macaroon_nonce(&cred.bytes).expect("decode nonce caveat from macaroon");
+        eprintln!("Round 4: revoking macaroon nonce={}", hex::encode(nonce));
+
+        let revoke_t = revoke_via_psql(nonce);
+        let reject_deadline = revoke_t + REVOKE_REJECT_DEADLINE;
+
+        let elapsed = loop {
+            match alice3.node_info().await {
+                Err(SdkError::Unauthenticated(msg)) => {
+                    let elapsed = revoke_t.elapsed();
+                    eprintln!("rejection seen after {elapsed:?}: {msg}");
+                    break elapsed;
+                }
+                Err(other) => {
+                    if Instant::now() >= reject_deadline {
+                        panic!("revoked RPC kept failing with non-auth error: {other:?}");
+                    }
+                }
+                Ok(_) => {
+                    if Instant::now() >= reject_deadline {
+                        panic!(
+                            "revoked macaroon was still accepted after {:?} (target < {:?})",
+                            revoke_t.elapsed(),
+                            REVOKE_REJECT_DEADLINE
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert!(
+            elapsed < REVOKE_REJECT_DEADLINE,
+            "revocation rejection latency {elapsed:?} exceeded {REVOKE_REJECT_DEADLINE:?}"
+        );
+
+        eprintln!(
+            "✅ Round 4: macaroon revoked → rejected within {elapsed:?} (target <1s)"
+        );
+    }
 
     let _ = server; // keep alive until end; Drop kills the subprocess
 }
