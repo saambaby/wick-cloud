@@ -733,6 +733,13 @@ where
             anyhow::bail!("node is not running");
         }
         let addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
+        tracing::info!(
+            target: "wick_lightning::connect_peer",
+            tenant = %self.tenant_id,
+            %node_id,
+            %addr,
+            "→ connect_outbound"
+        );
         // `connect_outbound` returns `Option<impl Future>`; the outer Option
         // reports connect success, the inner future resolves on disconnect.
         // We drop it — we only want the handshake to complete.
@@ -742,18 +749,37 @@ where
             None => anyhow::bail!("connect_outbound to {node_id} at {addr} failed"),
             Some(fut) => drop(fut),
         }
+        tracing::info!(
+            target: "wick_lightning::connect_peer",
+            tenant = %self.tenant_id,
+            %node_id,
+            "✓ connect_outbound returned; polling list_peers"
+        );
 
         // Wait for the handshake to register in peer_manager.list_peers().
+        let mut poll_n: u32 = 0;
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if self
+                let peers: Vec<_> = self
                     .peer_manager
                     .list_peers()
-                    .iter()
-                    .any(|p| p.counterparty_node_id == node_id)
-                {
+                    .into_iter()
+                    .map(|p| p.counterparty_node_id)
+                    .collect();
+                if peers.iter().any(|p| *p == node_id) {
                     break;
                 }
+                if poll_n % 20 == 0 {
+                    tracing::info!(
+                        target: "wick_lightning::connect_peer",
+                        tenant = %self.tenant_id,
+                        target_peer = %node_id,
+                        poll_n,
+                        observed = ?peers.iter().map(|p| hex::encode(p.serialize())).collect::<Vec<_>>(),
+                        "polling list_peers"
+                    );
+                }
+                poll_n += 1;
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
@@ -825,6 +851,14 @@ where
         // `create_channel` returns the temporary_channel_id LDK will use in
         // the later FundingGenerationReady event, so we know which key to
         // poll for in the registry.
+        let t_create = std::time::Instant::now();
+        tracing::info!(
+            target: "wick_lightning::open_channel",
+            value_sat = channel_value_sat,
+            push_msat,
+            user_channel_id,
+            "→ ChannelManager::create_channel"
+        );
         let temp_id = match self.channel_manager.create_channel(
             peer_id,
             channel_value_sat,
@@ -839,13 +873,34 @@ where
                 anyhow::bail!("create_channel: {e:?}");
             }
         };
+        tracing::info!(
+            target: "wick_lightning::open_channel",
+            elapsed_ms = t_create.elapsed().as_millis() as u64,
+            ?temp_id,
+            "✓ ChannelManager::create_channel returned; awaiting FundingGenerationReady"
+        );
 
         // FundingGenerationReady fires asynchronously after the peer accepts
         // the open_channel message. `take` polls the registry (which the
         // event handler writes into) up to `timeout`.
+        let t_take = std::time::Instant::now();
         let pending = match self.funding_registry.take(temp_id, timeout).await {
-            Some(p) => p,
+            Some(p) => {
+                tracing::info!(
+                    target: "wick_lightning::open_channel",
+                    elapsed_ms = t_take.elapsed().as_millis() as u64,
+                    ?temp_id,
+                    "✓ funding_registry.take returned PendingFunding"
+                );
+                p
+            }
             None => {
+                tracing::warn!(
+                    target: "wick_lightning::open_channel",
+                    elapsed_ms = t_take.elapsed().as_millis() as u64,
+                    ?temp_id,
+                    "✗ funding_registry.take timed out"
+                );
                 self.signer.clear_outbound_channel_open(user_channel_id);
                 anyhow::bail!(
                     "timed out waiting for FundingGenerationReady for temp_id {temp_id:?}"

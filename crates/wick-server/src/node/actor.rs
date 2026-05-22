@@ -398,9 +398,24 @@ impl NodeActor {
                 timeout,
                 resp,
             } => {
+                let t0 = std::time::Instant::now();
+                tracing::info!(
+                    target: "wick_server::open_channel",
+                    tenant = %self.tenant_id,
+                    value_sat,
+                    push_msat,
+                    "actor → node.open_channel_init"
+                );
                 let outcome = node
                     .open_channel_init(peer, value_sat, push_msat, timeout)
                     .await;
+                tracing::info!(
+                    target: "wick_server::open_channel",
+                    tenant = %self.tenant_id,
+                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    ok = outcome.is_ok(),
+                    "actor ← node.open_channel_init"
+                );
                 if resp.send(outcome).is_err() {
                     warn!(tenant = %self.tenant_id, "OpenChannelInit: caller dropped response receiver");
                 }

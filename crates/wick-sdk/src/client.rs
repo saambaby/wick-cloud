@@ -85,15 +85,22 @@ impl WickClient {
     /// `config.server_endpoint`. Key derivation, wallet construction, and
     /// Esplora client setup are offline.
     pub async fn new(mnemonic: &str, passphrase: Option<&str>, config: WickConfig) -> Result<Self> {
+        eprintln!("[sdk::WickClient::new] start endpoint={}", config.server_endpoint);
         config.validate()?;
 
         let identity = Identity::from_mnemonic(mnemonic, passphrase, config.network)?;
+        eprintln!("[sdk::WickClient::new] identity built node_id={}", identity.node_id_hex());
         let wallet = OnchainWallet::from_xprv(identity.master_xprv(), &config)?;
+        eprintln!("[sdk::WickClient::new] wallet built");
         let chain = EsploraChain::new(&config.esplora_url)?;
+        eprintln!("[sdk::WickClient::new] chain built (esplora={})", config.esplora_url);
 
         let token = empty_token();
         let cred = empty_credential();
+        eprintln!("[sdk::WickClient::new] → LightningClient::connect");
+        let t = std::time::Instant::now();
         let ln = LightningClient::connect(&config.server_endpoint, Arc::clone(&cred)).await?;
+        eprintln!("[sdk::WickClient::new] ✓ LightningClient::connect in {}ms", t.elapsed().as_millis());
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -174,6 +181,7 @@ impl WickClient {
     /// same pubkey (upsert semantics). The SDK stores the new token and
     /// overwrites any previous one.
     pub async fn register(&self, plan_tier: impl Into<String>) -> Result<CreateTenantOutcome> {
+        eprintln!("[sdk::register] start");
         let pubkey_hex = self.inner.identity.node_id_hex();
         // D5 (gotcha #509): two-step signature challenge. Step 1 fetches
         // a fresh nonce keyed on our pubkey; step 2 submits the
@@ -181,7 +189,10 @@ impl WickClient {
         // public `register()` API stays unchanged — internal RPC count
         // is now 2.
         let pubkey_bytes = self.inner.identity.node_id().serialize().to_vec();
+        eprintln!("[sdk::register] → register_challenge");
+        let t_ch = std::time::Instant::now();
         let nonce = self.inner.ln.register_challenge(&pubkey_bytes).await?;
+        eprintln!("[sdk::register] ✓ register_challenge in {}ms", t_ch.elapsed().as_millis());
         let signature = self.inner.identity.sign_register_challenge(&nonce);
 
         // Phase-4 D1 N2 — derive the tenant's Noise static pubkey from
@@ -198,11 +209,14 @@ impl WickClient {
         .map_err(|e| Error::Config(format!("noise key derivation: {e}")))?;
         let noise_pk_bytes = noise_kp.public.0.to_vec();
 
+        eprintln!("[sdk::register] → create_tenant");
+        let t_ct = std::time::Instant::now();
         let outcome = self
             .inner
             .ln
             .create_tenant(&pubkey_hex, &plan_tier.into(), nonce, signature, noise_pk_bytes)
             .await?;
+        eprintln!("[sdk::register] ✓ create_tenant in {}ms tenant_id={}", t_ct.elapsed().as_millis(), outcome.tenant_id);
         *self.inner.token.write() = Some(outcome.api_token.clone());
         *self.inner.tenant_id.write() = Some(outcome.tenant_id.clone());
 
@@ -268,7 +282,9 @@ impl WickClient {
             loop_builder = loop_builder
                 .with_noise_tunnel(wick_noise::NoisePublicKey(noise_pk_bytes), self.credential_store());
         }
+        eprintln!("[sdk::register] → SignerLoop::spawn");
         let handle = loop_builder.spawn();
+        eprintln!("[sdk::register] ✓ SignerLoop spawned; awaiting wait_attached(5s)");
 
         // Wait briefly for the signer loop's first SignerService.Attach
         // to land. The server-side wake path blocks until a
@@ -278,9 +294,11 @@ impl WickClient {
         // gRPC + Noise handshake; if the loop hasn't attached by then
         // we proceed anyway and surface the wake failure to the
         // caller. Best-effort, not load-bearing for correctness.
-        let _ = handle
+        let t_attach = std::time::Instant::now();
+        let attached = handle
             .wait_attached(std::time::Duration::from_secs(5))
             .await;
+        eprintln!("[sdk::register] ✓ wait_attached returned attached={attached} in {}ms", t_attach.elapsed().as_millis());
         *self.inner.signer.write() = Some(handle);
 
         // Phase-4 server pubkey pinning. Skipped on `Regtest` (no pin),
@@ -399,21 +417,43 @@ impl WickClient {
         channel_value_sat: u64,
         push_msat: u64,
     ) -> Result<[u8; 32]> {
+        let tag = format!("v={channel_value_sat}/p={push_msat}");
+        let t0 = std::time::Instant::now();
+        eprintln!("[sdk::open_channel {tag}] → open_channel_init gRPC start");
         let (temp_channel_id, output_script, value_sat) = self
             .inner
             .ln
             .open_channel_init(peer, channel_value_sat, push_msat)
             .await?;
+        eprintln!(
+            "[sdk::open_channel {tag}] ✓ open_channel_init returned in {}ms (value_sat={value_sat}, temp_id={})",
+            t0.elapsed().as_millis(),
+            hex::encode(temp_channel_id)
+        );
 
+        let t1 = std::time::Instant::now();
+        eprintln!("[sdk::open_channel {tag}] → build_and_sign_funding start");
         let funding_tx = self
             .inner
             .wallet
             .build_and_sign_funding(output_script, value_sat)?;
+        eprintln!(
+            "[sdk::open_channel {tag}] ✓ build_and_sign_funding done in {}ms (txid={})",
+            t1.elapsed().as_millis(),
+            funding_tx.compute_txid()
+        );
 
+        let t2 = std::time::Instant::now();
+        eprintln!("[sdk::open_channel {tag}] → open_channel_finalize gRPC start");
         self.inner
             .ln
             .open_channel_finalize(temp_channel_id, peer, &funding_tx)
             .await?;
+        eprintln!(
+            "[sdk::open_channel {tag}] ✓ open_channel_finalize done in {}ms (total {}ms)",
+            t2.elapsed().as_millis(),
+            t0.elapsed().as_millis()
+        );
 
         Ok(temp_channel_id)
     }

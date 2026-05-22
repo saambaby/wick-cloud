@@ -150,6 +150,14 @@ impl SignerConnection {
         encoded: Vec<u8>,
         timeout: Duration,
     ) -> anyhow::Result<Vec<u8>> {
+        tracing::info!(
+            target: "wick_vls::dispatch",
+            context_id = %self.context_id,
+            session_token = self.session_token,
+            request_id,
+            bytes = encoded.len(),
+            "→ dispatch_vls"
+        );
         if self.retired.load(Ordering::Acquire) {
             anyhow::bail!("signer session replaced for '{}'", self.context_id);
         }
@@ -190,9 +198,21 @@ impl SignerConnection {
             .await
             .map_err(|_| {
                 self.pending_vls.remove(&key);
+                tracing::warn!(
+                    target: "wick_vls::dispatch",
+                    context_id = %self.context_id,
+                    request_id,
+                    "✗ dispatch_vls timeout"
+                );
                 anyhow::anyhow!("VLS call timeout (request_id={request_id})")
             })?
             .map_err(|_| anyhow::anyhow!("VLS response oneshot dropped"))?;
+        tracing::info!(
+            target: "wick_vls::dispatch",
+            context_id = %self.context_id,
+            request_id,
+            "✓ dispatch_vls reply"
+        );
         result
     }
 }

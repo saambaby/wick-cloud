@@ -709,6 +709,15 @@ impl WalletService for WickGrpcService {
             return Err(Status::invalid_argument("channel_value_sat must be > 0"));
         }
 
+        let t0 = std::time::Instant::now();
+        tracing::info!(
+            target: "wick_server::open_channel",
+            %tenant_id,
+            value_sat = req.channel_value_sat,
+            push_msat = req.push_msat,
+            "→ open_channel_init gRPC entered"
+        );
+
         let (tx, rx) = oneshot::channel();
         self.manager
             .dispatch(
@@ -723,11 +732,27 @@ impl WalletService for WickGrpcService {
             )
             .await
             .map_err(dispatch_error_to_status)?;
+        tracing::info!(
+            target: "wick_server::open_channel",
+            %tenant_id,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "✓ dispatch(OpenChannelInit) returned; awaiting actor response"
+        );
 
+        let t1 = std::time::Instant::now();
         let (temp_id, pending) = rx
             .await
             .map_err(|_| Status::internal("node actor dropped the response channel"))?
             .map_err(|e| Status::internal(e.to_string()))?;
+        tracing::info!(
+            target: "wick_server::open_channel",
+            %tenant_id,
+            actor_ms = t1.elapsed().as_millis() as u64,
+            total_ms = t0.elapsed().as_millis() as u64,
+            ?temp_id,
+            value_sat = pending.value_sat,
+            "✓ actor returned OpenChannelInit; replying to client"
+        );
 
         Ok(Response::new(OpenChannelInitResponse {
             temp_channel_id: temp_id.0.to_vec(),

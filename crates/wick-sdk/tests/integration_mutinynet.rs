@@ -67,6 +67,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::net::TcpStream;
+use std::process::Command as StdCommand;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -77,7 +78,10 @@ use bdk_wallet::bitcoin::{Address, Amount, FeeRate, Network, Transaction};
 use bdk_wallet::{KeychainKind, SignOptions, Wallet};
 use bip39::Mnemonic;
 use bitcoin::secp256k1::PublicKey;
-use wick_sdk::{PaymentStatus, WickClient, WickConfig, WickNetwork};
+use wick_sdk::{
+    compute_operator_lsp_pubkey, run_funding_loop, OperatorClient, PaymentStatus, WickClient,
+    WickConfig, WickNetwork,
+};
 
 // ── Const mnemonics (mutinynet-only, dev-public) ─────────────────────────────
 //
@@ -859,4 +863,381 @@ fn mutiny_hub() -> (PublicKey, String, u16) {
     let (hub_host, hub_port_str) = hub_host_port.split_once(':').expect("host:port");
     let hub_port: u16 = hub_port_str.parse().expect("hub port");
     (hub_pubkey, hub_host.to_owned(), hub_port)
+}
+
+#[test]
+fn print_operator_lsp_pubkey_for_mutinynet() {
+    let pk = wick_sdk::compute_operator_lsp_pubkey(FAUCET_MNEMONIC, None, WickNetwork::Mutinynet)
+        .expect("compute_operator_lsp_pubkey");
+    println!(
+        "OPERATOR_LSP_PUBKEY_MUTINYNET (derived from FAUCET_MNEMONIC) = {}",
+        hex::encode(pk.serialize())
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JIT variant — skips the second on-chain confirmation wait
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Same scenario as `tenant_to_tenant_payment_mutinynet`, but Bob (receiver)
+// has no real channel — he pulls inbound on-demand via LSPS2 JIT through
+// our own operator-driven LSP. Alice still opens one outbound channel
+// (sender liquidity is required). The operator role is driven from the
+// test process: it `register_lsp()`s the LSP Lightning seed in-memory
+// server-side, then drains `LspWatchPendingFunding` via
+// `run_funding_loop`, signing each funding tx from the operator's BDK
+// wallet (which is the same wallet as `FAUCET_MNEMONIC` — they derive
+// from one mnemonic via domain-separated paths, see
+// `Identity::lsp_lightning_seed`).
+//
+// Prerequisites:
+//   1. `WICK_LSP__ENABLED` config (the `[lsp]` block in
+//      `deploy/docker/config.mutinynet.toml`) is uncommented with
+//      `pubkey_hex` set to the value emitted by
+//      `print_operator_lsp_pubkey_for_mutinynet`.
+//   2. `WICK_ADMIN_SECRET=jit-mutinynet-secret` in the wick-server env.
+
+/// Mint a fresh admin macaroon by shelling out to the wick-server
+/// `mint-admin-macaroon` subcommand against the mutinynet config. The
+/// server creates an admin root key on first call and reuses it; each
+/// invocation produces a new macaroon bytes blob signed under that
+/// root. Returns the raw bytes — encoding into `x-wick-macaroon` is
+/// `OperatorClient::with_admin_macaroon`'s job.
+fn mint_admin_macaroon_for_mutinynet() -> Vec<u8> {
+    let workspace_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+    let config_path = format!("{workspace_root}/deploy/docker/config.mutinynet.toml");
+    let output = StdCommand::new("cargo")
+        .current_dir(&workspace_root)
+        .args([
+            "run",
+            "--quiet",
+            "--bin",
+            "wick-server",
+            "--",
+            "mint-admin-macaroon",
+            "--config",
+            &config_path,
+        ])
+        .output()
+        .expect("spawn `wick-server mint-admin-macaroon`");
+    if !output.status.success() {
+        panic!(
+            "mint-admin-macaroon failed (exit {:?}):\nstdout={}\nstderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hex_line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("admin_macaroon_hex="))
+        .expect("`admin_macaroon_hex=…` line in mint-admin-macaroon stdout");
+    hex::decode(hex_line.trim()).expect("admin macaroon hex decodes")
+}
+
+/// JIT payment Bob will receive. Above LDK's dust + reserve floors,
+/// inside the LSP's default [min_payment_size_msat, max_payment_size_msat].
+const JIT_PAYMENT_AMOUNT_MSAT: u64 = 50_000_000;
+
+/// Outbound channel Alice opens to the LSP. Needs to cover the JIT
+/// payment + a fee allowance. 100k sats clears LDK's channel-reserve
+/// floor (1% = 1000 sats) plus ~3000 sats commit fee + the 50k payment.
+const JIT_ALICE_CHANNEL_VALUE_SAT: u64 = 100_000;
+
+/// LSPS2 JIT settlement deadline. Mutinynet's 30 s block target +
+/// operator funding loop signing + LDK pipeline; 4 min is plenty.
+const JIT_SETTLE_TIMEOUT: Duration = Duration::from_secs(240);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual: wick-server with [lsp] enabled + WICK_ADMIN_SECRET on mutinynet"]
+async fn tenant_to_tenant_jit_payment_mutinynet() {
+    if TcpStream::connect("127.0.0.1:50051").is_err() {
+        panic!(
+            "no wick-server listening on 127.0.0.1:50051 — boot with:\n  \
+             cargo run -p wick-server -- --config deploy/docker/config.mutinynet.toml"
+        );
+    }
+
+    println!("→ minting admin macaroon via wick-server subcommand …");
+    let admin_macaroon = mint_admin_macaroon_for_mutinynet();
+    println!("✓ minted admin macaroon ({} bytes)", admin_macaroon.len());
+
+    let t0 = Instant::now();
+    let stamp =
+        |label: &str, since: Instant| println!("[+{:>5.1}s] {label}", since.elapsed().as_secs_f32());
+
+    let network = WickNetwork::Mutinynet;
+    let expected_lsp_pubkey =
+        compute_operator_lsp_pubkey(FAUCET_MNEMONIC, None, network).expect("derive lsp pubkey");
+    println!(
+        "expected LSP pubkey (from FAUCET_MNEMONIC): {}",
+        hex::encode(expected_lsp_pubkey.serialize())
+    );
+
+    let cfg_for_operator = || {
+        let mut cfg = WickConfig::for_network(network);
+        cfg.server_endpoint = "http://127.0.0.1:50051".to_owned();
+        cfg
+    };
+
+    // ── Step 1: Operator registers LSP identity + starts funding loop ─────
+    let s1 = Instant::now();
+    let mut operator = OperatorClient::with_admin_macaroon(
+        FAUCET_MNEMONIC,
+        None,
+        admin_macaroon.clone(),
+        cfg_for_operator(),
+    )
+    .await
+    .expect("OperatorClient::with_admin_macaroon");
+    let registered = operator.register_lsp().await.expect(
+        "register_lsp — admin macaroon was just minted; if this still fails \
+         confirm `[lsp].pubkey_hex` in config.mutinynet.toml matches the operator's mnemonic",
+    );
+    assert_eq!(
+        registered, expected_lsp_pubkey,
+        "server reported LSP pubkey {registered} but operator derived {expected_lsp_pubkey} — \
+         config.mutinynet.toml `[lsp].pubkey_hex` is stale; rerun \
+         `print_operator_lsp_pubkey_for_mutinynet` and paste the result"
+    );
+    operator
+        .sync_wallet()
+        .await
+        .expect("operator sync_wallet");
+    let opbal = operator.balance_sat().expect("operator balance");
+    println!(
+        "✓ operator LSP registered; pubkey={} balance={opbal} sat",
+        hex::encode(expected_lsp_pubkey.serialize())
+    );
+
+    // Build a second OperatorClient for the funding loop so we keep
+    // `operator` here for any direct admin queries. The loop owns its
+    // handle for its lifetime — same shape as jit_flow.rs.
+    let mut funding_operator = OperatorClient::with_admin_macaroon(
+        FAUCET_MNEMONIC,
+        None,
+        admin_macaroon,
+        cfg_for_operator(),
+    )
+    .await
+    .expect("OperatorClient::with_admin_macaroon (funding loop)");
+    funding_operator
+        .sync_wallet()
+        .await
+        .expect("funding loop sync_wallet");
+    let funding_handle = tokio::spawn(async move {
+        if let Err(e) = run_funding_loop(&mut funding_operator).await {
+            eprintln!("operator funding loop ended: {e}");
+        }
+    });
+    // Give the watch stream a beat to subscribe before any JIT request lands.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    stamp("step1 register_lsp + funding loop", s1);
+
+    // ── Step 2: register Alice (sender) + Bob (JIT receiver) ──────────────
+    let s2 = Instant::now();
+    let alice = register_client(ALICE_MNEMONIC, "alice").await;
+    let bob = register_client(BOB_MNEMONIC, "bob").await;
+    stamp("step2 register (alice + bob)", s2);
+
+    // ── Step 3: discover LSP address; tenants peer with the LSP ───────────
+    let lsp_info = alice.lsp_info().await.expect("alice lsp_info");
+    assert!(
+        lsp_info.ready,
+        "LSP info reports ready=false after register_lsp — server boot order issue or signer not attached"
+    );
+    let lsp_pubkey_from_info = lsp_info.pubkey.expect("lsp must be enabled");
+    assert_eq!(
+        lsp_pubkey_from_info, expected_lsp_pubkey,
+        "LSP info pubkey {lsp_pubkey_from_info} != expected {expected_lsp_pubkey}"
+    );
+    let (lsp_host, lsp_port) = {
+        let parts: Vec<&str> = lsp_info.address.rsplitn(2, ':').collect();
+        match parts.as_slice() {
+            [port_str, host] => {
+                let raw_host = (*host).to_owned();
+                // The server reports 0.0.0.0 when it bound INADDR_ANY;
+                // rewrite for client-side dial-ability.
+                let dial_host = match raw_host.as_str() {
+                    "0.0.0.0" | "" => "127.0.0.1".to_owned(),
+                    _ => raw_host,
+                };
+                (dial_host, port_str.parse::<u16>().expect("lsp port parses"))
+            }
+            _ => panic!("malformed lsp_info.address: {}", lsp_info.address),
+        }
+    };
+    println!("LSP P2P address: {lsp_host}:{lsp_port}");
+
+    // Sequential connect_peer: parallel try_join! deadlocks the VLS signer
+    // bidi stream — both tenants' Lightning handshakes call into VLS for
+    // Noise static keys at the same time, and the server-side block_vls!
+    // path appears to starve one of the signer loops. Sequencing the two
+    // connects sidesteps it cleanly; total cost is the same handshake time
+    // back-to-back.
+    let s3 = Instant::now();
+    alice
+        .connect_peer(expected_lsp_pubkey, &lsp_host, lsp_port)
+        .await
+        .expect("alice connect_peer to LSP");
+    bob.connect_peer(expected_lsp_pubkey, &lsp_host, lsp_port)
+        .await
+        .expect("bob connect_peer to LSP");
+    stamp("step3 connect_peer LSP (sequential)", s3);
+
+    // ── Step 4: Alice ensures she has outbound liquidity ──────────────────
+    //
+    // Reuse: if Alice already has a usable channel to the LSP from a prior
+    // run with enough outbound for the payment, skip the open path entirely.
+    let alice_has_outbound = {
+        let chs = alice.list_channels().await.expect("alice list_channels");
+        chs.into_iter().any(|c| {
+            c.counterparty == expected_lsp_pubkey
+                && c.is_usable
+                && c.outbound_capacity_msat >= JIT_PAYMENT_AMOUNT_MSAT + ALICE_OUTBOUND_HEADROOM_MSAT
+        })
+    };
+    if alice_has_outbound {
+        println!("✓ Alice already has usable outbound channel to LSP — skipping open");
+    } else {
+        let s4 = Instant::now();
+        // Faucet step: Alice's BDK needs sats to fund the channel. Reuse
+        // the persistent FaucetWallet built from FAUCET_MNEMONIC. The
+        // operator's funding loop spends from the SAME wallet — sequencing
+        // matters: faucet step first (synchronous), then operator loop
+        // (already spawned above; it pulls on demand). If both ever ran
+        // truly concurrent we'd hit BDK UTXO contention.
+        alice.sync_onchain().await.expect("alice sync_onchain");
+        let alice_onchain = alice.onchain_spendable_sat().expect("alice spendable");
+        if alice_onchain < JIT_ALICE_CHANNEL_VALUE_SAT + 5_000 {
+            let esplora_url = network.default_esplora();
+            let esplora = esplora_client::Builder::new(esplora_url)
+                .build_async()
+                .expect("esplora build_async");
+            let mut faucet = faucet_wallet().expect("build faucet BDK wallet");
+            sync_full(&mut faucet, &esplora).await;
+            let faucet_bal = faucet.balance().confirmed.to_sat();
+            assert!(
+                faucet_bal >= FAUCET_MIN_SAT,
+                "faucet wallet below {FAUCET_MIN_SAT} sat (has {faucet_bal}); top up via {MUTINYNET_FAUCET_URL}"
+            );
+            let alice_addr = alice.next_address_p2wpkh().expect("alice addr");
+            let funding_tx = build_faucet_payment(
+                &mut faucet,
+                Some((&alice_addr, FAUCET_TO_SDK_SAT)),
+                None,
+            )
+            .expect("build faucet payment");
+            esplora
+                .broadcast(&funding_tx)
+                .await
+                .expect("broadcast faucet payment");
+            println!("→ faucet → alice: {}", funding_tx.compute_txid());
+            wait_for_confirmation(&esplora, &funding_tx.compute_txid().to_string()).await;
+            alice.sync_onchain().await.expect("alice resync");
+        }
+
+        // Open exactly one outbound channel Alice → LSP.
+        open_with_retry(
+            &alice,
+            expected_lsp_pubkey,
+            &lsp_host,
+            lsp_port,
+            JIT_ALICE_CHANNEL_VALUE_SAT,
+            0,
+        )
+        .await
+        .expect("alice open_channel to LSP");
+        wait_for_usable(&alice, "alice", CHANNEL_READY_TIMEOUT)
+            .await
+            .expect("alice channel to LSP usable");
+        stamp("step4 alice open+ready", s4);
+    }
+
+    // ── Step 5: Bob fetches a JIT quote + issues a JIT invoice ────────────
+    let s5 = Instant::now();
+    let quote = bob
+        .lsps2_get_info(Some(JIT_PAYMENT_AMOUNT_MSAT))
+        .await
+        .expect("bob lsps2_get_info");
+    assert_eq!(quote.lsp_pubkey, expected_lsp_pubkey);
+    assert!(
+        JIT_PAYMENT_AMOUNT_MSAT >= quote.min_payment_size_msat
+            && JIT_PAYMENT_AMOUNT_MSAT <= quote.max_payment_size_msat,
+        "payment size {JIT_PAYMENT_AMOUNT_MSAT} outside LSP-quoted range \
+         [{}, {}]",
+        quote.min_payment_size_msat,
+        quote.max_payment_size_msat
+    );
+    let invoice = bob
+        .receive_payment_jit(JIT_PAYMENT_AMOUNT_MSAT, "jit smoke (mutinynet)")
+        .await
+        .expect("bob receive_payment_jit");
+    assert_eq!(invoice.lsp_pubkey, expected_lsp_pubkey);
+    assert!(invoice.jit_fee_msat_quote >= quote.min_fee_msat);
+    println!(
+        "✓ JIT invoice: hash={} bolt11_len={} jit_fee_quote={}",
+        hex::encode(invoice.payment_hash),
+        invoice.bolt11.len(),
+        invoice.jit_fee_msat_quote
+    );
+    stamp("step5 bob JIT invoice", s5);
+
+    // ── Step 6: Alice pays ────────────────────────────────────────────────
+    let bob_bal_before = bob.lightning_balance().await.expect("bob balance");
+    let s6 = Instant::now();
+    let payment = alice
+        .send_payment(&invoice.bolt11)
+        .await
+        .expect("alice send_payment");
+    assert_eq!(payment.payment_hash, invoice.payment_hash);
+    println!(
+        "→ Alice send_payment enqueued (status={:?})",
+        payment.status
+    );
+
+    // Poll Bob's transactions for the Succeeded inbound row.
+    let hash_hex = hex::encode(invoice.payment_hash);
+    let deadline = Instant::now() + JIT_SETTLE_TIMEOUT;
+    let net_expected = JIT_PAYMENT_AMOUNT_MSAT.saturating_sub(invoice.jit_fee_msat_quote);
+    let settled = loop {
+        if Instant::now() >= deadline {
+            panic!(
+                "JIT settlement did not complete within {JIT_SETTLE_TIMEOUT:?} — \
+                 operator funding loop or LDK pipeline stalled"
+            );
+        }
+        if let Ok(rows) = bob.transactions(20, None).await {
+            if let Some(row) = rows.into_iter().find(|p| {
+                hex::encode(p.payment_hash) == hash_hex
+                    && !p.is_outbound
+                    && p.status == PaymentStatus::Succeeded
+            }) {
+                break row;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    stamp("step6 alice → bob JIT settled", s6);
+    stamp("TOTAL", t0);
+
+    let bob_bal_after = bob.lightning_balance().await.expect("bob balance after");
+    let bob_delta = bob_bal_after
+        .lightning_msat
+        .saturating_sub(bob_bal_before.lightning_msat);
+    let amount_delta = settled.amount_msat.abs_diff(net_expected);
+    assert!(
+        amount_delta <= 1_000,
+        "alice's payment landed but bob's amount {} msat differs from expected ~{} msat \
+         (delta {amount_delta} msat) — JIT fee accounting may be off",
+        settled.amount_msat,
+        net_expected
+    );
+    println!(
+        "✓ JIT payment settled: bob received {} msat (Δ={bob_delta}, expected ~{net_expected})",
+        settled.amount_msat
+    );
+
+    funding_handle.abort();
 }

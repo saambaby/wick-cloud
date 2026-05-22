@@ -573,7 +573,19 @@ impl NodeSigner for SignerSession {
             Recipient::PhantomNode => return Err(()),
         }
         let conn = self.active_conn_if_ready()?;
+        tracing::info!(
+            target: "wick_vls::dispatch",
+            context_id = %self.lookup.context_id(),
+            peer = %hex::encode(other_key.serialize()),
+            "→ ecdh"
+        );
         let secret = block_vls!(rpc::rpc_ecdh(&conn, other_key.serialize())).map_err(|_| ())?;
+        tracing::info!(
+            target: "wick_vls::dispatch",
+            context_id = %self.lookup.context_id(),
+            peer = %hex::encode(other_key.serialize()),
+            "✓ ecdh"
+        );
         Ok(SharedSecret::from_bytes(secret))
     }
 
