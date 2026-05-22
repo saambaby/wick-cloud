@@ -104,6 +104,12 @@ pub struct CreateTenantOutcome {
     /// need to read this, but it's exposed for persistence across process
     /// restarts.
     pub api_token: String,
+    /// Serialized macaroon issued by the server when its macaroon auth
+    /// surface is wired. Empty when the server runs the legacy bearer-only
+    /// path. [`crate::WickClient`] prefers this for wallet RPCs when
+    /// non-empty (sent as `x-wick-macaroon: <base64>`); the bearer is
+    /// retained for the signer-attach path.
+    pub macaroon: Vec<u8>,
 }
 
 /// Tenant's server-side Lightning node pubkey + P2P listen address.

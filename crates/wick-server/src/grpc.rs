@@ -57,6 +57,35 @@ use crate::nonce_store::{NonceError, NonceStore, REGISTER_DOMAIN};
 /// can push that out — 15s is generous.
 const OPEN_CHANNEL_INIT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Dual-accept tenant authentication: prefer macaroon, fall back to bearer.
+///
+/// Returns the authenticated tenant id. A *present-but-invalid* macaroon
+/// header surfaces as `Status::unauthenticated` — only an *absent* header
+/// falls through to the legacy bearer path. The bearer path remains the
+/// canonical wallets-table lookup; the macaroon path resolves the tenant
+/// from the embedded `Scope::User { tenant_id }` caveat.
+async fn authenticate_dual<T>(
+    pool: &sqlx::PgPool,
+    mac_auth: &Option<MacaroonAuth>,
+    request: &Request<T>,
+) -> Result<TenantId, Status> {
+    if let Some(auth) = mac_auth {
+        if let Some(ctx) = auth.authenticate_optional(request).await? {
+            // Scope must be Scope::User { tenant_id } and the embedded
+            // tenant_id must match the verified context.
+            match ctx.scope {
+                Some(Scope::User { tenant_id: scope_tid })
+                    if scope_tid == *ctx.tenant_id.as_uuid().as_bytes() =>
+                {
+                    return Ok(ctx.tenant_id);
+                }
+                _ => return Err(Status::permission_denied("macaroon scope mismatch")),
+            }
+        }
+    }
+    Auth::authenticate(pool, request).await
+}
+
 /// Translate a typed [`DispatchError`] into the appropriate gRPC
 /// `Status`. Preserves the Phase-2 error taxonomy so clients can tell
 /// "retry later" (UNAVAILABLE, RESOURCE_EXHAUSTED, DEADLINE_EXCEEDED)
@@ -470,7 +499,7 @@ impl WalletService for WickGrpcService {
         request: Request<GetBalanceRequest>,
     ) -> Result<Response<GetBalanceResponse>, Status> {
         // Authenticate first — the req.tenant_id field is ignored.
-        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = authenticate_dual(self.pool.raw(), &self.macaroon_auth, &request).await?;
 
         let (tx, rx) = oneshot::channel();
         self.manager
@@ -494,7 +523,7 @@ impl WalletService for WickGrpcService {
         request: Request<SendPaymentRequest>,
     ) -> Result<Response<SendPaymentResponse>, Status> {
         // Authenticate first — the req.tenant_id field is ignored.
-        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = authenticate_dual(self.pool.raw(), &self.macaroon_auth, &request).await?;
 
         let req = request.into_inner();
         if req.bolt11.is_empty() {
@@ -530,7 +559,7 @@ impl WalletService for WickGrpcService {
         request: Request<ReceivePaymentRequest>,
     ) -> Result<Response<ReceivePaymentResponse>, Status> {
         // Authenticate first — the req.tenant_id field is ignored.
-        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = authenticate_dual(self.pool.raw(), &self.macaroon_auth, &request).await?;
 
         let req = request.into_inner();
         let (tx, rx) = oneshot::channel();
@@ -562,7 +591,7 @@ impl WalletService for WickGrpcService {
         request: Request<GetTransactionsRequest>,
     ) -> Result<Response<GetTransactionsResponse>, Status> {
         // Authenticate first — the req.tenant_id field is ignored.
-        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = authenticate_dual(self.pool.raw(), &self.macaroon_auth, &request).await?;
 
         let req = request.into_inner();
         let limit = req.limit.clamp(1, 200);
@@ -598,7 +627,7 @@ impl WalletService for WickGrpcService {
         &self,
         request: Request<GetNodeInfoRequest>,
     ) -> Result<Response<GetNodeInfoResponse>, Status> {
-        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = authenticate_dual(self.pool.raw(), &self.macaroon_auth, &request).await?;
 
         let (tx, rx) = oneshot::channel();
         self.manager
@@ -627,7 +656,7 @@ impl WalletService for WickGrpcService {
         &self,
         request: Request<ConnectPeerRequest>,
     ) -> Result<Response<ConnectPeerResponse>, Status> {
-        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = authenticate_dual(self.pool.raw(), &self.macaroon_auth, &request).await?;
         let req = request.into_inner();
 
         let peer_bytes = hex::decode(&req.peer_pubkey_hex)
@@ -667,7 +696,7 @@ impl WalletService for WickGrpcService {
         &self,
         request: Request<OpenChannelInitRequest>,
     ) -> Result<Response<OpenChannelInitResponse>, Status> {
-        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = authenticate_dual(self.pool.raw(), &self.macaroon_auth, &request).await?;
         let req = request.into_inner();
 
         let peer_bytes = hex::decode(&req.peer_pubkey_hex)
@@ -711,7 +740,7 @@ impl WalletService for WickGrpcService {
         &self,
         request: Request<OpenChannelFinalizeRequest>,
     ) -> Result<Response<OpenChannelFinalizeResponse>, Status> {
-        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = authenticate_dual(self.pool.raw(), &self.macaroon_auth, &request).await?;
         let req = request.into_inner();
 
         if req.temp_channel_id.len() != 32 {
@@ -759,7 +788,7 @@ impl WalletService for WickGrpcService {
         &self,
         request: Request<ListChannelsRequest>,
     ) -> Result<Response<ListChannelsResponse>, Status> {
-        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = authenticate_dual(self.pool.raw(), &self.macaroon_auth, &request).await?;
 
         let (tx, rx) = oneshot::channel();
         self.manager
@@ -791,7 +820,7 @@ impl WalletService for WickGrpcService {
         &self,
         request: Request<CloseChannelRequest>,
     ) -> Result<Response<CloseChannelResponse>, Status> {
-        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = authenticate_dual(self.pool.raw(), &self.macaroon_auth, &request).await?;
         let req = request.into_inner();
 
         if req.channel_id.len() != 32 {
@@ -861,7 +890,7 @@ impl WalletService for WickGrpcService {
         &self,
         request: Request<Lsps2GetInfoRequest>,
     ) -> Result<Response<Lsps2GetInfoResponse>, Status> {
-        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = authenticate_dual(self.pool.raw(), &self.macaroon_auth, &request).await?;
         let req = request.into_inner();
 
         let (tx, rx) = oneshot::channel();
@@ -895,7 +924,7 @@ impl WalletService for WickGrpcService {
         &self,
         request: Request<GetJitInvoiceRequest>,
     ) -> Result<Response<GetJitInvoiceResponse>, Status> {
-        let tenant_id = Auth::authenticate(self.pool.raw(), &request).await?;
+        let tenant_id = authenticate_dual(self.pool.raw(), &self.macaroon_auth, &request).await?;
         let req = request.into_inner();
 
         if req.amount_msat == 0 {

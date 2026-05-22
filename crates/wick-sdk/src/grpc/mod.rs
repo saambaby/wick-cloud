@@ -14,7 +14,7 @@ use wick_proto::wick as pb;
 use wick_proto::wick::wallet_service_client::WalletServiceClient;
 
 use auth::AuthInterceptor;
-pub(crate) use auth::{empty_token, SharedToken};
+pub(crate) use auth::{empty_credential, empty_token, SharedCredential, SharedToken};
 
 use crate::error::{Error, Result};
 use crate::types::{
@@ -32,11 +32,11 @@ pub(crate) struct LightningClient {
 impl LightningClient {
     /// Open a tonic channel to `endpoint` and attach the shared bearer
     /// token via an interceptor.
-    pub(crate) async fn connect(endpoint: &str, token: SharedToken) -> Result<Self> {
+    pub(crate) async fn connect(endpoint: &str, cred: SharedCredential) -> Result<Self> {
         let ep = Endpoint::from_shared(endpoint.to_owned())
             .map_err(|e| Error::Config(format!("invalid server_endpoint: {e}")))?;
         let channel = ep.connect().await?;
-        let service = InterceptedService::new(channel, AuthInterceptor::new(token));
+        let service = InterceptedService::new(channel, AuthInterceptor::new(cred));
         let inner = WalletServiceClient::new(service);
         Ok(Self { inner })
     }

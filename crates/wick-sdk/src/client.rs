@@ -25,7 +25,9 @@ use crate::credential::{
     RotationHandle, RotationLoop,
 };
 use crate::error::{Error, Result};
-use crate::grpc::{empty_token, LightningClient, SharedToken};
+use crate::grpc::{
+    empty_credential, empty_token, LightningClient, SharedCredential, SharedToken,
+};
 use crate::identity::Identity;
 use crate::pinning::{self, PinWitness, TransparencyLog};
 use crate::types::{
@@ -49,6 +51,14 @@ struct Inner {
     ln: LightningClient,
     config: WickConfig,
     token: SharedToken,
+    /// Wallet-RPC credential slot. Carries either the bearer (legacy)
+    /// or a serialized macaroon (Phase 4 dual-accept). The
+    /// `LightningClient` interceptor reads this on every call and
+    /// stamps either `Authorization: Bearer …` or `x-wick-macaroon: …`
+    /// accordingly. Distinct from `token`, which the signer-attach path
+    /// continues to use as bearer-only (outer attach is still bearer
+    /// in Phase 4; macaroon-with-pk is verified per inner frame).
+    cred: SharedCredential,
     tenant_id: RwLock<Option<String>>,
     /// Background reconnecting signer loop. `Some` after `register()`.
     /// Dropped when the last `WickClient` clone is released, which fires
@@ -82,7 +92,8 @@ impl WickClient {
         let chain = EsploraChain::new(&config.esplora_url)?;
 
         let token = empty_token();
-        let ln = LightningClient::connect(&config.server_endpoint, Arc::clone(&token)).await?;
+        let cred = empty_credential();
+        let ln = LightningClient::connect(&config.server_endpoint, Arc::clone(&cred)).await?;
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -92,6 +103,7 @@ impl WickClient {
                 ln,
                 config,
                 token,
+                cred,
                 tenant_id: RwLock::new(None),
                 signer: RwLock::new(None),
                 transparency_log: pinning::default_log(),
@@ -194,19 +206,30 @@ impl WickClient {
         *self.inner.token.write() = Some(outcome.api_token.clone());
         *self.inner.tenant_id.write() = Some(outcome.tenant_id.clone());
 
-        // D3 M4 — persist the credential into the swappable store and
-        // (if it's a macaroon with an expiry caveat) spawn the rotation
-        // loop. Bytes today are the legacy bearer token's UTF-8 form;
-        // D3 M3 will start returning serialised macaroon bytes here,
-        // detected via [`credential::classify`]. Both code paths share
-        // the same store + interceptor plumbing.
-        let bytes = outcome.api_token.as_bytes().to_vec();
-        let (kind, expires_at) = credential::classify(&bytes);
-        let cred = Credential {
-            bytes,
-            kind,
-            expires_at,
+        // Phase 4 dual-accept: when the server's macaroon auth surface
+        // is wired, `outcome.macaroon` carries the serialised macaroon
+        // bytes. Send them on every wallet RPC via the
+        // `x-wick-macaroon` header (base64-standard). Otherwise fall
+        // back to bearer on the `authorization` header. The signer
+        // path keeps using `self.inner.token` (bearer-only outer
+        // attach) regardless.
+        let (cred_bytes, cred_kind, cred_expires_at) = if outcome.macaroon.is_empty() {
+            let bytes = outcome.api_token.as_bytes().to_vec();
+            let (kind, expires_at) = credential::classify(&bytes);
+            (bytes, kind, expires_at)
+        } else {
+            let bytes = outcome.macaroon.clone();
+            let (kind, expires_at) = credential::classify(&bytes);
+            (bytes, kind, expires_at)
         };
+        *self.inner.cred.write() = Some((cred_kind, cred_bytes.clone()));
+        let cred = Credential {
+            bytes: cred_bytes,
+            kind: cred_kind,
+            expires_at: cred_expires_at,
+        };
+        let kind = cred.kind;
+        let expires_at = cred.expires_at;
         let store = self.credential_store();
         store.save(cred).await;
 

@@ -19,10 +19,12 @@
 //!   interceptor MUST NOT sort, dedup, or reorder caveats — the
 //!   signature wouldn't match. This is documented at the verify call
 //!   site too.
-//! * **The metadata header carries hex-encoded bytes.** Tonic metadata
-//!   is ASCII-only, so the serialized macaroon (which is arbitrary
-//!   bytes) rides as lowercase hex. The SDK side encodes on every
-//!   call; here we decode + verify.
+//! * **The metadata header carries base64-standard bytes (with padding).**
+//!   Tonic metadata is ASCII-only, so the serialized macaroon (arbitrary
+//!   bytes) rides as `base64::engine::general_purpose::STANDARD`. The
+//!   SDK side encodes on every call; here we decode + verify. Encoding
+//!   choice is load-bearing — the SDK interceptor at
+//!   `crates/wick-sdk/src/grpc/auth.rs` must use the same engine.
 
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
@@ -402,25 +404,30 @@ impl MacaroonAuth {
 
 /// Pull the macaroon bytes off a request's metadata. `Ok(None)` if the
 /// header is absent; an error if the value can't be parsed as
-/// base64-standard bytes.
+/// base64-standard bytes (with padding).
 fn extract_macaroon_bytes<T>(req: &Request<T>) -> Result<Option<Vec<u8>>, Status> {
+    use base64::Engine;
     let Some(header) = req.metadata().get(MACAROON_HEADER) else {
         return Ok(None);
     };
     let s = header
         .to_str()
         .map_err(|_| Status::unauthenticated("x-wick-macaroon is not valid ASCII"))?;
-    let bytes = hex::decode(s)
-        .map_err(|_| Status::unauthenticated("x-wick-macaroon is not valid hex"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|_| Status::unauthenticated("x-wick-macaroon is not valid base64"))?;
     Ok(Some(bytes))
 }
 
 /// Encode a serialized macaroon as the metadata header expects. SDK
 /// uses the same encoding via [`MACAROON_HEADER`]; exported here for
-/// tests.
+/// tests. Encoding is `base64::engine::general_purpose::STANDARD`
+/// (with padding) — the SDK interceptor at
+/// `crates/wick-sdk/src/grpc/auth.rs` mirrors this.
 #[must_use]
 pub fn encode_macaroon_header(bytes: &[u8]) -> String {
-    hex::encode(bytes)
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 fn map_macaroon_err(e: MacaroonError) -> Status {
@@ -470,10 +477,13 @@ mod tests {
 
     #[test]
     fn header_encode_decode_roundtrip() {
+        use base64::Engine;
         let (m, _rk) = issue_user_macaroon([1u8; 16]);
         let bytes = m.serialize();
         let encoded = encode_macaroon_header(&bytes);
-        let decoded = hex::decode(&encoded).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .unwrap();
         assert_eq!(bytes, decoded);
     }
 

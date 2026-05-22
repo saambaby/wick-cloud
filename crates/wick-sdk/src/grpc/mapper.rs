@@ -24,6 +24,7 @@ impl From<pb::CreateTenantResponse> for CreateTenantOutcome {
         Self {
             tenant_id: r.tenant_id,
             api_token: r.api_token,
+            macaroon: r.macaroon,
         }
     }
 }
