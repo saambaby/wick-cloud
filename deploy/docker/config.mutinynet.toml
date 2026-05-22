@@ -26,11 +26,13 @@ network             = "mutinynet"
 # you need stable inbound addresses that survive park/wake cycles.
 listen_port_base    = 0
 
-# ── Phase-2 park/wake tuning (all optional — defaults shown) ─────────────────
-# Mutinynet has 30-second blocks; wake_deadline can be tighter than regtest.
-#
-# [park_wake]
-# wake_deadline_secs              = 2      # max wall-clock time for one wake
+# ── Phase-2 park/wake tuning ─────────────────────────────────────────────────
+# Live-network wake on first boot includes RGS sync (~700ms), ChannelManager
+# restore from PgKvStore, and a Noise+VLS round-trip to the SDK signer for
+# every keys-derive. The 2s default is too tight; 30s gives slow-start
+# tenants room without being abusive.
+[park_wake]
+wake_deadline_secs              = 30
 # activity_poll_interval_secs     = 30     # how often the idle poller ticks
 # idle_threshold_secs             = 300    # 5 min idle before park candidate
 # max_error_attempts              = 5      # failures before ERROR state

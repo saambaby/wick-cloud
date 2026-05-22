@@ -42,14 +42,16 @@ use futures::StreamExt;
 use hmac::{ Hmac, Mac };
 use parking_lot::Mutex;
 use sha2::Sha256;
-use tokio::sync::{ mpsc, watch };
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{ mpsc, watch, Notify };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{ Channel, Endpoint };
 use tonic::Request;
 use vls_protocol::msgs::{ self as vls_msgs, Message, SerBolt };
 use vls_protocol::model::{ ExtKey, PubKey };
+use vls_protocol::serde_bolt::{ Array, WireString };
 use vls_protocol_signer::approver::PositiveApprover;
-use vls_protocol_signer::handler::{ Handler, HandlerBuilder, InitHandler, RootHandler };
+use vls_protocol_signer::handler::{ Handler, HandlerBuilder, RootHandler };
 use vls_protocol_signer::lightning_signer;
 use prost::Message as _;
 use wick_core::WickNetwork;
@@ -94,12 +96,38 @@ pub fn next_backoff(failures: u32) -> Duration {
 #[derive(Debug)]
 pub struct SignerHandle {
     shutdown_tx: watch::Sender<bool>,
+    /// Set to `true` once the first `SignerService.Attach` call returns
+    /// `Ok`. Callers awaiting [`Self::wait_attached`] race this against
+    /// their own timeout; the wake path on the server side blocks until
+    /// the signer is bound, so callers issuing RPCs immediately after
+    /// `register()` should await this first.
+    attached_flag: Arc<AtomicBool>,
+    attached_notify: Arc<Notify>,
 }
 
 impl SignerHandle {
     /// Signal the loop to exit at the next await point. Idempotent.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Wait until the signer loop's first `SignerService.Attach` call
+    /// has succeeded, or `timeout` elapses. Returns `true` on attach,
+    /// `false` on timeout. Cheap to call repeatedly: returns
+    /// immediately once the flag is set.
+    pub async fn wait_attached(&self, timeout: Duration) -> bool {
+        if self.attached_flag.load(Ordering::Acquire) {
+            return true;
+        }
+        // Register the listener BEFORE the state re-check to avoid
+        // the classic Notify TOCTOU (see PendingFundingRegistry note
+        // in wick-lightning).
+        let notified = self.attached_notify.notified();
+        tokio::pin!(notified);
+        if self.attached_flag.load(Ordering::Acquire) {
+            return true;
+        }
+        tokio::time::timeout(timeout, notified).await.is_ok()
     }
 }
 
@@ -133,6 +161,10 @@ pub struct SignerLoop {
     /// `AttachInner` envelope. Wired only when `noise_remote` is `Some`.
     credentials: Option<std::sync::Arc<dyn crate::credential::CredentialStore>>,
     shutdown_rx: Option<watch::Receiver<bool>>,
+    /// Wired in by [`Self::spawn`] so the loop can signal the first
+    /// successful `Attach` to anyone awaiting [`SignerHandle::wait_attached`].
+    attached_flag: Option<Arc<AtomicBool>>,
+    attached_notify: Option<Arc<Notify>>,
 }
 
 impl std::fmt::Debug for SignerLoop {
@@ -166,6 +198,8 @@ impl SignerLoop {
             noise_remote: None,
             credentials: None,
             shutdown_rx: None,
+            attached_flag: None,
+            attached_notify: None,
         }
     }
 
@@ -190,12 +224,20 @@ impl SignerLoop {
     pub fn spawn(mut self) -> SignerHandle {
         let (tx, rx) = watch::channel(false);
         self.shutdown_rx = Some(rx);
+        let attached_flag = Arc::new(AtomicBool::new(false));
+        let attached_notify = Arc::new(Notify::new());
+        self.attached_flag = Some(Arc::clone(&attached_flag));
+        self.attached_notify = Some(Arc::clone(&attached_notify));
         tokio::spawn(async move {
             if let Err(e) = self.run().await {
                 tracing::warn!(target: "wick_sdk::signer", %e, "signer loop terminated");
             }
         });
-        SignerHandle { shutdown_tx: tx }
+        SignerHandle {
+            shutdown_tx: tx,
+            attached_flag,
+            attached_notify,
+        }
     }
 
     /// Run the outer reconnection loop until the stream survives or a
@@ -323,6 +365,18 @@ impl SignerLoop {
                 return RunOutcome::TransportError { saw_frame: false };
             }
         };
+
+        // First-attach signal: the server-side wake path blocks until
+        // the SignerSession is bound. Setting the flag here lets
+        // `WickClient::register` callers (and integration tests) await
+        // signer readiness before firing tenant RPCs that would race
+        // the 2s wake_deadline.
+        if let Some(flag) = &self.attached_flag {
+            flag.store(true, Ordering::Release);
+        }
+        if let Some(notify) = &self.attached_notify {
+            notify.notify_waiters();
+        }
 
         // Phase-4 D1 N2 — if a Noise remote is configured, drive the
         // KK handshake before the VLS init handshake. The first frame
@@ -578,8 +632,11 @@ enum RunOutcome {
 
 // ── VLS handler state machine ─────────────────────────────────────────────────
 
+/// SDK-side VLS signer state. Always boots directly to `RootHandler`
+/// — the VLS init protocol is self-completed in `SignerState::new` via
+/// a synthesized `HsmdInit2` because wick-server's `SignerService.Attach`
+/// surface skips the wire-level init handshake.
 enum SignerState {
-    Init(InitHandler),
     Ready(RootHandler),
 }
 
@@ -600,28 +657,56 @@ impl SignerState {
             clock,
             trusted_oracle_pubkeys: vec![],
         };
-        let init = HandlerBuilder::new(network, 0, services, seed)
+        let mut init = HandlerBuilder::new(network, 0, services, seed)
             .approver(Arc::new(PositiveApprover()))
             .build()
             .map_err(|e| Error::Config(format!("VLS InitHandler build: {e:?}")))?;
-        Ok(Self::Init(init))
+
+        // Drive the VLS init protocol to completion locally by feeding a
+        // synthesized `HsmdInit2`. wick-server's `SignerService.Attach`
+        // surface does NOT send `HsmdInit`/`HsmdInit2` first — LDK 0.2
+        // jumps straight to per-peer calls like `Ecdh` once the bidi
+        // stream comes up. `InitHandler::handle` panics with
+        // `unimplemented init loop … message Ecdh` on any non-init
+        // message, and `Into<RootHandler>` requires `protocol_version`
+        // to be `Some` (set only by `HsmdInit`/`HsmdInit2`). Synthesising
+        // an `HsmdInit2` here is the cheapest path to leaving the SDK
+        // signer in `Ready` state before the first real client message
+        // arrives. The reply we'd send back is discarded — the server
+        // already knows the node identity (it derived the pubkey
+        // offline via `compute_operator_lsp_pubkey`).
+        //
+        // `derivation_style = 2` selects `KeyDerivationStyle::Ldk`
+        // (see `lightning_signer::signer::derive::KeyDerivationStyle`).
+        // `network_name` is informational only — `HsmdInit2` doesn't
+        // assert against the node's configured network.
+        let network_name = match network {
+            bitcoin::Network::Bitcoin => "bitcoin",
+            bitcoin::Network::Testnet => "testnet",
+            bitcoin::Network::Signet => "signet",
+            bitcoin::Network::Regtest => "regtest",
+            _ => "testnet",
+        };
+        let init_msg = Message::HsmdInit2(vls_msgs::HsmdInit2 {
+            derivation_style: 2,
+            network_name: WireString(network_name.as_bytes().to_vec()),
+            dev_seed: None,
+            dev_allowlist: Array(Vec::new()),
+        });
+        let (done, _reply) = init
+            .handle(init_msg)
+            .map_err(|e| Error::Config(format!("VLS init priming failed: {e:?}")))?;
+        if !done {
+            return Err(Error::Config(
+                "VLS InitHandler did not flip to done after synthetic HsmdInit2".to_owned(),
+            ));
+        }
+        Ok(Self::Ready(init.into()))
     }
 
     fn handle_node(&mut self, message: Message) -> std::result::Result<Vec<u8>, String> {
-        match self {
-            SignerState::Init(init_handler) => {
-                let (done, reply) = init_handler
-                    .handle(message)
-                    .map_err(|e| format!("init handler error: {e:?}"))?;
-                let body = reply.map(|r| r.as_vec()).unwrap_or_default();
-                if done {
-                    let root: RootHandler = init_handler.clone().into();
-                    *self = SignerState::Ready(root);
-                }
-                Ok(body)
-            }
-            SignerState::Ready(root_handler) =>
-                match message {
+        let SignerState::Ready(root_handler) = self;
+        match message {
                     // Re-init after wick-server restart: keep returning the same
                     // node identity rather than panicking the loop.
                     Message::HsmdInit2(_) => {
@@ -669,12 +754,11 @@ impl SignerState {
                             }
                         }
                     }
-                    other =>
-                        root_handler
-                            .handle(other)
-                            .map(|reply| reply.as_vec())
-                            .map_err(|e| format!("root handler error: {e:?}")),
-                }
+            other =>
+                root_handler
+                    .handle(other)
+                    .map(|reply| reply.as_vec())
+                    .map_err(|e| format!("root handler error: {e:?}")),
         }
     }
 
@@ -684,9 +768,7 @@ impl SignerState {
         peer_id: [u8; 33],
         payload: &[u8]
     ) -> std::result::Result<Vec<u8>, String> {
-        let SignerState::Ready(root_handler) = self else {
-            return Err("channel request received before signer init".to_owned());
-        };
+        let SignerState::Ready(root_handler) = self;
         let message = vls_msgs
             ::from_vec(payload.to_vec())
             .map_err(|e| format!("channel decode message: {e:?}"))?;
@@ -1091,7 +1173,11 @@ mod tests {
         // The watch channel inside `SignerHandle` is the cancellation
         // primitive for the outer reconnect loop — verify drop flips it.
         let (tx, mut rx) = watch::channel(false);
-        let handle = SignerHandle { shutdown_tx: tx };
+        let handle = SignerHandle {
+            shutdown_tx: tx,
+            attached_flag: Arc::new(AtomicBool::new(false)),
+            attached_notify: Arc::new(Notify::new()),
+        };
         assert!(!*rx.borrow());
         drop(handle);
         // After drop, `changed()` returns Err (sender gone) — we treat

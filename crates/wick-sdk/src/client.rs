@@ -269,6 +269,18 @@ impl WickClient {
                 .with_noise_tunnel(wick_noise::NoisePublicKey(noise_pk_bytes), self.credential_store());
         }
         let handle = loop_builder.spawn();
+
+        // Wait briefly for the signer loop's first SignerService.Attach
+        // to land. The server-side wake path blocks until a
+        // SignerSession is bound for the tenant — returning from
+        // register() before then races the 2s wake_deadline on the
+        // first tenant RPC. 5s budget covers a slow live-network
+        // gRPC + Noise handshake; if the loop hasn't attached by then
+        // we proceed anyway and surface the wake failure to the
+        // caller. Best-effort, not load-bearing for correctness.
+        let _ = handle
+            .wait_attached(std::time::Duration::from_secs(5))
+            .await;
         *self.inner.signer.write() = Some(handle);
 
         // Phase-4 server pubkey pinning. Skipped on `Regtest` (no pin),
