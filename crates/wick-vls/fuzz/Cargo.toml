@@ -34,3 +34,10 @@ path = "fuzz_targets/extension_rpc.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "policy_signing"
+path = "fuzz_targets/policy_signing.rs"
+test = false
+doc = false
+bench = false
