@@ -79,3 +79,26 @@ wake_deadline_secs              = 30
 # cltv_expiry_delta    = 144
 # jit_fulfil_timeout_blocks = 40
 # pubkey_hex           = "<33-byte hex>"      # output of compute_operator_lsp_pubkey(...)
+
+# Active config for the JIT integration test
+# (`tenant_to_tenant_jit_payment_mutinynet`). `pubkey_hex` is the LSP
+# Lightning pubkey derived from `FAUCET_MNEMONIC` (committed in
+# integration_mutinynet.rs) via `compute_operator_lsp_pubkey(...,
+# WickNetwork::Mutinynet)`. The printer test
+# `print_operator_lsp_pubkey_for_mutinynet` re-emits it on demand if
+# the mnemonic changes. Boot the server with
+# `WICK_ADMIN_SECRET=jit-mutinynet-secret`; the operator role inside the
+# test passes the same value via the `x-wick-admin-secret` header.
+[lsp]
+enabled                   = true
+listen_addr               = "0.0.0.0:19836"
+upstream_peer             = ""
+min_fee_msat              = 2000
+proportional_ppm          = 7000
+reorg_reserve_sats        = 1000000
+max_jit_channel_sats      = 5000000
+min_payment_size_msat     = 100000
+max_payment_size_msat     = 100000000000
+cltv_expiry_delta         = 144
+jit_fulfil_timeout_blocks = 40
+pubkey_hex                = "0255a219a8406ea07b93d976261553d974ea54723dd251642a9e2efccaddccbabd"

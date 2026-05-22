@@ -1113,6 +1113,19 @@ impl NodeManager {
     ///
     /// Uses `format()` which is safe here because `schema` is derived from a
     /// `TenantId` — always `^tenant_[0-9]+$`.
+    /// Idempotent wrapper around [`Self::create_tenant_schema`] used by
+    /// bootstrap paths that own a tenant id but don't go through the
+    /// normal `provision` flow — currently just the in-process LSP
+    /// daemon, whose tenant_id is derived from the operator's LSP
+    /// pubkey at boot. Safe to call repeatedly; the underlying DDL is
+    /// all `IF NOT EXISTS`.
+    pub async fn ensure_tenant_schema(
+        tenant_id: TenantId,
+        pool: &Pool,
+    ) -> anyhow::Result<()> {
+        Self::create_tenant_schema(tenant_id, pool).await
+    }
+
     async fn create_tenant_schema(tenant_id: TenantId, pool: &Pool) -> anyhow::Result<()> {
         let schema = tenant_id.schema_name();
 

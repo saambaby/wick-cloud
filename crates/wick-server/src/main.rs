@@ -314,19 +314,44 @@ async fn main() -> Result<()> {
     // logged and the server continues without an LSP — same behaviour
     // as Phase 2.
     let (lsp_builder, lsp_daemon_slot) = if let Some(ref state) = lsp_state {
-        match build_lsp_builder(&cfg, manager.clone()).await {
-            Ok(builder) => {
-                info!(
-                    lsp_pubkey = %state.pubkey,
-                    lsp_address = %state.address,
-                    "lsp slot ready, awaiting RegisterLspIdentity"
-                );
-                let slot: Arc<RwLock<Option<LspDaemon>>> = Arc::new(RwLock::new(None));
-                (Some(Arc::new(builder)), Some(slot))
-            }
-            Err(e) => {
-                warn!(error = %e, "lsp builder construction failed; serving without LSP");
-                (None, None)
+        // The LSP daemon's tenant_id is derived from its Lightning
+        // pubkey (`TenantId::from_pubkey`), but the LSP doesn't go
+        // through `NodeManager::provision` — it goes straight into
+        // `NodeBuilder::build` inside `LspBuilder::build_with_seed`,
+        // which immediately reads/writes via `PgKvStore`. Without
+        // pre-creating the schema (and the `vss_objects` /
+        // `channel_manager_state` / `monitors` tables) the very first
+        // `read_channel_monitors` query errors with
+        // `relation … does not exist` and the daemon refuses to boot.
+        // Idempotent: `ensure_tenant_schema` is all `CREATE … IF NOT
+        // EXISTS`, safe to call on every boot.
+        let lsp_tenant_id = wick_core::TenantId::from_pubkey(&state.pubkey.serialize());
+        if let Err(e) =
+            wick_server::node::manager::NodeManager::ensure_tenant_schema(lsp_tenant_id, &pool)
+                .await
+        {
+            warn!(
+                error = %e,
+                tenant = %lsp_tenant_id,
+                "LSP tenant schema bootstrap failed; serving without LSP"
+            );
+            (None, None)
+        } else {
+            match build_lsp_builder(&cfg, manager.clone()).await {
+                Ok(builder) => {
+                    info!(
+                        lsp_pubkey = %state.pubkey,
+                        lsp_address = %state.address,
+                        lsp_tenant = %lsp_tenant_id,
+                        "lsp slot ready, awaiting RegisterLspIdentity"
+                    );
+                    let slot: Arc<RwLock<Option<LspDaemon>>> = Arc::new(RwLock::new(None));
+                    (Some(Arc::new(builder)), Some(slot))
+                }
+                Err(e) => {
+                    warn!(error = %e, "lsp builder construction failed; serving without LSP");
+                    (None, None)
+                }
             }
         }
     } else {
@@ -534,6 +559,7 @@ async fn build_lsp_builder(cfg: &Config, manager: Arc<NodeManager>) -> Result<Ls
                     reward: cfg.lsp.grief_reward,
                     rejection_threshold: cfg.lsp.grief_rejection_threshold,
                 },
+                listen_addr: cfg.lsp.listen_addr,
             },
             bridge
         )

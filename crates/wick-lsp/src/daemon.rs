@@ -60,6 +60,12 @@ pub struct LspPartialConfig {
     /// fields. Used to construct the `GriefScorer` at handler build
     /// time.
     pub grief: GriefConfig,
+    /// P2P listen address for the LSP node. Maps 1:1 to
+    /// `LspConfig::listen_addr`. The LSP daemon binds this exact
+    /// SocketAddr (overriding the random per-tenant port that ordinary
+    /// `Node<S>` instances use) so the operator-published `lsp_address`
+    /// is the actual port tenants can dial.
+    pub listen_addr: std::net::SocketAddr,
 }
 
 /// Grief-score tunables. Plain `f64`s with the same shape as
@@ -158,6 +164,7 @@ impl LspBuilder {
                 .with_signer(signer)
                 .with_liquidity_service(promise_secret)
                 .with_lsp_service_handler(deferred.clone() as Arc<dyn LspServiceEventHandler>)
+                .with_listen_addr_override(self.config.listen_addr)
                 .build()
                 .await?;
 
@@ -185,7 +192,7 @@ impl LspBuilder {
             self.config.max_jit_channel_sats,
             grief_scorer,
         );
-        deferred.install(Arc::new(real_handler));
+        deferred.install(Arc::new(real_handler)).await;
 
         // Background handle kept around purely for the existing
         // `daemon.event_pump.abort()` shutdown contract. The actual
@@ -309,8 +316,14 @@ impl DeferredHandler {
         Self::default()
     }
 
-    fn install(&self, handler: Arc<dyn LspServiceEventHandler>) {
-        *self.inner.blocking_write() = Some(handler);
+    async fn install(&self, handler: Arc<dyn LspServiceEventHandler>) {
+        // `install` is called from `LspBuilder::build_with_seed`, which
+        // runs on a tokio worker — `blocking_write` panics in that
+        // context with "Cannot block the current thread from within a
+        // runtime". Use the async `write().await` instead. There's no
+        // real contention at install time; the lock is only held for
+        // the assignment.
+        *self.inner.write().await = Some(handler);
     }
 }
 

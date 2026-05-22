@@ -118,6 +118,11 @@ where
     /// responses + forward LDK lifecycle events into the
     /// `lsps2_service_handler`.
     lsp_service_handler: Option<Arc<dyn crate::liquidity_hook::LspServiceEventHandler>>,
+    /// Override the `deps.listen_addr_for(tenant_id)` random port with
+    /// a fixed `SocketAddr`. Used by the LSP daemon so tenants can
+    /// reach it on the operator-published `[lsp].listen_addr` instead
+    /// of an OS-assigned port the SDK side has no way to discover.
+    listen_addr_override: Option<std::net::SocketAddr>,
 }
 
 impl<S> NodeBuilder<S>
@@ -141,6 +146,7 @@ where
             liquidity_service: None,
             lsp_peer: None,
             lsp_service_handler: None,
+            listen_addr_override: None,
         }
     }
 
@@ -160,7 +166,17 @@ where
             liquidity_service: self.liquidity_service,
             lsp_peer: self.lsp_peer,
             lsp_service_handler: self.lsp_service_handler,
+            listen_addr_override: self.listen_addr_override,
         }
+    }
+
+    /// Override the random P2P listen port assigned by
+    /// `deps.listen_addr_for(tenant_id)`. Used by the LSP daemon so the
+    /// operator-published `[lsp].listen_addr` is the actual bound port.
+    #[must_use]
+    pub fn with_listen_addr_override(mut self, addr: std::net::SocketAddr) -> Self {
+        self.listen_addr_override = Some(addr);
+        self
     }
 
     /// Install an LSP service-event handler. Required when this node
@@ -230,6 +246,7 @@ where
             liquidity_service,
             lsp_peer,
             lsp_service_handler,
+            listen_addr_override,
         } = self;
 
         let signer = signer.ok_or_else(|| {
@@ -621,7 +638,7 @@ where
         let jit_registry = PendingJitRegistry::new();
 
         // ── Bind P2P listener ────────────────────────────────────────────────
-        let listen_bind = deps.listen_addr_for(tenant_id);
+        let listen_bind = listen_addr_override.unwrap_or_else(|| deps.listen_addr_for(tenant_id));
         let listener = TcpListener::bind(listen_bind).await.map_err(|e| {
             WickLightningError::Config(format!(
                 "TcpListener::bind({listen_bind}): {e} — port in use?"
@@ -671,9 +688,20 @@ where
         // call without the previous timer-driven nudge. No-op for
         // local-keys signers (default trait impl).
         {
+            // The callback fires from inside `VlsRemoteChannelSigner::
+            // maybe_setup_channel`, which runs synchronously inside LDK's
+            // `funding_transaction_generated` (and friends) — a path that
+            // already holds `ChannelManager`'s internal lock. Calling
+            // `signer_unblocked` synchronously from here would re-enter that
+            // lock and deadlock. Defer to a tokio task so the call lands
+            // after the current LDK frame unwinds.
             let channel_manager_for_unblock = Arc::clone(&channel_manager);
+            let unblock_runtime = deps.runtime.clone();
             signer.set_signer_unblock_callback(Box::new(move || {
-                channel_manager_for_unblock.signer_unblocked(None);
+                let cm = Arc::clone(&channel_manager_for_unblock);
+                unblock_runtime.spawn(async move {
+                    cm.signer_unblocked(None);
+                });
             }));
         }
 
@@ -869,14 +897,31 @@ where
             tokio::select! {
                 result = listener.accept() => {
                     match result {
-                        Ok((stream, _)) => {
+                        Ok((stream, peer_addr)) => {
                             match stream.into_std() {
                                 Ok(std_stream) => {
-                                    lightning_net_tokio::setup_inbound(
-                                        peer_manager.clone(),
-                                        std_stream,
-                                    )
-                                    .await;
+                                    // `lightning_net_tokio::setup_inbound` returns a
+                                    // future that completes when the peer disconnects.
+                                    // Awaiting it inline would serialise the listen
+                                    // backlog — only one inbound peer could be
+                                    // handshaking at a time, and a long-lived peer
+                                    // (e.g. a tenant) would block every subsequent
+                                    // accept. Spawn it on a task so the accept loop
+                                    // returns to `accept()` immediately.
+                                    let pm = peer_manager.clone();
+                                    tokio::spawn(async move {
+                                        tracing::debug!(
+                                            target: "wick_lightning",
+                                            %peer_addr,
+                                            "P2P inbound: spawning setup_inbound"
+                                        );
+                                        lightning_net_tokio::setup_inbound(pm, std_stream).await;
+                                        tracing::debug!(
+                                            target: "wick_lightning",
+                                            %peer_addr,
+                                            "P2P inbound: setup_inbound future resolved (peer disconnect)"
+                                        );
+                                    });
                                 }
                                 Err(e) => {
                                     tracing::warn!(

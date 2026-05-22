@@ -22,6 +22,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use base64::Engine as _;
+
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
 use bitcoin::{Address, Network, ScriptBuf, Transaction};
@@ -41,21 +43,47 @@ use crate::error::{Error, Result};
 use crate::identity::Identity;
 use crate::wallet::OnchainWallet;
 
-/// Metadata header carrying the admin shared secret. Must match the
-/// server-side `WICK_ADMIN_SECRET` (slice 3.3a auth gate).
+/// Legacy metadata header for the slice-3.3a shared-secret path. Kept
+/// only so existing callers that pre-date the macaroon migration still
+/// compile; the server-side admin handler no longer reads it.
 const ADMIN_SECRET_HEADER: &str = "x-wick-admin-secret";
 
-/// Tonic interceptor that injects the admin secret on every outbound
-/// request. Cloned cheaply per call alongside the underlying `Channel`.
+/// Metadata header carrying the admin macaroon (slice-3.3c). Same
+/// header the user-auth path uses — the two are distinguished by the
+/// embedded scope, not by metadata key. Value is the base64-standard
+/// (with padding) encoding of the raw macaroon bytes, matching the
+/// SDK's `crate::grpc::auth::AuthInterceptor`.
+const ADMIN_MACAROON_HEADER: &str = "x-wick-macaroon";
+
+/// Credential the operator sends to authenticate against the server's
+/// admin gRPC. `Macaroon` is the current path; `Secret` is retained
+/// for backwards compatibility with code that still passes the
+/// pre-macaroon shared secret, but the server-side admin handler no
+/// longer accepts it and will reject the request as `Unauthenticated`.
+#[derive(Clone)]
+enum AdminCredential {
+    Macaroon(MetadataValue<Ascii>),
+    Secret(MetadataValue<Ascii>),
+}
+
+/// Tonic interceptor that stamps the operator's credential on every
+/// outbound request. Cloned cheaply per call alongside the underlying
+/// `Channel`.
 #[derive(Clone)]
 struct AdminInterceptor {
-    secret: MetadataValue<Ascii>,
+    credential: AdminCredential,
 }
 
 impl Interceptor for AdminInterceptor {
     fn call(&mut self, mut req: Request<()>) -> std::result::Result<Request<()>, Status> {
-        req.metadata_mut()
-            .insert(ADMIN_SECRET_HEADER, self.secret.clone());
+        match &self.credential {
+            AdminCredential::Macaroon(v) => {
+                req.metadata_mut().insert(ADMIN_MACAROON_HEADER, v.clone());
+            }
+            AdminCredential::Secret(v) => {
+                req.metadata_mut().insert(ADMIN_SECRET_HEADER, v.clone());
+            }
+        }
         Ok(req)
     }
 }
@@ -153,7 +181,60 @@ impl OperatorClient {
         let endpoint = Endpoint::from_shared(config.server_endpoint.clone())
             .map_err(|e| Error::Config(format!("invalid server_endpoint: {e}")))?;
         let channel = endpoint.connect().await?;
-        let interceptor = AdminInterceptor { secret: secret_md };
+        let interceptor = AdminInterceptor {
+            credential: AdminCredential::Secret(secret_md),
+        };
+        let grpc = AdminServiceClient::with_interceptor(channel, interceptor);
+
+        Ok(Self {
+            grpc,
+            wallet,
+            lightning_seed,
+            lsp_pubkey,
+            config,
+            reserve_sats: AtomicU64::new(0),
+        })
+    }
+
+    /// Build an operator client authenticated with an admin macaroon
+    /// (slice 3.3c). The macaroon is minted server-side via
+    /// `wick-server mint-admin-macaroon --config <path>`; the bytes
+    /// produced (`admin_macaroon_hex` line, or the raw `--out` file)
+    /// are passed in here verbatim.
+    ///
+    /// Same semantics as [`Self::new`] otherwise — deterministic key
+    /// derivation, one network dial to bring up the gRPC channel.
+    pub async fn with_admin_macaroon(
+        mnemonic: &str,
+        passphrase: Option<&str>,
+        macaroon_bytes: Vec<u8>,
+        config: WickConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        if macaroon_bytes.is_empty() {
+            return Err(Error::InvalidInput(
+                "macaroon_bytes must not be empty — mint one with \
+                 `wick-server mint-admin-macaroon`"
+                    .to_owned(),
+            ));
+        }
+        let identity = Identity::from_mnemonic(mnemonic, passphrase, config.network)?;
+        let wallet = OnchainWallet::from_xprv(identity.master_xprv(), &config)?;
+        let lightning_seed = identity.lsp_lightning_seed(config.network)?;
+        let lsp_pubkey = derive_node_id_from_lightning_seed(lightning_seed)?;
+
+        // Server-side decoder (`extract_macaroon_bytes`) expects
+        // base64-standard with padding; mirror `crate::grpc::auth::AuthInterceptor`.
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&macaroon_bytes);
+        let value: MetadataValue<Ascii> = encoded.parse().map_err(|_| {
+            Error::InvalidInput("encoded admin macaroon is not valid ASCII".to_owned())
+        })?;
+        let endpoint = Endpoint::from_shared(config.server_endpoint.clone())
+            .map_err(|e| Error::Config(format!("invalid server_endpoint: {e}")))?;
+        let channel = endpoint.connect().await?;
+        let interceptor = AdminInterceptor {
+            credential: AdminCredential::Macaroon(value),
+        };
         let grpc = AdminServiceClient::with_interceptor(channel, interceptor);
 
         Ok(Self {
