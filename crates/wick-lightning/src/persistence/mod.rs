@@ -64,13 +64,45 @@ impl PgKvStore {
         format!("{primary}/{secondary}/")
     }
 
-    /// Drive `fut` to completion on the caller thread without starving the
-    /// Tokio scheduler. Requires a multi-threaded runtime.
+    /// Drive `fut` to completion synchronously from a worker thread
+    /// without starving the runtime's worker pool.
+    ///
+    /// Two indirections matter here:
+    ///
+    /// 1. `runtime.spawn` schedules `fut` as a normal task. It runs
+    ///    on **any** free worker, so its progress does not depend on
+    ///    the calling thread polling the io driver.
+    /// 2. `block_in_place` releases the calling thread from worker
+    ///    duty while it waits on the oneshot. The runtime spins up a
+    ///    replacement worker to keep the worker count at `N`, so I/O
+    ///    polling continues even when several `PgKvStore::block_on`
+    ///    callers are in flight.
+    ///
+    /// The earlier implementation drove `fut` directly on the calling
+    /// thread via `Handle::block_on`. That pattern deadlocked
+    /// `lightning_liquidity::events::EventQueue::persist`: persist
+    /// holds an `std::sync::Mutex` while it calls
+    /// `KVStoreSync::write`; if `block_on(fut)` is still running when
+    /// another worker contends for the same mutex (e.g. via
+    /// `EventQueueNotifierGuard::enqueue` during a concurrent
+    /// `LSPS2ServiceHandler::handle_buy_request`), the contending
+    /// worker can starve the io driver, and the sqlx future never
+    /// observes the Postgres response that would let `persist`
+    /// return. Decoupling future-progress from the worker that owns
+    /// the mutex breaks the cycle.
     fn block_on<F, T>(&self, fut: F) -> T
     where
-        F: std::future::Future<Output = T>,
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
     {
-        tokio::task::block_in_place(|| self.runtime.block_on(fut))
+        let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
+        self.runtime.spawn(async move {
+            let _ = tx.send(fut.await);
+        });
+        tokio::task::block_in_place(|| {
+            rx.recv()
+                .expect("PgKvStore::block_on: spawned future panicked or runtime dropped")
+        })
     }
 
     async fn read_async(&self, row_key: &str) -> Result<Vec<u8>, io::Error> {
@@ -192,7 +224,8 @@ impl KVStoreSync for PgKvStore {
         key: &str,
     ) -> Result<Vec<u8>, io::Error> {
         let row_key = Self::encode_key(primary_namespace, secondary_namespace, key);
-        self.block_on(self.read_async(&row_key))
+        let me = self.clone();
+        self.block_on(async move { me.read_async(&row_key).await })
     }
 
     fn write(
@@ -203,7 +236,8 @@ impl KVStoreSync for PgKvStore {
         buf: Vec<u8>,
     ) -> Result<(), io::Error> {
         let row_key = Self::encode_key(primary_namespace, secondary_namespace, key);
-        self.block_on(self.write_async(&row_key, buf))
+        let me = self.clone();
+        self.block_on(async move { me.write_async(&row_key, buf).await })
     }
 
     fn remove(
@@ -217,7 +251,8 @@ impl KVStoreSync for PgKvStore {
         // execute eagerly — simpler consistency and avoids resurrecting rows
         // via a deferred batch.
         let row_key = Self::encode_key(primary_namespace, secondary_namespace, key);
-        self.block_on(self.remove_async(&row_key))
+        let me = self.clone();
+        self.block_on(async move { me.remove_async(&row_key).await })
     }
 
     fn list(
@@ -226,7 +261,8 @@ impl KVStoreSync for PgKvStore {
         secondary_namespace: &str,
     ) -> Result<Vec<String>, io::Error> {
         let prefix = Self::namespace_prefix(primary_namespace, secondary_namespace);
-        self.block_on(self.list_async(&prefix))
+        let me = self.clone();
+        self.block_on(async move { me.list_async(&prefix).await })
     }
 }
 
