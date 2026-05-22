@@ -936,13 +936,17 @@ fn mint_admin_macaroon_for_mutinynet() -> Vec<u8> {
     hex::decode(hex_line.trim()).expect("admin macaroon hex decodes")
 }
 
-/// JIT payment Bob will receive. Above LDK's dust + reserve floors,
-/// inside the LSP's default [min_payment_size_msat, max_payment_size_msat].
-const JIT_PAYMENT_AMOUNT_MSAT: u64 = 50_000_000;
+/// JIT payment Bob will receive. Sized to fit through Alice's outbound
+/// channel under LDK's default `max_inbound_htlc_value_in_flight_percent_of_channel`
+/// (10%). With a 100k sat Alice↔LSP channel the LSP accepts at most
+/// 10 000 sat per inbound HTLC, so 8 000 sat leaves headroom for the
+/// jit_fee_quote without spilling into MPP fallback (which we have no
+/// channels for).
+const JIT_PAYMENT_AMOUNT_MSAT: u64 = 8_000_000;
 
-/// Outbound channel Alice opens to the LSP. Needs to cover the JIT
-/// payment + a fee allowance. 100k sats clears LDK's channel-reserve
-/// floor (1% = 1000 sats) plus ~3000 sats commit fee + the 50k payment.
+/// Outbound channel Alice opens to the LSP. 100k sats covers Alice's
+/// reserve + commit fee plus enough outbound headroom for repeated 8k
+/// sat payments across many test runs without re-funding the channel.
 const JIT_ALICE_CHANNEL_VALUE_SAT: u64 = 100_000;
 
 /// LSPS2 JIT settlement deadline. Mutinynet's 30 s block target +
@@ -1185,12 +1189,42 @@ async fn tenant_to_tenant_jit_payment_mutinynet() {
     stamp("step5 bob JIT invoice", s5);
 
     // ── Step 6: Alice pays ────────────────────────────────────────────────
+    //
+    // LDK's router occasionally returns `RouteNotFound` on the *first*
+    // try when the only viable path is `alice → LSP → intercept_scid →
+    // bob` and the alice↔LSP channel just transitioned to `is_usable`.
+    // Retry briefly with backoff before giving up. Each retry is cheap
+    // (sync graph lookup); 5×500ms covers any settle delay.
     let bob_bal_before = bob.lightning_balance().await.expect("bob balance");
     let s6 = Instant::now();
-    let payment = alice
-        .send_payment(&invoice.bolt11)
-        .await
-        .expect("alice send_payment");
+    let payment = {
+        let mut last_err: Option<wick_sdk::Error> = None;
+        let mut paid = None;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            match alice.send_payment(&invoice.bolt11).await {
+                Ok(p) => {
+                    paid = Some(p);
+                    break;
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if msg.contains("RouteNotFound") {
+                        println!("  send_payment attempt {} RouteNotFound — retrying", attempt + 1);
+                        last_err = Some(e);
+                        continue;
+                    }
+                    panic!("alice send_payment (non-RouteNotFound): {e}");
+                }
+            }
+        }
+        paid.unwrap_or_else(|| panic!(
+            "alice send_payment failed after 5 attempts; last: {}",
+            last_err.map(|e| format!("{e}")).unwrap_or_default()
+        ))
+    };
     assert_eq!(payment.payment_hash, invoice.payment_hash);
     println!(
         "→ Alice send_payment enqueued (status={:?})",
