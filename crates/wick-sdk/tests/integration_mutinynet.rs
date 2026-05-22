@@ -80,11 +80,28 @@ use bitcoin::secp256k1::PublicKey;
 use wick_sdk::{PaymentStatus, WickClient, WickConfig, WickNetwork};
 
 // ── Const mnemonics (mutinynet-only, dev-public) ─────────────────────────────
+//
+// Mnemonic provenance (2026-05-22):
+//
+// - FAUCET_MNEMONIC: promoted from the prior BOB role because the on-chain
+//   BIP84 wallet it controls held ~10.35 M mutinynet sats — enough to fund
+//   the test for many iterations without another browser faucet trip.
+// - BOB_MNEMONIC: rotated to a fresh BIP39 test vector (Trezor entropy
+//   `8080808080…`). Starts at 0 sats; the first run faucets it from the
+//   new FAUCET above.
+//
+// Stranded funds: the previous FAUCET mnemonic
+// `legal winner thank year wave sausage worth useful legal winner thank yellow`
+// retained ~400 k sats after the last top-up. To recover, swap that string
+// back in as `FAUCET_MNEMONIC` for one run and either sweep with a
+// `bdk drain` or open a channel against it.
 
 /// Faucet BDK wallet mnemonic. Operator tops up manually via the
 /// browser faucet; test spends from it to fund Alice + Bob on-chain.
+/// This is the previous BOB mnemonic — kept because its on-chain
+/// wallet already holds enough sats for many runs.
 const FAUCET_MNEMONIC: &str =
-    "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
 
 /// Alice — the payment sender. Persistent across runs so the Alice
 /// tenant, her on-chain UTXOs, and her Lightning channel all carry
@@ -92,33 +109,44 @@ const FAUCET_MNEMONIC: &str =
 const ALICE_MNEMONIC: &str =
     "army van defense carry jealous true garbage claim echo media make crunch";
 
-/// Bob — the payment receiver. Same persistence rationale as Alice.
-/// Opens his channel with `push_msat` so he has inbound liquidity.
+/// Bob — the payment receiver. Fresh BIP39 test vector (Trezor entropy
+/// `8080…`). On the first run the FAUCET funds him on-chain; subsequent
+/// runs reuse his channel + tenant state.
 const BOB_MNEMONIC: &str =
-    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+    "jelly better achieve collect unaware mountain thought cargo oxygen act hood bridge";
 
 // ── Thresholds + timeouts ────────────────────────────────────────────────────
 
 /// Minimum confirmed faucet balance required before the test will try
 /// to fund a tenant. Only checked when at least one tenant actually
-/// needs funding. Covers `2 × FAUCET_TO_SDK_SAT` plus fee headroom.
-const FAUCET_MIN_SAT: u64 = 400_000;
+/// needs faucet money. Covers `2 × FAUCET_TO_SDK_SAT` plus fee headroom.
+const FAUCET_MIN_SAT: u64 = 150_000;
 
 /// Amount the faucet sends into each SDK's BIP84 wallet when that
-/// tenant has no channel yet and must open one.
-const FAUCET_TO_SDK_SAT: u64 = 150_000;
+/// tenant has no channel yet AND its BDK balance is below
+/// `MIN_TENANT_ONCHAIN_SAT`. The faucet step is skipped per-tenant
+/// when on-chain is already sufficient (saves sats across re-runs).
+const FAUCET_TO_SDK_SAT: u64 = 60_000;
+
+/// If a tenant's BDK on-chain balance already exceeds this, the
+/// faucet→SDK transfer is skipped for that tenant — its existing
+/// UTXOs cover the channel open. Sized at `CHANNEL_VALUE_SAT` plus a
+/// generous fee buffer.
+const MIN_TENANT_ONCHAIN_SAT: u64 = 40_000;
 
 /// Channel capacity each tenant opens to the Mutiny hub on a fresh run.
-const CHANNEL_VALUE_SAT: u64 = 100_000;
+/// 30k sats is small enough to be cheap but above LDK's hard minimum
+/// (~20k for a healthy 2-of-2 + dust limit + commit-fee reservation).
+const CHANNEL_VALUE_SAT: u64 = 30_000;
 
 /// Bob pushes this many msat to the Mutiny hub at channel open so the
 /// hub has balance on Bob's channel — that balance is what becomes
 /// Bob's inbound liquidity when routing Alice → hub → Bob.
-const BOB_PUSH_MSAT: u64 = 30_000_000;
+const BOB_PUSH_MSAT: u64 = 6_000_000;
 
 /// Invoice amount Alice pays Bob. Well below Bob's expected inbound
 /// after reserves.
-const PAYMENT_AMOUNT_MSAT: u64 = 5_000_000;
+const PAYMENT_AMOUNT_MSAT: u64 = 1_000_000;
 
 /// Margin above `PAYMENT_AMOUNT_MSAT` required before the test will
 /// reuse an existing channel on Alice's side (covers routing fees).
@@ -173,25 +201,38 @@ async fn tenant_to_tenant_payment_mutinynet() {
         );
     }
 
+    let t0 = Instant::now();
+    let stamp = |label: &str, since: Instant| {
+        println!(
+            "[+{:>5.1}s] {label}",
+            since.elapsed().as_secs_f32()
+        );
+    };
+
     let esplora_url = WickNetwork::Mutinynet.default_esplora();
     let esplora = esplora_client::Builder::new(esplora_url)
         .build_async()
         .expect("esplora build_async");
 
     // ── Step 1: register both tenants (idempotent) ──────────────────────
+    let s1 = Instant::now();
     let alice = register_client(ALICE_MNEMONIC, "alice").await;
     let bob = register_client(BOB_MNEMONIC, "bob").await;
+    stamp("step1 register (alice + bob)", s1);
 
     let (hub_pubkey, hub_host, hub_port) = mutiny_hub();
 
     // ── Step 2: classify what each tenant needs ─────────────────────────
+    let s2 = Instant::now();
     let alice_state = classify(&alice, "alice", hub_pubkey, true).await;
     let bob_state = classify(&bob, "bob", hub_pubkey, false).await;
+    stamp("step2 classify (alice + bob)", s2);
 
     // ── Step 3: faucet + open for any tenant that NeedsFunding ──────────
     let alice_needs_open = matches!(alice_state, TenantState::NeedsFunding);
     let bob_needs_open = matches!(bob_state, TenantState::NeedsFunding);
 
+    let s3 = Instant::now();
     if alice_needs_open || bob_needs_open {
         run_funding_and_open_path(
             &alice,
@@ -207,8 +248,10 @@ async fn tenant_to_tenant_payment_mutinynet() {
     } else {
         println!("✓ both tenants have pre-existing channel state; skipping faucet + open");
     }
+    stamp("step3 funding+open path", s3);
 
     // ── Step 4: wait for any Pending channels to become usable ──────────
+    let s4 = Instant::now();
     if matches!(alice_state, TenantState::Pending) {
         wait_for_usable(&alice, "alice", EXISTING_CHANNEL_USABLE_TIMEOUT)
             .await
@@ -219,8 +262,10 @@ async fn tenant_to_tenant_payment_mutinynet() {
             .await
             .expect("bob pending channel");
     }
+    stamp("step4 wait Pending → Usable", s4);
 
     // ── Step 5: confirm post-state liquidity matches the test plan ──────
+    let s5 = Instant::now();
     let alice_channels = alice.list_channels().await.expect("alice list_channels");
     let bob_channels = bob.list_channels().await.expect("bob list_channels");
     let alice_hub = alice_channels
@@ -256,11 +301,15 @@ async fn tenant_to_tenant_payment_mutinynet() {
         PAYMENT_AMOUNT_MSAT
     );
 
+    stamp("step5 list_channels + liquidity asserts", s5);
+
     // ── Step 6: Bob issues invoice, Alice pays ──────────────────────────
+    let s6a = Instant::now();
     let invoice = bob
         .receive_payment(Some(PAYMENT_AMOUNT_MSAT), "tenant-to-tenant smoke")
         .await
         .expect("bob receive_payment");
+    stamp("step6a bob.receive_payment (invoice)", s6a);
     println!(
         "✓ Bob issued invoice ({} chars, hash={})",
         invoice.bolt11.len(),
@@ -274,10 +323,12 @@ async fn tenant_to_tenant_payment_mutinynet() {
         alice_bal_before.lightning_msat, bob_bal_before.lightning_msat
     );
 
+    let s6b = Instant::now();
     let payment = alice
         .send_payment(&invoice.bolt11)
         .await
         .expect("alice send_payment");
+    stamp("step6b alice.send_payment enqueued", s6b);
     println!(
         "→ Alice send_payment enqueued (status={:?}, hash={})",
         payment.status,
@@ -285,8 +336,13 @@ async fn tenant_to_tenant_payment_mutinynet() {
     );
     assert_eq!(payment.payment_hash, invoice.payment_hash);
 
+    let s6c = Instant::now();
     wait_for_payment_settled(&alice, &payment.payment_hash, true).await;
+    stamp("step6c alice sees Succeeded", s6c);
+    let s6d = Instant::now();
     wait_for_payment_settled(&bob, &invoice.payment_hash, false).await;
+    stamp("step6d bob sees Succeeded", s6d);
+    stamp("TOTAL", t0);
 
     let alice_bal_after = alice.lightning_balance().await.expect("alice balance");
     let bob_bal_after = bob.lightning_balance().await.expect("bob balance");
@@ -385,39 +441,65 @@ async fn run_funding_and_open_path(
     hub_host: &str,
     hub_port: u16,
 ) {
-    let mut faucet = faucet_wallet().expect("build faucet BDK wallet");
-    sync_full(&mut faucet, esplora).await;
-
-    // Minimum faucet balance depends on how many tenants need funding.
-    let tenants_needing = usize::from(alice_needs) + usize::from(bob_needs);
-    let min_required = FAUCET_TO_SDK_SAT * tenants_needing as u64 + 100_000;
-    ensure_faucet_funded(&mut faucet, esplora, min_required).await;
-
-    let alice_addr = if alice_needs {
-        Some(alice.next_address_p2wpkh().expect("alice addr"))
-    } else {
-        None
+    // Skip the faucet per-tenant when its BDK on-chain balance already
+    // covers a channel open. Saves real mutinynet sats across re-runs
+    // when prior attempts left UTXOs in the tenant wallets.
+    let alice_needs_faucet = alice_needs && {
+        let _ = alice.sync_onchain().await;
+        let bal = alice.onchain_spendable_sat().unwrap_or(0);
+        if bal >= MIN_TENANT_ONCHAIN_SAT {
+            println!("• alice on-chain already sufficient ({bal} sats) — skipping faucet");
+            false
+        } else {
+            true
+        }
     };
-    let bob_addr = if bob_needs {
-        Some(bob.next_address_p2wpkh().expect("bob addr"))
-    } else {
-        None
+    let bob_needs_faucet = bob_needs && {
+        let _ = bob.sync_onchain().await;
+        let bal = bob.onchain_spendable_sat().unwrap_or(0);
+        if bal >= MIN_TENANT_ONCHAIN_SAT {
+            println!("• bob on-chain already sufficient ({bal} sats) — skipping faucet");
+            false
+        } else {
+            true
+        }
     };
 
-    // Build one funding tx that pays whichever tenants need it.
-    let funding_tx = build_faucet_payment(
-        &mut faucet,
-        alice_addr.as_ref().map(|a| (a, FAUCET_TO_SDK_SAT)),
-        bob_addr.as_ref().map(|a| (a, FAUCET_TO_SDK_SAT)),
-    )
-    .expect("build faucet payment");
-    esplora
-        .broadcast(&funding_tx)
-        .await
-        .expect("broadcast faucet payment");
-    let funding_txid = funding_tx.compute_txid();
-    println!("→ broadcast funding tx {funding_txid}");
-    wait_for_confirmation(esplora, &funding_txid.to_string()).await;
+    if alice_needs_faucet || bob_needs_faucet {
+        let mut faucet = faucet_wallet().expect("build faucet BDK wallet");
+        sync_full(&mut faucet, esplora).await;
+
+        let tenants_needing = usize::from(alice_needs_faucet) + usize::from(bob_needs_faucet);
+        let min_required = FAUCET_TO_SDK_SAT * tenants_needing as u64 + 30_000;
+        ensure_faucet_funded(&mut faucet, esplora, min_required).await;
+
+        let alice_addr = if alice_needs_faucet {
+            Some(alice.next_address_p2wpkh().expect("alice addr"))
+        } else {
+            None
+        };
+        let bob_addr = if bob_needs_faucet {
+            Some(bob.next_address_p2wpkh().expect("bob addr"))
+        } else {
+            None
+        };
+
+        let funding_tx = build_faucet_payment(
+            &mut faucet,
+            alice_addr.as_ref().map(|a| (a, FAUCET_TO_SDK_SAT)),
+            bob_addr.as_ref().map(|a| (a, FAUCET_TO_SDK_SAT)),
+        )
+        .expect("build faucet payment");
+        esplora
+            .broadcast(&funding_tx)
+            .await
+            .expect("broadcast faucet payment");
+        let funding_txid = funding_tx.compute_txid();
+        println!("→ broadcast funding tx {funding_txid}");
+        wait_for_confirmation(esplora, &funding_txid.to_string()).await;
+    } else {
+        println!("✓ both tenants pre-funded — faucet step skipped");
+    }
 
     // Both tenants peer the hub (cheap even if one's already connected
     // — `connect_peer` is idempotent at the server).
@@ -434,36 +516,50 @@ async fn run_funding_and_open_path(
         alice.sync_onchain().await.expect("alice sync_onchain");
         let bal = alice.onchain_spendable_sat().expect("alice spendable");
         assert!(
-            bal >= FAUCET_TO_SDK_SAT - 10_000,
-            "alice on-chain {bal} sats looks wrong after funding"
+            bal >= CHANNEL_VALUE_SAT + 5_000,
+            "alice on-chain {bal} sats below channel value + fees"
         );
     }
     if bob_needs {
         bob.sync_onchain().await.expect("bob sync_onchain");
         let bal = bob.onchain_spendable_sat().expect("bob spendable");
         assert!(
-            bal >= FAUCET_TO_SDK_SAT - 10_000,
-            "bob on-chain {bal} sats looks wrong after funding"
+            bal >= CHANNEL_VALUE_SAT + 5_000,
+            "bob on-chain {bal} sats below channel value + fees"
         );
     }
 
     // Open in parallel when both need it; sequentially otherwise.
+    // Mutinynet's public hub can drop the P2P connection between
+    // `connect_peer` and `open_channel` — `open_with_retry` re-peers
+    // and retries up to 3 times against the "Not connected to node"
+    // error LDK surfaces in that window.
     match (alice_needs, bob_needs) {
         (true, true) => {
+            let open_started = Instant::now();
+            println!("→ open_channel (alice + bob, parallel)");
             tokio::try_join!(
-                alice.open_channel(hub_pubkey, CHANNEL_VALUE_SAT, 0),
-                bob.open_channel(hub_pubkey, CHANNEL_VALUE_SAT, BOB_PUSH_MSAT)
+                open_with_retry(alice, hub_pubkey, hub_host, hub_port, CHANNEL_VALUE_SAT, 0),
+                open_with_retry(bob, hub_pubkey, hub_host, hub_port, CHANNEL_VALUE_SAT, BOB_PUSH_MSAT)
             )
             .expect("open_channel");
+            println!(
+                "[+{:>5.1}s] open_channel returned (funding tx broadcast)",
+                open_started.elapsed().as_secs_f32()
+            );
+            let usable_started = Instant::now();
             tokio::try_join!(
                 wait_for_usable(alice, "alice", CHANNEL_READY_TIMEOUT),
                 wait_for_usable(bob, "bob", CHANNEL_READY_TIMEOUT)
             )
             .expect("wait_for_usable");
+            println!(
+                "[+{:>5.1}s] both channels usable (3 confs + channel_ready exchange)",
+                usable_started.elapsed().as_secs_f32()
+            );
         }
         (true, false) => {
-            alice
-                .open_channel(hub_pubkey, CHANNEL_VALUE_SAT, 0)
+            open_with_retry(alice, hub_pubkey, hub_host, hub_port, CHANNEL_VALUE_SAT, 0)
                 .await
                 .expect("alice open_channel");
             wait_for_usable(alice, "alice", CHANNEL_READY_TIMEOUT)
@@ -471,7 +567,7 @@ async fn run_funding_and_open_path(
                 .expect("alice usable");
         }
         (false, true) => {
-            bob.open_channel(hub_pubkey, CHANNEL_VALUE_SAT, BOB_PUSH_MSAT)
+            open_with_retry(bob, hub_pubkey, hub_host, hub_port, CHANNEL_VALUE_SAT, BOB_PUSH_MSAT)
                 .await
                 .expect("bob open_channel");
             wait_for_usable(bob, "bob", CHANNEL_READY_TIMEOUT)
@@ -485,6 +581,42 @@ async fn run_funding_and_open_path(
 }
 
 // ── SDK helpers ──────────────────────────────────────────────────────────────
+
+/// Open a channel with up-to-3 retries on the LDK "Not connected to
+/// node" misuse error. Mutinynet's public hub occasionally drops the
+/// TCP/Noise connection between `connect_peer` and `open_channel`;
+/// re-peering and retrying papers over the flake without changing
+/// product code.
+async fn open_with_retry(
+    client: &WickClient,
+    peer: PublicKey,
+    host: &str,
+    port: u16,
+    value_sat: u64,
+    push_msat: u64,
+) -> Result<[u8; 32], wick_sdk::Error> {
+    let mut last_err: Option<wick_sdk::Error> = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            println!("  re-peering hub before open_channel retry #{attempt}");
+            let _ = client.connect_peer(peer, host, port).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        match client.open_channel(peer, value_sat, push_msat).await {
+            Ok(temp_id) => return Ok(temp_id),
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("Not connected to node") {
+                    println!("  open_channel saw 'Not connected' — will retry");
+                    last_err = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Err(last_err.expect("at least one error"))
+}
 
 async fn register_client(mnemonic: &str, label: &str) -> WickClient {
     let mut cfg = WickConfig::for_network(WickNetwork::Mutinynet);
@@ -502,7 +634,9 @@ async fn register_client(mnemonic: &str, label: &str) -> WickClient {
 }
 
 async fn wait_for_usable(client: &WickClient, label: &str, budget: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + budget;
+    let started = Instant::now();
+    let deadline = started + budget;
+    let mut poll_n: u32 = 0;
     loop {
         if Instant::now() >= deadline {
             return Err(format!(
@@ -514,9 +648,31 @@ async fn wait_for_usable(client: &WickClient, label: &str, budget: Duration) -> 
             .await
             .map_err(|e| format!("{label} list_channels: {e}"))?;
         if channels.iter().any(|c| c.is_usable) {
-            println!("✓ {label} channel usable");
+            println!(
+                "[+{:>5.1}s] ✓ {label} channel usable (poll #{poll_n})",
+                started.elapsed().as_secs_f32()
+            );
             return Ok(());
         }
+        // Surface the per-poll state so we can see Pending → Usable
+        // transitions (3 confs on mutinynet ~ 90s).
+        if let Some(c) = channels.first() {
+            println!(
+                "[+{:>5.1}s] {label} poll #{poll_n}: channels={}, first \
+                 is_usable={}, out={}msat in={}msat",
+                started.elapsed().as_secs_f32(),
+                channels.len(),
+                c.is_usable,
+                c.outbound_capacity_msat,
+                c.inbound_capacity_msat,
+            );
+        } else {
+            println!(
+                "[+{:>5.1}s] {label} poll #{poll_n}: 0 channels yet",
+                started.elapsed().as_secs_f32()
+            );
+        }
+        poll_n += 1;
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
