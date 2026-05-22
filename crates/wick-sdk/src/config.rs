@@ -63,6 +63,13 @@ pub struct WickConfig {
     /// bearer-only attach path in place — useful for development
     /// against unconfigured servers.
     pub expected_noise_pubkey: Option<[u8; 32]>,
+
+    /// Skip Phase-4 server-pubkey pinning entirely. **Test/dev only.**
+    /// Production deployments must leave this `false` so the pinning
+    /// check enforces the SDK's release pin (or the operator's
+    /// override). Integration tests dialing a local `wick-server`
+    /// whose pubkey can't be known in advance set this to `true`.
+    pub disable_pinning: bool,
 }
 
 impl WickConfig {
@@ -79,6 +86,7 @@ impl WickConfig {
             parallel_esplora_requests: DEFAULT_PARALLEL_ESPLORA_REQUESTS,
             expected_server_pubkey: None,
             expected_noise_pubkey: None,
+            disable_pinning: false,
         }
     }
 

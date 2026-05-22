@@ -249,17 +249,46 @@ impl WickClient {
             *self.inner.rotation.write() = Some(handle);
         }
 
-        // Phase-4 server pubkey pinning. Skipped on `Regtest` (no pin)
-        // and when the operator hasn't supplied an override on a
-        // network that has no release const yet. On signet / mutinynet
-        // / bitcoin we constant-time-compare the server's tenant LN
-        // pubkey against the expected pin and hand a witness to the
-        // installed transparency log. The default `NoOpLog` always Oks.
-        let node_info = self.inner.ln.get_node_info().await?;
-        let actual_pubkey = node_info.pubkey.serialize();
-        if let Some((expected, source)) =
+        // Phase-4: spawn the on-device signer loop FIRST — before any
+        // RPC that might dispatch into the tenant actor on the server
+        // side. `get_node_info` (used by pinning below) triggers a
+        // server-side wake which fails with "signer offline" if the
+        // SDK side of `SignerService.Attach` isn't running yet.
+        // Spawning here closes that chicken-and-egg.
+        let seed = self
+            .inner
+            .identity
+            .tenant_lightning_seed(self.inner.config.network)?;
+        let xprv = *self.inner.identity.master_xprv();
+        let endpoint = self.inner.config.server_endpoint.clone();
+        let token = Arc::clone(&self.inner.token);
+        let network = self.inner.config.network;
+        let mut loop_builder = SignerLoop::new(endpoint, token, seed, xprv, network);
+        if let Some(noise_pk_bytes) = self.inner.config.expected_noise_pubkey {
+            loop_builder = loop_builder
+                .with_noise_tunnel(wick_noise::NoisePublicKey(noise_pk_bytes), self.credential_store());
+        }
+        let handle = loop_builder.spawn();
+        *self.inner.signer.write() = Some(handle);
+
+        // Phase-4 server pubkey pinning. Skipped on `Regtest` (no pin),
+        // when `disable_pinning` is set (test/dev only), and when the
+        // operator hasn't supplied an override on a network that has
+        // no release const yet. On signet / mutinynet / bitcoin we
+        // constant-time-compare the server's tenant LN pubkey against
+        // the expected pin and hand a witness to the installed
+        // transparency log. The default `NoOpLog` always Oks.
+        // `get_node_info` stays gated inside the pin branch — the call
+        // is unnecessary work when no pin is configured.
+        let pin = if self.inner.config.disable_pinning {
+            None
+        } else {
             pinning::expected_pubkey(self.inner.config.network, self.inner.config.expected_server_pubkey)
+        };
+        if let Some((expected, source)) = pin
         {
+            let node_info = self.inner.ln.get_node_info().await?;
+            let actual_pubkey = node_info.pubkey.serialize();
             if !pinning::ct_eq_pubkey(&actual_pubkey, &expected) {
                 return Err(Error::ServerPubkeyMismatch {
                     expected: pinning::fingerprint(&expected),
@@ -278,30 +307,6 @@ impl WickClient {
                 .await
                 .map_err(|e| Error::TransparencyVerify(e.to_string()))?;
         }
-
-        // Phase-4: spawn the on-device signer loop on a background task as
-        // soon as we have a bearer token. The server's per-tenant
-        // `wick_vls::SignerSession` resolves the live SDK side of this
-        // bidi stream on every LDK signer-trait call. Without this, the
-        // tenant's `Node` cannot sign anything (parked).
-        let seed = self
-            .inner
-            .identity
-            .tenant_lightning_seed(self.inner.config.network)?;
-        let xprv = *self.inner.identity.master_xprv();
-        let endpoint = self.inner.config.server_endpoint.clone();
-        let token = Arc::clone(&self.inner.token);
-        let network = self.inner.config.network;
-        // Spawn the reconnecting signer loop. The returned handle owns a
-        // watch-channel sender; storing it on `Inner` ties the loop's
-        // lifetime to the last `WickClient` clone (B5).
-        let mut loop_builder = SignerLoop::new(endpoint, token, seed, xprv, network);
-        if let Some(noise_pk_bytes) = self.inner.config.expected_noise_pubkey {
-            loop_builder = loop_builder
-                .with_noise_tunnel(wick_noise::NoisePublicKey(noise_pk_bytes), self.credential_store());
-        }
-        let handle = loop_builder.spawn();
-        *self.inner.signer.write() = Some(handle);
 
         Ok(outcome)
     }

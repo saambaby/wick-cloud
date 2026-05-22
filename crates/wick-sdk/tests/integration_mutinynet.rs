@@ -489,6 +489,10 @@ async fn run_funding_and_open_path(
 async fn register_client(mnemonic: &str, label: &str) -> WickClient {
     let mut cfg = WickConfig::for_network(WickNetwork::Mutinynet);
     cfg.server_endpoint = "http://127.0.0.1:50051".to_owned();
+    // Local dev server's tenant pubkey doesn't match the release pin
+    // baked into pinning.rs — the production wick.cloud's identity.
+    // Pinning correctness is covered by `tests/pinning_mitm.rs`.
+    cfg.disable_pinning = true;
     let client = WickClient::new(mnemonic, None, cfg)
         .await
         .expect("WickClient::new");
