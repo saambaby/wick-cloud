@@ -36,8 +36,11 @@ authors = ["Wick Cloud contributors"]
 # async runtime
 tokio = { version = "1.40", features = ["full"] }
 tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-native-roots", "connect", "handshake"] }
 async-trait = "0.1"
 futures = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+clap = { version = "4", features = ["derive"] }
 
 # errors / logging
 thiserror = "1"
