@@ -26,12 +26,44 @@
 //! and nothing else changes.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use lightning::io;
 use lightning::util::persist::KVStoreSync;
 use sqlx::{PgPool, Row};
 use tokio::runtime::Handle;
 use wick_core::TenantId;
+
+/// Dedicated runtime for driving KVStore sqlx futures, isolated from the
+/// main application runtime.
+///
+/// LDK calls [`KVStoreSync`] methods synchronously from the process-events
+/// loop and actor tasks, all on the **main** multi-threaded runtime. Bridging
+/// each call to async by spawning the sqlx future *on that same runtime* and
+/// then `block_in_place(rx.recv())` deadlocks under a persistence burst (e.g.
+/// a channel open, which persists the ChannelManager + every ChannelMonitor +
+/// the liquidity EventQueue in quick succession): enough main-runtime workers
+/// end up parked in `block_in_place(rx.recv())` that none remain to *poll* the
+/// spawned sqlx futures, so they never send and every waiter hangs forever
+/// (observed: the whole runtime wedges, even timers stop firing).
+///
+/// Running the sqlx futures on a separate runtime whose workers never call
+/// `block_in_place` breaks the cycle: those workers are always free to drive
+/// the Postgres IO to completion, so `rx.recv()` on the main side always
+/// unblocks. `block_in_place` is still used on the caller side so the *main*
+/// runtime spins up a replacement worker while this one waits.
+fn kv_runtime() -> &'static Handle {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_name("wick-kvstore")
+            .enable_all()
+            .build()
+            .expect("build dedicated KVStore runtime")
+    })
+    .handle()
+}
 
 /// Postgres-backed KV store for a single tenant.
 ///
@@ -40,17 +72,15 @@ use wick_core::TenantId;
 pub struct PgKvStore {
     pool: PgPool,
     schema: Arc<String>,
-    runtime: Handle,
 }
 
 impl PgKvStore {
     /// Construct a store bound to `tenant_id`'s schema on `pool`.
     #[must_use]
-    pub fn new(tenant_id: TenantId, pool: PgPool, runtime: Handle) -> Self {
+    pub fn new(tenant_id: TenantId, pool: PgPool) -> Self {
         Self {
             pool,
             schema: Arc::new(tenant_id.schema_name()),
-            runtime,
         }
     }
 
@@ -64,39 +94,24 @@ impl PgKvStore {
         format!("{primary}/{secondary}/")
     }
 
-    /// Drive `fut` to completion synchronously from a worker thread
-    /// without starving the runtime's worker pool.
+    /// Drive `fut` to completion synchronously from a main-runtime worker
+    /// without deadlocking the main runtime's worker pool.
     ///
-    /// Two indirections matter here:
-    ///
-    /// 1. `runtime.spawn` schedules `fut` as a normal task. It runs
-    ///    on **any** free worker, so its progress does not depend on
-    ///    the calling thread polling the io driver.
-    /// 2. `block_in_place` releases the calling thread from worker
-    ///    duty while it waits on the oneshot. The runtime spins up a
-    ///    replacement worker to keep the worker count at `N`, so I/O
-    ///    polling continues even when several `PgKvStore::block_on`
-    ///    callers are in flight.
-    ///
-    /// The earlier implementation drove `fut` directly on the calling
-    /// thread via `Handle::block_on`. That pattern deadlocked
-    /// `lightning_liquidity::events::EventQueue::persist`: persist
-    /// holds an `std::sync::Mutex` while it calls
-    /// `KVStoreSync::write`; if `block_on(fut)` is still running when
-    /// another worker contends for the same mutex (e.g. via
-    /// `EventQueueNotifierGuard::enqueue` during a concurrent
-    /// `LSPS2ServiceHandler::handle_buy_request`), the contending
-    /// worker can starve the io driver, and the sqlx future never
-    /// observes the Postgres response that would let `persist`
-    /// return. Decoupling future-progress from the worker that owns
-    /// the mutex breaks the cycle.
+    /// `fut` is spawned on the **dedicated** [`kv_runtime`] (not the main
+    /// runtime), whose workers never call `block_in_place` and are therefore
+    /// always available to poll it to completion. `block_in_place` on the
+    /// caller side releases this main-runtime worker (the runtime spins up a
+    /// replacement) so the main runtime keeps making progress while we wait
+    /// on the cross-runtime channel. See [`kv_runtime`] for the deadlock this
+    /// avoids — an earlier version spawned `fut` on the main runtime and hung
+    /// the whole process under a channel-open persistence burst.
     fn block_on<F, T>(&self, fut: F) -> T
     where
         F: std::future::Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
         let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
-        self.runtime.spawn(async move {
+        kv_runtime().spawn(async move {
             let _ = tx.send(fut.await);
         });
         tokio::task::block_in_place(|| {

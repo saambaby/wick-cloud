@@ -295,11 +295,7 @@ where
         }
 
         // ── Stores ────────────────────────────────────────────────────────────
-        let kv_store = Arc::new(PgKvStore::new(
-            tenant_id,
-            deps.pg_pool.clone(),
-            deps.runtime.clone(),
-        ));
+        let kv_store = Arc::new(PgKvStore::new(tenant_id, deps.pg_pool.clone()));
         let payments = Arc::new(PaymentStore::new(tenant_id, deps.pg_pool.clone()));
         let channels = Arc::new(ChannelStore::new(tenant_id, deps.pg_pool.clone()));
         let peer_store = Arc::new(PeerStore::new(tenant_id, deps.pg_pool.clone()));
