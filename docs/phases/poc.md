@@ -105,7 +105,50 @@ Confirmed empirically (2026-05-30): a JIT channel from the 2026-05-22 runs left 
 
 **Operational note.** This is primarily a stale-dev-state problem, not a production one: in normal park/wake, a tenant is offline for minutes, so the catch-up is a handful of blocks. Don't leave mutinynet test state idle for days. To recover a poisoned tenant, purge its `//manager` + `monitors//*` rows (and `channels` table) from its `tenant_<id>` schema so it boots fresh at the current tip. A durable fix (esplora script-based sync, or fast-forwarding `best_block` past a staleness threshold) is deferred to Phase 1 — see Done-When below.
 
-## JIT step-5 stall — bounded (symptom fixed; root cause scoped)
+## JIT step-5 stall — FIXED & verified (2026-05-30)
+
+Root cause was **not** only the LSP handler: a thread dump of the wedged server
+showed the whole tokio runtime dead (metrics endpoint + timers stopped) with the
+process-events loop stuck in `PgKvStore::block_on → block_in_place → mpsc::recv`.
+`PgKvStore::block_on` spawned its sqlx future on the **main** runtime then blocked
+a main worker on `rx.recv()`; under the channel-open persistence burst (manager +
+every monitor + EventQueue persisted at once) enough main workers parked in
+`rx.recv()` that none were left to poll the spawned futures → permanent wedge.
+
+Two fixes landed:
+1. `wick-lightning/src/persistence/mod.rs` — drive PgKvStore sqlx futures on a
+   **dedicated runtime** (`kv_runtime`) whose workers never `block_in_place`, so
+   they always poll Postgres IO to completion. (commit on main)
+2. `wick-lsp/src/handler.rs` — `forward_channel_ready` now skips non-JIT channels
+   (a tenant's normal channel ChannelReady was being fed into the LSPS2 handler,
+   erroring + blocking the LSP event loop).
+
+**Verified live on the fresh-open path:** runtime stays alive through the burst
+(metrics responsive), and step 5 `lsps2_get_info` returns in ~0.1s instead of
+hanging forever. This was the user-reported "30-min stall" class, now resolved.
+
+The `block_vls!` macro still uses the same `block_in_place(block_on)` shape, but
+with PgKvStore no longer wedging the runtime it completes normally; left as-is
+unless a future burst shows it wedging.
+
+## Open bug — step-6 VLS "unbalanced payments" policy failure (NEW, next)
+
+With the wedge gone, the JIT payment now reaches the actual commitment signing and
+hits a VLS **policy** rejection on Alice's (payer) channel:
+
+```
+wick_vls: sign_counterparty_commitment failed ctx=Alice
+  policy failure: validate_payments: unbalanced payments on channel … [<Bob's invoice hash>]
+```
+
+The SDK signer uses VLS's default `SimpleValidatorFactory` (wick-sdk/src/signer.rs).
+For a holder *originating* a payment, VLS's `validate_payments` needs the outgoing
+payment/invoice relayed to the device so the offered HTLC balances; otherwise it
+sees an unexplained outgoing HTLC and rejects. This is a distinct, deeper
+VLS-integration gap (payment-state sync to the device signer) — separate from the
+stall and the SetupChannel-reattach fixes. It is the next blocker to close the PoC.
+
+## JIT step-5 stall — historical detail (superseded by the FIXED section above)
 
 With the stale-state hang resolved (above), a run on the **fresh-open path** (Alice opens her channel in-process, ~210s) progressed through register_lsp, connect_peer, and Alice's channel open, then **stalled indefinitely at step 5 — `bob.lsps2_get_info()`** with no output and no error.
 
