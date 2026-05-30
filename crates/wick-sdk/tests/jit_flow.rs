@@ -172,6 +172,44 @@ impl Drop for HostedServer {
     }
 }
 
+/// Mint an admin macaroon by shelling out to the wick-server
+/// `mint-admin-macaroon` subcommand against the regtest config. Admin
+/// auth migrated from the deprecated `WICK_ADMIN_SECRET` shared secret to
+/// minted macaroons; the operator passes the bytes via
+/// [`OperatorClient::with_admin_macaroon`].
+fn mint_admin_macaroon_for_regtest() -> Vec<u8> {
+    let workspace_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+    let config_path = format!("{workspace_root}/deploy/docker/config.regtest.toml");
+    let output = StdCommand::new("cargo")
+        .current_dir(&workspace_root)
+        .args([
+            "run",
+            "--quiet",
+            "--bin",
+            "wick-server",
+            "--",
+            "mint-admin-macaroon",
+            "--config",
+            &config_path,
+        ])
+        .output()
+        .expect("spawn `wick-server mint-admin-macaroon`");
+    if !output.status.success() {
+        panic!(
+            "mint-admin-macaroon failed (exit {:?}):\nstdout={}\nstderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hex_line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("admin_macaroon_hex="))
+        .expect("`admin_macaroon_hex=…` line in mint-admin-macaroon stdout");
+    hex::decode(hex_line.trim()).expect("admin macaroon hex decodes")
+}
+
 // ── Test ──────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -203,9 +241,13 @@ async fn jit_invoice_carries_lsp_route_hint() {
 
     // ── 1. Operator: register LSP identity + start funding loop ───────────
 
-    let mut operator = OperatorClient::new(OPERATOR_MNEMONIC, None, ADMIN_SECRET, config())
-        .await
-        .expect("OperatorClient::new");
+    // Admin auth is macaroon-based (WICK_ADMIN_SECRET is deprecated/ignored).
+    let admin_macaroon = mint_admin_macaroon_for_regtest();
+
+    let mut operator =
+        OperatorClient::with_admin_macaroon(OPERATOR_MNEMONIC, None, admin_macaroon.clone(), config())
+            .await
+            .expect("OperatorClient::with_admin_macaroon");
     assert_eq!(
         operator.lsp_pubkey(),
         lsp_pubkey,
@@ -244,9 +286,14 @@ async fn jit_invoice_carries_lsp_route_hint() {
     // via the operator's BDK wallet. Important: the loop owns
     // `operator` for its lifetime — in the test we rebuild a separate
     // OperatorClient handle for the loop.
-    let mut funding_operator = OperatorClient::new(OPERATOR_MNEMONIC, None, ADMIN_SECRET, config())
-        .await
-        .expect("OperatorClient::new (funding loop)");
+    let mut funding_operator = OperatorClient::with_admin_macaroon(
+        OPERATOR_MNEMONIC,
+        None,
+        admin_macaroon.clone(),
+        config(),
+    )
+    .await
+    .expect("OperatorClient::with_admin_macaroon (funding loop)");
     funding_operator
         .sync_wallet()
         .await
@@ -416,10 +463,41 @@ async fn jit_invoice_carries_lsp_route_hint() {
     // `FundingGenerationReady` parks → operator's funding loop signs
     // + finalizes → Alice's `OpenChannelRequest` accepts 0-conf →
     // channel opens → HTLC settles inbound on Alice.
-    let send = bob
-        .send_payment(&invoice.bolt11)
-        .await
-        .expect("Bob send_payment");
+    // LDK's router can return `RouteNotFound` on the first attempt while the
+    // freshly-bought intercept SCID / Bob's just-usable channel settle into
+    // the router's view. Retry briefly with a block nudge — same pattern the
+    // mutinynet harness uses. Each attempt is cheap (sync graph lookup).
+    let send = {
+        let mut last_err: Option<wick_sdk::Error> = None;
+        let mut paid = None;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                let _ = rpc.mine(1);
+                tokio::time::sleep(Duration::from_millis(750)).await;
+            }
+            match bob.send_payment(&invoice.bolt11).await {
+                Ok(p) => {
+                    paid = Some(p);
+                    break;
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if msg.contains("RouteNotFound") {
+                        println!("  Bob send_payment attempt {} RouteNotFound — retrying", attempt + 1);
+                        last_err = Some(e);
+                        continue;
+                    }
+                    panic!("Bob send_payment (non-RouteNotFound): {e}");
+                }
+            }
+        }
+        paid.unwrap_or_else(|| {
+            panic!(
+                "Bob send_payment failed after 5 attempts; last: {}",
+                last_err.map(|e| format!("{e}")).unwrap_or_default()
+            )
+        })
+    };
     assert_eq!(send.payment_hash, invoice.payment_hash);
 
     // Mine a couple of blocks while we wait — the JIT funding tx
