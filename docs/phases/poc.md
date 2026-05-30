@@ -210,6 +210,43 @@ remaining `event.rs` `block_on` through `kv_runtime`.
 (the cascade is gone, so this is now a clean routing-correctness issue to chase
 next). Plus an occasional regtest setup flake at `bitcoind send_to_address`.
 
+## End-goal payment (Alice↔Bob) — status (2026-05-30)
+
+Regtest `jit_flow` now gets the payment **almost** all the way: stability (no
+wedge), routing (no RouteNotFound), Bob's channel + the JIT channel to Alice
+open with full VLS signing. The single remaining blocker is at HTLC settlement:
+
+**VLS commitment-number desync (`get_per_commitment_point: commitment_number 3
+invalid when next_holder_commit_num is 1`).** Precise diagnosis (2 agents +
+a sequence trace on Bob's channel, dbid=1):
+
+```
+get_per_commitment_point 0,1            validate_holder_commitment 0 (initial, forwards)
+get_per_commitment_point 2              validate_holder_commitment 1 (forwards ValidateCommitmentTx2)
+get_per_commitment_point 3  -> FAILS    release_commitment_secret 0  (revoke, AFTER the failed point)
+```
+
+The device's `next_holder_commit_num` only advances on `RevokeCommitmentTx`
+(`release_commitment_secret`), and that requires a prior `ValidateCommitmentTx2`
+to stage `next_holder_commit_info`. LDK 0.2 fetches `get_per_commitment_point(N+1)`
+**eagerly** (point 3) *before* the revoke that would advance the counter — and
+on the signer-unblock **resend path** (`get_last_revoke_and_ack`) it skips
+`validate_holder_commitment` entirely. So the device counter is stranded at 1.
+
+Confirmed NOT version-related: the `> next+1` ceiling holds at both v5 and v6
+(GetPerCommitmentPoint2). Applied so far: `validate_holder_commitment` now
+forwards `ValidateCommitmentTx2` for post-funding commitments (was a blanket
+`Ok(())` stub) — necessary but not sufficient.
+
+**The fix (next session — fund-securing signer code, do carefully):** drive
+`ValidateCommitmentTx2(n)` from inside `release_commitment_secret` (which IS on
+the resend path) before its `RevokeCommitmentTx(n-1)`, replaying the holder
+commitment cached from `validate_holder_commitment`. Reference a working
+LDK+VLS integration (lnrod) for the exact v5 validate→revoke pairing. Files:
+`crates/wick-vls/src/session.rs` (release_commitment_secret ~1371,
+validate_holder_commitment ~1387), `rpc.rs` (rpc_validate_holder_commitment,
+rpc_release_commitment_secret).
+
 ## Active Work (as of May 2026)
 
 Based on recent commits:

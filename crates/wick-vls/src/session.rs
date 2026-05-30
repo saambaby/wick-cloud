@@ -1393,25 +1393,37 @@ impl ChannelSigner for VlsRemoteChannelSigner {
             return Err(());
         }
         // LDK 0.2's two-phase funding calls `validate_holder_commitment` as a
-        // pre-funding self-check, before any `EcdsaChannelSigner` method has
-        // fired with `ChannelTransactionParameters`. There's no concurrent
-        // racing call that could deliver `SetupChannel`, so awaiting setup
-        // would deadlock — skip the VLS round-trip in this state and let
-        // `sign_holder_commitment` (which IS handed `ChannelTransactionParameters`
-        // and runs `maybe_setup_channel`) re-validate downstream. LDK's own
-        // counterparty-signature check covers the gap.
-        if !self.channel_is_set_up() {
+        // pre-funding self-check for the INITIAL commitment (LDK number
+        // `(1<<48)-1` = VLS commit 0), before any `EcdsaChannelSigner` method
+        // has run `maybe_setup_channel`/`SetupChannel`. For that one call there
+        // is no concurrent racing call to deliver `SetupChannel`, so awaiting
+        // setup would deadlock — skip the VLS round-trip and let
+        // `sign_holder_commitment` validate downstream.
+        //
+        // For EVERY subsequent (post-funding) commitment this call MUST be
+        // forwarded. At VLS protocol v5+ (which we now negotiate so
+        // `RevokeCommitmentTx` is available), `ValidateCommitmentTx2` is the
+        // *only* message that stages `next_holder_commit_info` — the
+        // prerequisite for `release_commitment_secret` (`RevokeCommitmentTx`)
+        // to advance the device's `next_holder_commit_num`. Dropping it strands
+        // the device counter at 1 while LDK marches its commitments forward,
+        // producing `get_per_commitment_point: commitment_number N invalid when
+        // next_holder_commit_num is 1` at the next HTLC. So PARK (await_setup),
+        // never stub, for post-funding commitments.
+        let commitment_number = holder_tx.commitment_number();
+        let is_initial = commitment_number == (1u64 << 48) - 1;
+        if is_initial && !self.channel_is_set_up() {
             tracing::debug!(
                 target: "wick_vls",
                 ctx = %self.lookup.context_id(),
                 dbid = self.dbid,
-                "validate_holder_commitment: channel not set up — deferring to sign_holder_commitment"
+                "validate_holder_commitment: initial pre-funding self-check — deferring to sign_holder_commitment"
             );
             return Ok(());
         }
+        self.await_setup()?;
 
         let conn = self.active_conn()?;
-        let commitment_number = holder_tx.commitment_number();
         let feerate = holder_tx.negotiated_feerate_per_kw();
         let to_local_value_sat = holder_tx.to_broadcaster_value_sat();
         let to_remote_value_sat = holder_tx.to_countersignatory_value_sat();
