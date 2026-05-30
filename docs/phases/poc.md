@@ -173,6 +173,43 @@ The sentinel pubkey (compressed secp256k1 generator G) is the placeholder a VLS 
 
 A fully **fresh-open** run would set up the channel in-process and avoid this — but that path hits the step-5 actor wedge above. Closing the PoC needs one of: (a) fix the step-5 wedge so a fully-fresh run completes end-to-end, or (b) make VLS channel state reattach across process restarts so the reuse path works.
 
+## LSP lifecycle stability under load — FIXED & verified (2026-05-30)
+
+Three parallel agents root-caused the regtest-burst JIT instability as a single
+cascade, and the fixes landed + verified (3 consecutive regtest `jit_flow` runs,
+**zero cascade errors** each):
+
+- **Trigger:** under a channel-open persistence burst, the `kv_runtime` funnels
+  all KV connection returns (each paying a `RESET ALL` via the pool's
+  `after_release` hook) through 4 workers — connection *return-rate* starves the
+  pool (why 16→64 didn't help). Ruled out: no DB transaction is held across a
+  VLS signer round-trip (VLS is decoupled from the pool).
+- **Amplifier:** LDK's `process_events_async` returns `Err` on a persist failure;
+  wick logged it and let the task DIE with no restart, against LDK's
+  restart-after-error contract. For the **singleton LSP node** (no park/wake
+  rebuild) this is fatal — it stops persisting, dispatching LDK events, and
+  pumping peer I/O.
+- **Symptom:** the BOLT8/`Init` handshake runs on net-tokio main-runtime tasks;
+  a dead/starved LSP loop means its `Init` never sends → never appears in
+  `list_peers` → "timeout waiting for handshake", RouteNotFound, get_jit_invoice
+  stalls.
+
+**Fixes (committed):**
+- `builder.rs spawn_process_events`: supervised restart loop (re-enter with
+  cloned Arc handles + capped backoff on `Err`, exit on graceful `Ok`/`stop_tx`).
+- `persistence/mod.rs write_async`: retry transient sqlx errors (PoolTimedOut /
+  PoolClosed / Io) 4× with backoff before surfacing.
+- `db/pool.rs`: `acquire_timeout` 30s→10s (fail fast so retry/restart recover).
+
+**Deferred (trigger-side perf, not stability):** a dedicated KV `PgPool` (no
+`RESET ALL` hook) so KV traffic stops contending with tenant traffic; route the
+remaining `event.rs` `block_on` through `kv_runtime`.
+
+**Remaining functional blocker (separate from stability):** deterministic
+`RouteNotFound` when the payer routes through the JIT intercept SCID on regtest
+(the cascade is gone, so this is now a clean routing-correctness issue to chase
+next). Plus an occasional regtest setup flake at `bitcoind send_to_address`.
+
 ## Active Work (as of May 2026)
 
 Based on recent commits:
