@@ -1186,5 +1186,11 @@ fn zero_counterparty_reserve_user_config() -> UserConfig {
     let mut cfg = UserConfig::default();
     cfg.channel_handshake_config
         .their_channel_reserve_proportional_millionths = 0;
+    // Match the node-wide config: allow the full channel value in flight so a
+    // counterparty isn't capped at routing 10% of the channel per HTLC (the
+    // LDK default), which otherwise yields RouteNotFound for any payment above
+    // 10% of capacity. See the builder's `user_config` for rationale.
+    cfg.channel_handshake_config
+        .max_inbound_htlc_value_in_flight_percent_of_channel = 100;
     cfg
 }

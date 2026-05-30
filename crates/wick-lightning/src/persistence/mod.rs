@@ -65,6 +65,42 @@ fn kv_runtime() -> &'static Handle {
     .handle()
 }
 
+/// Dedicated Postgres pool for KV writes, isolated from the shared tenant pool.
+///
+/// Two properties matter, and together they were the root of the
+/// channel-open-burst wedge:
+///
+/// 1. **No `RESET ALL` on release.** The shared tenant pool runs `RESET ALL`
+///    on every connection return (defence-in-depth for `SET LOCAL` tenant
+///    scoping). KV queries never touch session state — tenant isolation here
+///    is via the interpolated schema identifier, validated `^[0-9]+$` — so
+///    that round-trip is pure overhead. Under a burst it becomes the
+///    bottleneck: connection *return* throughput (the few `kv_runtime` workers,
+///    each paying a `RESET ALL` round-trip) can't keep up, the pool drains, KV
+///    writes block on acquire, and because each KV call bridges back to the
+///    main runtime via `block_in_place(rx.recv())`, enough main workers stall
+///    that the whole process wedges. Dropping `RESET ALL` makes returns instant.
+/// 2. **Separate connection budget** — KV traffic no longer contends with
+///    tenant-request work on the shared pool.
+///
+/// Built lazily (async) from the shared pool's connect options the first time
+/// a KV op runs — always inside `kv_runtime`, so the pool's IO is driven there.
+async fn kv_pool(template: &PgPool) -> &'static PgPool {
+    static POOL: tokio::sync::OnceCell<PgPool> = tokio::sync::OnceCell::const_new();
+    POOL.get_or_init(|| {
+        let opts = (*template.connect_options()).clone();
+        async move {
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(16)
+                .acquire_timeout(std::time::Duration::from_secs(10))
+                .connect_with(opts)
+                .await
+                .expect("build dedicated KV pool")
+        }
+    })
+    .await
+}
+
 /// Postgres-backed KV store for a single tenant.
 ///
 /// Cloning is cheap — the pool and schema are behind `Arc` indirections.
@@ -127,9 +163,10 @@ impl PgKvStore {
             r#"SELECT value FROM "{}".vss_objects WHERE key = $1"#,
             self.schema
         );
+        let pool = kv_pool(&self.pool).await;
         let row = sqlx::query(&sql)
             .bind(row_key)
-            .fetch_optional(&self.pool)
+            .fetch_optional(pool)
             .await
             .map_err(|e| sqlx_to_io(&e))?;
 
@@ -159,12 +196,13 @@ ON CONFLICT (key) DO UPDATE
         // absorbing a brief pool blip here prevents that escalation. Bounded:
         // give up after a few attempts and let the loop's supervised restart
         // (builder.rs) take over.
+        let pool = kv_pool(&self.pool).await;
         let mut attempt: u32 = 0;
         loop {
             match sqlx::query(&sql)
                 .bind(row_key)
                 .bind(&buf)
-                .execute(&self.pool)
+                .execute(pool)
                 .await
             {
                 Ok(_) => return Ok(()),
@@ -192,9 +230,10 @@ ON CONFLICT (key) DO UPDATE
             r#"DELETE FROM "{}".vss_objects WHERE key = $1"#,
             self.schema
         );
+        let pool = kv_pool(&self.pool).await;
         sqlx::query(&sql)
             .bind(row_key)
-            .execute(&self.pool)
+            .execute(pool)
             .await
             .map_err(|e| sqlx_to_io(&e))?;
         Ok(())
@@ -239,9 +278,10 @@ ON CONFLICT (key) DO UPDATE
             self.schema
         );
         let like = format!("{prefix}%");
+        let pool = kv_pool(&self.pool).await;
         let rows = sqlx::query(&sql)
             .bind(&like)
-            .fetch_all(&self.pool)
+            .fetch_all(pool)
             .await
             .map_err(|e| sqlx_to_io(&e))?;
 

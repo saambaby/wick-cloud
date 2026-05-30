@@ -290,6 +290,16 @@ where
         user_config
             .channel_handshake_limits
             .max_channel_reserve_satoshis = u64::MAX;
+        // LDK defaults the in-flight cap to 10% of channel value, which means
+        // a counterparty can only ever route a single HTLC worth 10% of the
+        // channel — e.g. a 200k-sat channel rejects a 50k-sat payment with
+        // RouteNotFound ("insufficient value contribution, channel max 20000000
+        // msat"). For a self-custodial wallet the user owns both ends of the
+        // risk, so allow the full channel value in flight (100%) on both
+        // inbound (what a counterparty may send us) directions.
+        user_config
+            .channel_handshake_config
+            .max_inbound_htlc_value_in_flight_percent_of_channel = 100;
         if lsp_peer.is_some() {
             user_config.manually_accept_inbound_channels = true;
         }
