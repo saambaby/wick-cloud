@@ -49,7 +49,6 @@ use tonic::transport::{ Channel, Endpoint };
 use tonic::Request;
 use vls_protocol::msgs::{ self as vls_msgs, Message, SerBolt };
 use vls_protocol::model::{ ExtKey, PubKey };
-use vls_protocol::serde_bolt::{ Array, WireString };
 use vls_protocol_signer::approver::PositiveApprover;
 use vls_protocol_signer::handler::{ Handler, HandlerBuilder, RootHandler };
 use vls_protocol_signer::lightning_signer;
@@ -680,25 +679,42 @@ impl SignerState {
         // (see `lightning_signer::signer::derive::KeyDerivationStyle`).
         // `network_name` is informational only — `HsmdInit2` doesn't
         // assert against the node's configured network.
-        let network_name = match network {
-            bitcoin::Network::Bitcoin => "bitcoin",
-            bitcoin::Network::Testnet => "testnet",
-            bitcoin::Network::Signet => "signet",
-            bitcoin::Network::Regtest => "regtest",
-            _ => "testnet",
-        };
-        let init_msg = Message::HsmdInit2(vls_msgs::HsmdInit2 {
-            derivation_style: 2,
-            network_name: WireString(network_name.as_bytes().to_vec()),
-            dev_seed: None,
-            dev_allowlist: Array(Vec::new()),
+        // Prime with `HsmdInit` (v1), NOT `HsmdInit2`. The vls-protocol-signer
+        // `HsmdInit2` handler hard-codes the negotiated `protocol_version` to 4
+        // (handler.rs), but `RevokeCommitmentTx` (LDK's
+        // `release_commitment_secret`) requires `>= PROTOCOL_VERSION_REVOKE`
+        // (5) — at v4 the device rejects it with "RevokeCommitmentTx called
+        // with hsmd_protocol_version 4 < 5" and the channel can never advance
+        // its revocation state. `HsmdInit` negotiates the version from the wire
+        // min/max fields below: `mutual = min(signer_max=6, 5) = 5`, which
+        // enables `RevokeCommitmentTx` while keeping the pre-v6
+        // `GetPerCommitmentPoint` (returns-secret) semantics wick relies on.
+        //
+        // Safe w.r.t. keys: the node (and its `node_id` / derivation) was
+        // already built by `HandlerBuilder::new(network, ..)` above. On the
+        // non-developer `HsmdInit` path the handler only reads the existing
+        // node's pubkeys and the wire versions — `key_version` / `chain_params`
+        // are not consulted — so dummy values here do not change identity.
+        let init_msg = Message::HsmdInit(vls_msgs::HsmdInit {
+            key_version: vls_protocol::model::Bip32KeyVersion {
+                pubkey_version: 0,
+                privkey_version: 0,
+            },
+            chain_params: bitcoin::constants::genesis_block(network).block_hash(),
+            encryption_key: None,
+            dev_privkey: None,
+            dev_bip32_seed: None,
+            dev_channel_secrets: None,
+            dev_channel_secrets_shaseed: None,
+            hsm_wire_min_version: 2,
+            hsm_wire_max_version: 5,
         });
         let (done, _reply) = init
             .handle(init_msg)
             .map_err(|e| Error::Config(format!("VLS init priming failed: {e:?}")))?;
         if !done {
             return Err(Error::Config(
-                "VLS InitHandler did not flip to done after synthetic HsmdInit2".to_owned(),
+                "VLS InitHandler did not flip to done after synthetic HsmdInit".to_owned(),
             ));
         }
         Ok(Self::Ready(init.into()))
