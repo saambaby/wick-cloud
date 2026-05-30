@@ -405,24 +405,38 @@ impl LspServiceEventHandler for OperatorServiceHandler {
         channel_id: ChannelId,
         counterparty_node_id: PublicKey,
     ) {
-        // The user_channel_id we minted at BuyRequest is `u128::from(scid)`;
-        // recover it and persist the LDK channel id against the registry
-        // entry so `forward_payment_forwarded` can resolve client_pubkey.
-        if user_channel_id <= u128::from(u64::MAX) {
-            #[allow(clippy::cast_possible_truncation)]
-            let scid = user_channel_id as u64;
-            if let Err(e) = self
-                .peer_registry
-                .set_channel_id(scid, channel_id.0, &self.pool)
-                .await
-            {
-                tracing::warn!(
-                    target: "wick_lsp",
-                    error = %e,
-                    intercept_scid = scid,
-                    "peer_registry.set_channel_id failed (grief reward attribution may miss)"
-                );
-            }
+        // A JIT channel the LSP opened always carries `user_channel_id ==
+        // u128::from(intercept_scid)`, and that scid is registered in the
+        // peer_registry (from the LSPS2 `buy`). A tenant's *normal* channel
+        // to the LSP (e.g. Alice's outbound channel) carries neither. Feeding
+        // a non-JIT ChannelReady into the LSPS2 service handler is not just
+        // useless — LDK returns `APIMisuseError("No counterparty state for …")`,
+        // and the call does on-event-loop blocking work (per-peer state lookup
+        // + KV persist) that ties up the single LSP event loop, starving
+        // unrelated LSPS2 traffic (e.g. another tenant's `get_info`). Skip it.
+        if user_channel_id > u128::from(u64::MAX) {
+            return;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let scid = user_channel_id as u64;
+        if self.peer_registry.lookup(scid).is_none() {
+            // Not a JIT channel we minted — nothing for the LSPS2 handler to do.
+            return;
+        }
+
+        // Recover the intercept scid and persist the LDK channel id against the
+        // registry entry so `forward_payment_forwarded` can resolve client_pubkey.
+        if let Err(e) = self
+            .peer_registry
+            .set_channel_id(scid, channel_id.0, &self.pool)
+            .await
+        {
+            tracing::warn!(
+                target: "wick_lsp",
+                error = %e,
+                intercept_scid = scid,
+                "peer_registry.set_channel_id failed (grief reward attribution may miss)"
+            );
         }
 
         let lm = self.liquidity();

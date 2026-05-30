@@ -141,6 +141,16 @@ struct ChannelMeta {
     peer_id: [u8; 33],
     setup_funding: Option<(bitcoin::Txid, u16)>,
     push_value_msat: u64,
+    /// Signer `session_token` for which `SetupChannel` has actually been
+    /// delivered to the **device** in this process. Distinct from
+    /// `setup_funding` (which persists to Postgres and survives restarts):
+    /// the device signer holds no durable channel state (`DummyPersister`)
+    /// and is rebuilt fresh on every `Attach`, so a persisted `setup_funding`
+    /// from a prior process/attach does NOT mean the freshly-attached device
+    /// knows the channel. `maybe_setup_channel` re-issues `SetupChannel`
+    /// whenever this does not match the current connection's session token.
+    /// Not persisted — always `None` after rehydrate.
+    setup_done_for_session: Option<u64>,
 }
 
 // ── SignerSession ─────────────────────────────────────────────────────────────
@@ -257,6 +267,9 @@ impl SignerSession {
                     peer_id: row.peer_id,
                     setup_funding: row.setup_funding,
                     push_value_msat: row.push_value_msat,
+                    // Restored from a prior process — the freshly-attached
+                    // device has not been sent SetupChannel yet.
+                    setup_done_for_session: None,
                 },
             );
             // If we have the cached basepoints, re-hydrate `channel_keys`
@@ -702,6 +715,7 @@ impl SignerProvider for SignerSession {
                         peer_id: SENTINEL_PUBKEY,
                         setup_funding: None,
                         push_value_msat: self.drain_pending_push(&channel_keys_id),
+                        setup_done_for_session: None,
                     },
                 );
                 self.persist_meta(channel_keys_id);
@@ -724,6 +738,7 @@ impl SignerProvider for SignerSession {
                 peer_id: SENTINEL_PUBKEY,
                 setup_funding: None,
                 push_value_msat: self.drain_pending_push(&channel_keys_id),
+                setup_done_for_session: None,
             },
         );
 
@@ -1234,10 +1249,24 @@ impl VlsRemoteChannelSigner {
             .ok_or(())?;
         let target_funding = (funding_outpoint.txid, funding_outpoint.index);
 
+        // Resolve the live signer connection up front — we need its
+        // `session_token` to decide whether the *device* has been sent
+        // SetupChannel in THIS attach. The device keeps no durable channel
+        // state (`DummyPersister`) and is rebuilt on every Attach, so a
+        // `setup_funding` rehydrated from a prior process is NOT proof the
+        // freshly-attached device knows the channel. Short-circuit only when
+        // setup landed for the current session; otherwise re-issue it (the
+        // VLS `SetupChannel` promotion is idempotent on the device).
+        let conn = self.active_conn()?;
+        let session = conn.session_token();
+
         if self
             .channel_meta
             .get(&self.channel_keys_id)
-            .map(|m| m.setup_funding == Some(target_funding))
+            .map(|m| {
+                m.setup_funding == Some(target_funding)
+                    && m.setup_done_for_session == Some(session)
+            })
             .unwrap_or(false)
         {
             return Ok(());
@@ -1255,7 +1284,6 @@ impl VlsRemoteChannelSigner {
             .get(&self.channel_keys_id)
             .map(|m| m.push_value_msat)
             .unwrap_or(0);
-        let conn = self.active_conn()?;
         block_vls!(rpc::rpc_setup_channel_from_primitives(
             &conn,
             self.dbid,
@@ -1283,6 +1311,9 @@ impl VlsRemoteChannelSigner {
 
         if let Some(mut meta) = self.channel_meta.get_mut(&self.channel_keys_id) {
             meta.setup_funding = Some(target_funding);
+            // Record that the device for THIS attach now knows the channel,
+            // so subsequent signing calls in the same session short-circuit.
+            meta.setup_done_for_session = Some(session);
         }
         self.persist_meta_after_setup();
 
