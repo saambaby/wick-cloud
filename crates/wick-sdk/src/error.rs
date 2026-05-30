@@ -81,6 +81,11 @@ pub enum Error {
     /// server pubkey. The inner string is the upstream error message.
     #[error("transparency log verification failed: {0}")]
     TransparencyVerify(String),
+
+    /// A client-side deadline elapsed before an operation completed. The
+    /// inner string names the operation and the likely cause.
+    #[error("operation timed out: {0}")]
+    Timeout(String),
 }
 
 impl From<tonic::Status> for Error {

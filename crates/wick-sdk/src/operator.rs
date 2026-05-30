@@ -146,6 +146,14 @@ impl std::fmt::Debug for OperatorClient {
 }
 
 impl OperatorClient {
+    /// Maximum time [`Self::register_lsp`] waits for the server to boot
+    /// the LSP node and respond. Generous enough to cover a fresh boot
+    /// (RGS fetch + ChannelManager construct, a few seconds) plus a
+    /// short chain catch-up, but far below the tens of minutes a
+    /// pathologically-stale node would take — so a stuck boot surfaces
+    /// as an error rather than an indefinite hang.
+    pub const REGISTER_LSP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// Build an operator client from a BIP39 mnemonic.
     ///
     /// Deterministic: same `(mnemonic, passphrase, network)` always
@@ -312,14 +320,36 @@ impl OperatorClient {
     /// agrees on the derived pubkey — a mismatch is a bug somewhere
     /// (LDK key derivation drift, bad mnemonic, or wrong server) and
     /// surfaces as [`Error::InvalidResponse`].
+    ///
+    /// Fails fast with [`Error::Timeout`] if the server does not respond
+    /// within [`Self::REGISTER_LSP_TIMEOUT`]. Registration boots the LSP
+    /// node server-side, which restores its `ChannelManager` and syncs
+    /// every persisted channel monitor to the chain tip. A node that has
+    /// been offline for a long time (e.g. stale dev/test state left for
+    /// days) does a linear block-by-block catch-up over the elapsed
+    /// blocks — on a public, rate-limited Esplora this can take tens of
+    /// minutes. Without this bound the call would hang silently; the
+    /// timeout turns it into an actionable error. See
+    /// `docs/phases/poc.md` ("Known limitation — long-offline boot sync").
     pub async fn register_lsp(&mut self) -> Result<PublicKey> {
-        let resp = self
-            .grpc
-            .register_lsp_identity(RegisterLspIdentityRequest {
-                lightning_seed: self.lightning_seed.to_vec(),
-            })
-            .await?
-            .into_inner();
+        let resp = tokio::time::timeout(
+            Self::REGISTER_LSP_TIMEOUT,
+            self.grpc
+                .register_lsp_identity(RegisterLspIdentityRequest {
+                    lightning_seed: self.lightning_seed.to_vec(),
+                }),
+        )
+        .await
+        .map_err(|_| {
+            Error::Timeout(format!(
+                "register_lsp did not complete within {:?} — the LSP node is likely \
+                 doing a long chain catch-up on boot (stale persisted channel state \
+                 with a far-behind best_block). Purge the LSP tenant's channel state \
+                 or wait for the catch-up to finish. See docs/phases/poc.md.",
+                Self::REGISTER_LSP_TIMEOUT
+            ))
+        })??
+        .into_inner();
         let bytes = hex::decode(&resp.lsp_pubkey_hex).map_err(|e| {
             Error::InvalidResponse(format!("RegisterLspIdentity returned invalid hex: {e}"))
         })?;
