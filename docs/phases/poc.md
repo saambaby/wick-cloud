@@ -105,13 +105,30 @@ Confirmed empirically (2026-05-30): a JIT channel from the 2026-05-22 runs left 
 
 **Operational note.** This is primarily a stale-dev-state problem, not a production one: in normal park/wake, a tenant is offline for minutes, so the catch-up is a handful of blocks. Don't leave mutinynet test state idle for days. To recover a poisoned tenant, purge its `//manager` + `monitors//*` rows (and `channels` table) from its `tenant_<id>` schema so it boots fresh at the current tip. A durable fix (esplora script-based sync, or fast-forwarding `best_block` past a staleness threshold) is deferred to Phase 1 — see Done-When below.
 
-## Open bug — JIT step-5 stall (next to fix)
+## JIT step-5 stall — bounded (symptom fixed; root cause scoped)
 
-With the stale-state hang resolved (above), a clean run on 2026-05-30 progressed through register_lsp (8.5s), connect_peer (1.8s), and Alice's on-chain channel open (confirmed in-block, usable at +213s), then **stalled at step 5 — `bob.lsps2_get_info()`** (the test produced no output past step 4).
+With the stale-state hang resolved (above), a run on the **fresh-open path** (Alice opens her channel in-process, ~210s) progressed through register_lsp, connect_peer, and Alice's channel open, then **stalled indefinitely at step 5 — `bob.lsps2_get_info()`** with no output and no error.
 
-Two server-side observations at that moment, to investigate next session:
-- `wick_lsp: lsps2 channel_ready forward failed — No counterparty state for: 031ebe4d…` — this pubkey is **Alice** (tenant 14e6c970), whose *normal* (non-JIT) channel ChannelReady is being passed into the LSPS2 handler. Likely **benign/noisy** (the handler legitimately has no LSPS2 state for a non-buy peer) but `forward_channel_ready` in `wick-lsp/src/handler.rs` should skip non-JIT channels rather than log an error.
-- The actual stall is `lsps2_get_info` / `receive_payment_jit` not returning. Suspect the LSP→client peer lifecycle (Bob idle ~3–4 min during Alice's channel-open wait) or the get_info path itself. This is a distinct issue from the boot-sync hang.
+**Mechanism (root-caused).** The server gRPC handlers `lsps2_get_info` / `get_jit_invoice` (`wick-server/src/grpc.rs`) `dispatch` the command to the tenant's actor and then `rx.await` the actor's response **with no timeout**. The actor (`node/actor.rs::run`) processes commands strictly serially: `handle(cmd).await` must finish before the next command. If an earlier `handle(cmd)` blocks on an `.await` that never completes (a stalled JIT/peer-lifecycle or signer round-trip during the slow channel-open window), the actor is wedged and `Lsps2GetInfo` queues behind it forever — so `rx.await` never returns. (Both `dispatch`'s wake (90s) and the actor's own `node.lsps2_get_info` (15s) are bounded; the unbounded link was the handler's `rx.await`.)
+
+**Symptom fixed (commit pending).** `lsps2_get_info` and `get_jit_invoice` now wrap `rx.await` in `JIT_RPC_TIMEOUT` (30s) and return `DeadlineExceeded` instead of hanging — the client gets an actionable, retryable error rather than an indefinite stall. This is the same robustness pattern as `register_lsp`'s `REGISTER_LSP_TIMEOUT`.
+
+**Root cause still open.** *Why* the actor wedges on the fresh-open path (and not on the reuse path, where Bob never idles long) is a JIT/wake/peer-lifecycle timing bug that needs a clean live reproduction with thread-level inspection. Reproduction is hampered by mutinynet cross-run state (each iteration ≈ 5 min). Reusing the `tenant_<id>` schemas across separate SDK processes also surfaces a **second, distinct bug** (below).
+
+**Noisy-but-benign.** `wick_lsp: lsps2 channel_ready forward failed — No counterparty state for: 031ebe4d…` is **Alice** (tenant 14e6c970), whose *normal* (non-JIT) channel ChannelReady is passed into the LSPS2 handler. `forward_channel_ready` in `wick-lsp/src/handler.rs` should skip non-JIT channels rather than log an error.
+
+## Open bug — step-6 VLS "channel not ready" on the reuse path
+
+On the **reuse path** (Alice reuses a channel opened in a *prior* test process), step 5 passes but step 6 (the JIT payment) fails:
+
+```
+ERROR wick_vls: sign_counterparty_commitment failed ctx=14e6c970 (Alice)
+  e=VLS signer error: channel not ready: 0279be66…(secp256k1 G sentinel)… dbid=16
+```
+
+The sentinel pubkey (compressed secp256k1 generator G) is the placeholder a VLS channel carries **before `SetupChannel` promotes it** with the real counterparty. So Alice's reused channel was never re-promoted in her *fresh* signer: VLS per-channel state (the `signer_channel_meta` / `SetupChannel` replay, commit 58bf5fe) does not survive across separate SDK processes. Signing the HTLC commitment then fails and the payment can't progress, so the JIT settlement times out at 240s.
+
+A fully **fresh-open** run would set up the channel in-process and avoid this — but that path hits the step-5 actor wedge above. Closing the PoC needs one of: (a) fix the step-5 wedge so a fully-fresh run completes end-to-end, or (b) make VLS channel state reattach across process restarts so the reuse path works.
 
 ## Active Work (as of May 2026)
 

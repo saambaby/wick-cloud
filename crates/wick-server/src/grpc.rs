@@ -57,6 +57,15 @@ use crate::nonce_store::{NonceError, NonceStore, REGISTER_DOMAIN};
 /// can push that out — 15s is generous.
 const OPEN_CHANNEL_INIT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Upper bound on how long a JIT actor round-trip (`Lsps2GetInfo`,
+/// `GetJitInvoice`) may take before the gRPC handler gives up. The actor
+/// self-bounds the LSP negotiation at 15s internally, so a response should
+/// always arrive well within this window. If it does not, the actor is
+/// wedged ahead of this command (e.g. a stalled JIT/peer-lifecycle step on
+/// the slow channel-open path); the bound converts that into a clear
+/// `DeadlineExceeded` the client can retry instead of an indefinite hang.
+const JIT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Dual-accept tenant authentication: prefer macaroon, fall back to bearer.
 ///
 /// Returns the authenticated tenant id. A *present-but-invalid* macaroon
@@ -931,8 +940,15 @@ impl WalletService for WickGrpcService {
             .await
             .map_err(dispatch_error_to_status)?;
 
-        let quote = rx
+        let quote = tokio::time::timeout(JIT_RPC_TIMEOUT, rx)
             .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "lsps2_get_info did not complete within {JIT_RPC_TIMEOUT:?} — the LSP \
+                     negotiation stalled (peer/JIT lifecycle); retry once the client is \
+                     reconnected to the LSP"
+                ))
+            })?
             .map_err(|_| Status::internal("node actor dropped the response channel"))?
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -972,8 +988,15 @@ impl WalletService for WickGrpcService {
             .await
             .map_err(dispatch_error_to_status)?;
 
-        let invoice = rx
+        let invoice = tokio::time::timeout(JIT_RPC_TIMEOUT, rx)
             .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "get_jit_invoice did not complete within {JIT_RPC_TIMEOUT:?} — the LSP \
+                     negotiation stalled (peer/JIT lifecycle); retry once the client is \
+                     reconnected to the LSP"
+                ))
+            })?
             .map_err(|_| Status::internal("node actor dropped the response channel"))?
             .map_err(|e| Status::internal(e.to_string()))?;
 
