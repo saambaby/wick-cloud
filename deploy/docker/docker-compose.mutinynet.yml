@@ -1,0 +1,89 @@
+# wick-server stack pointing at mutinynet (custom signet, 30-second blocks).
+#
+# No local bitcoind or electrs — chain data comes from mutinynet.com.
+# This compose file boots Postgres + wick-server only.
+#
+# Usage:
+#
+#   # First time only — build the server image:
+#   docker compose -f deploy/docker/docker-compose.mutinynet.yml build
+#
+#   # Start:
+#   docker compose -f deploy/docker/docker-compose.mutinynet.yml up -d
+#
+#   # Run migrations (first time or after schema changes):
+#   docker compose -f deploy/docker/docker-compose.mutinynet.yml exec wick-server \
+#       wick-server migrate --config /app/config.mutinynet.toml
+#
+#   # Watch logs:
+#   docker compose -f deploy/docker/docker-compose.mutinynet.yml logs -f wick-server
+#
+#   # Stop:
+#   docker compose -f deploy/docker/docker-compose.mutinynet.yml down
+#
+# Secrets:
+#   The compose file passes secrets via environment variables. Set them in
+#   a `.env` file next to this compose file (gitignored):
+#
+#     WICK_DATABASE_URL=postgres://wick:wick@postgres:5432/wick
+#     WICK_ADMIN_SECRET=<random strong secret>
+#
+#   For the JIT integration test the admin secret must be `jit-mutinynet-secret`
+#   to match the value hardcoded in the test's `mint_admin_macaroon` call.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: wick-postgres-mutinynet
+    environment:
+      POSTGRES_USER: wick
+      POSTGRES_PASSWORD: wick
+      POSTGRES_DB: wick
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-mutinynet:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wick -d wick"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  wick-server:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    container_name: wick-server-mutinynet
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Override database URL to reach the compose-internal postgres service.
+      WICK_DATABASE_URL: postgres://wick:wick@postgres:5432/wick
+      # Bind gRPC to all interfaces so the SDK (running outside compose) can reach it.
+      WICK_GRPC_ADDR: 0.0.0.0:50051
+      # Prometheus metrics — accessible on host at localhost:9464.
+      WICK_METRICS_ADDR: 0.0.0.0:9464
+      # Admin secret for the operator client (LSP registration + macaroon minting).
+      WICK_ADMIN_SECRET: ${WICK_ADMIN_SECRET:-change-me-before-production}
+    ports:
+      - "50051:50051"    # gRPC (SDK connects here)
+      - "19836:19836"    # LSP P2P Lightning port
+      - "9464:9464"      # Prometheus metrics
+    volumes:
+      - ./config.mutinynet.toml:/app/config.mutinynet.toml:ro
+    command:
+      - wick-server
+      - --config
+      - /app/config.mutinynet.toml
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=localhost:50051"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+volumes:
+  postgres-mutinynet:

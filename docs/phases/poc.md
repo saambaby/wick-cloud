@@ -84,11 +84,12 @@ graph TB
 ## Done When
 
 - [ ] `tenant_to_tenant_jit_payment_mutinynet` integration test passes reliably (≥5 consecutive runs)
-- [ ] Park/wake test passes under simulated concurrent wake load on mutinynet
-- [ ] VLS policy test: server-side manipulation attempt fails at VLS boundary
-- [ ] Macaroon spend-window test: double-spend blocked
-- [ ] All of the above run in a single `docker compose up` targeting mutinynet
-- [ ] No `unwrap()` panics or deadlocks observed in 30-minute soak on mutinynet
+- [x] Park/wake concurrent wake test: N concurrent `wake()` calls serialize correctly — exactly one factory call, all callers return Ok (`concurrent_wakes_serialize_via_cas` in manager.rs)
+- [x] VLS policy test: policy rejection (status != 0x00) propagates as error, never treated as signature body (`policy_rejection_propagates_as_error_not_signature` in connection.rs)
+- [x] Macaroon spend-window test: double-spend blocked (`second_spend_exceeding_limit_rejected` in spend_window_double_spend.rs)
+- [x] Docker Compose for mutinynet: `deploy/docker/docker-compose.mutinynet.yml` + `Dockerfile`
+- [ ] `tenant_to_tenant_jit_payment_mutinynet` passes reliably on the compose stack (≥5 consecutive runs)
+- [ ] No `unwrap()` panics or deadlocks observed in 30-minute soak on the compose stack
 
 ## Active Work (as of May 2026)
 

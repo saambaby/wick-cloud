@@ -225,6 +225,104 @@ impl Default for SignerConnection {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+
+    use crate::registry::OutboundSignerFrame;
+
+    use super::SignerConnection;
+
+    /// [INV-CUSTODY-2] VLS policy rejection propagates as an error and is
+    /// never silently treated as a valid response body.
+    ///
+    /// Simulates the path where the on-device VLS policy engine returns
+    /// `status != 0x00` (policy violation). The server-side routing layer
+    /// must surface this as an `Err` — a compromised or buggy server cannot
+    /// manufacture a valid signature by sending a crafted error frame.
+    #[tokio::test]
+    async fn policy_rejection_propagates_as_error_not_signature() {
+        let (sender, mut rx) = mpsc::channel::<OutboundSignerFrame>(1);
+        let conn = Arc::new(SignerConnection::new("test-tenant".to_owned(), 42, sender));
+        conn.activate();
+
+        let conn_caller = conn.clone();
+        let call = tokio::spawn(async move {
+            conn_caller
+                .dispatch_node_call(vec![0x00, 0x01, 0x02], Duration::from_secs(5))
+                .await
+        });
+
+        // Drain the outbound frame to get the request_id.
+        let request_id = loop {
+            match rx.recv().await.expect("outbound frame") {
+                OutboundSignerFrame::VlsBinaryCall { request_id, .. } => break request_id,
+                // StateSync and Ping are control frames; skip them.
+                OutboundSignerFrame::StateSync { .. } | OutboundSignerFrame::Ping => continue,
+            }
+        };
+
+        // Simulate a policy rejection from the on-device VLS engine.
+        // status=0x01 means error; body is a UTF-8 error message, NOT a signature.
+        let mut rejection = Vec::new();
+        rejection.extend_from_slice(&request_id.to_be_bytes());
+        rejection.push(0x01);
+        rejection.extend_from_slice(b"policy violation: payment_size exceeds max_payment_sat");
+        conn.resolve_response(rejection);
+
+        let result = call.await.expect("task did not panic");
+        assert!(
+            result.is_err(),
+            "policy rejection must propagate as Err, got Ok"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("VLS signer error"),
+            "error message should identify the VLS signer as the source: {msg}"
+        );
+        assert!(
+            msg.contains("policy violation"),
+            "error message should include the policy rejection reason: {msg}"
+        );
+    }
+
+    /// A success response (status=0x00) reaches the caller as Ok(body).
+    /// Companion to the rejection test — ensures we haven't broken the happy path.
+    #[tokio::test]
+    async fn success_response_delivered_as_ok_body() {
+        let (sender, mut rx) = mpsc::channel::<OutboundSignerFrame>(1);
+        let conn = Arc::new(SignerConnection::new("test-tenant".to_owned(), 1, sender));
+        conn.activate();
+
+        let conn_caller = conn.clone();
+        let call = tokio::spawn(async move {
+            conn_caller
+                .dispatch_node_call(vec![0xDE, 0xAD], Duration::from_secs(5))
+                .await
+        });
+
+        let request_id = loop {
+            match rx.recv().await.expect("outbound frame") {
+                OutboundSignerFrame::VlsBinaryCall { request_id, .. } => break request_id,
+                OutboundSignerFrame::StateSync { .. } | OutboundSignerFrame::Ping => continue,
+            }
+        };
+
+        let sig_body = vec![0xAB, 0xCD, 0xEF];
+        let mut response = Vec::new();
+        response.extend_from_slice(&request_id.to_be_bytes());
+        response.push(0x00); // success
+        response.extend_from_slice(&sig_body);
+        conn.resolve_response(response);
+
+        let result = call.await.expect("task did not panic");
+        assert_eq!(result.expect("success response must be Ok"), sig_body);
+    }
+}
+
 /// `[4B request_id BE][0x01][3B reserved][vls_bytes]`
 fn encode_node_call(request_id: u32, vls_bytes: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + vls_bytes.len());

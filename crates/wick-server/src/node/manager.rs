@@ -1570,4 +1570,79 @@ mod tests {
         let join = res.expect("waker task panicked");
         join.expect("wake returned error");
     }
+
+    // ── Concurrent wake serialisation ───────────────────────────────────────
+
+    /// [INV-CONCURRENCY-2] N concurrent `wake()` calls on the same PARKED
+    /// tenant must:
+    ///
+    /// 1. Call the node factory exactly once (CAS winner loads; losers wait).
+    /// 2. All return `Ok` — no caller is left permanently stalled or errored.
+    /// 3. Leave the tenant in ACTIVE state after all callers return.
+    ///
+    /// This is the key wake-storm safety property: a burst of concurrent
+    /// RPCs (e.g. HTLC intercept + user balance check arriving together)
+    /// must not double-load the node or starve any caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_wakes_serialize_via_cas() {
+        use std::sync::atomic::AtomicUsize;
+
+        const WAKE_COUNT: usize = 10;
+
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls2 = factory_calls.clone();
+
+        let factory: NodeFactory = Arc::new(move |_tid| {
+            let calls = factory_calls2.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                // Brief delay so concurrent callers reach the LOADING branch.
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let node: Arc<dyn NodeApi> =
+                    Arc::new(StubNode::with_flags(false, false, false));
+                Ok(node)
+            })
+        });
+
+        let mgr = Arc::new(NodeManager::new_for_test_with_factory(
+            ManagerConfig::default(),
+            factory,
+        ));
+        let tid = TenantId::generate();
+        let handle = NodeActor::spawn(tid);
+        mgr.nodes.insert(tid, handle);
+
+        let wakers: Vec<_> = (0..WAKE_COUNT)
+            .map(|_| {
+                let m = mgr.clone();
+                tokio::spawn(async move { m.wake(tid).await })
+            })
+            .collect();
+
+        let results = futures::future::join_all(wakers).await;
+
+        for (i, r) in results.iter().enumerate() {
+            let inner = r.as_ref().expect("task {i} panicked");
+            inner
+                .as_ref()
+                .unwrap_or_else(|e| panic!("wake task {i} returned error: {e}"));
+        }
+
+        assert_eq!(
+            factory_calls.load(Ordering::SeqCst),
+            1,
+            "factory must be called exactly once regardless of concurrent wake count"
+        );
+
+        let final_state = mgr
+            .get_handle(tid)
+            .expect("handle exists")
+            .state
+            .load(Ordering::SeqCst);
+        assert_eq!(
+            final_state,
+            state::ACTIVE,
+            "tenant must be ACTIVE after all wakers return"
+        );
+    }
 }
