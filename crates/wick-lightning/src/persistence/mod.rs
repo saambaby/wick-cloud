@@ -153,13 +153,38 @@ ON CONFLICT (key) DO UPDATE
 "#,
             self.schema, self.schema
         );
-        sqlx::query(&sql)
-            .bind(row_key)
-            .bind(&buf)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| sqlx_to_io(&e))?;
-        Ok(())
+        // Retry on TRANSIENT failures (a connection-acquire timeout under a
+        // persistence burst, a dropped connection). LDK treats a write error
+        // from this store as fatal — it tears down the whole event loop — so
+        // absorbing a brief pool blip here prevents that escalation. Bounded:
+        // give up after a few attempts and let the loop's supervised restart
+        // (builder.rs) take over.
+        let mut attempt: u32 = 0;
+        loop {
+            match sqlx::query(&sql)
+                .bind(row_key)
+                .bind(&buf)
+                .execute(&self.pool)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e) if is_transient(&e) && attempt < 4 => {
+                    attempt += 1;
+                    tracing::warn!(
+                        target: "wick_lightning",
+                        schema = %self.schema,
+                        attempt,
+                        error = %e,
+                        "transient KV write error; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        u64::from(attempt) * 250,
+                    ))
+                    .await;
+                }
+                Err(e) => return Err(sqlx_to_io(&e)),
+            }
+        }
     }
 
     async fn remove_async(&self, row_key: &str) -> Result<(), io::Error> {
@@ -284,4 +309,15 @@ impl KVStoreSync for PgKvStore {
 /// Map sqlx errors to the LDK `io::Error` alias so the trait can consume them.
 fn sqlx_to_io(e: &sqlx::Error) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("sqlx: {e}").as_str())
+}
+
+/// Classify a sqlx error as transient (worth retrying) vs. permanent. A
+/// pool-acquire timeout, a closed pool, or a connection-level IO error are
+/// transient — they reflect contention / a dropped connection, not bad data.
+/// Anything else (constraint violation, decode error, bad SQL) is permanent.
+fn is_transient(e: &sqlx::Error) -> bool {
+    matches!(
+        e,
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_)
+    )
 }

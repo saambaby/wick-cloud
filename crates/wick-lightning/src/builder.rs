@@ -1182,49 +1182,79 @@ where
     <S as SignerProvider>::EcdsaSigner: MaybeSend + MaybeSync,
 {
     tokio::spawn(async move {
-        let sleeper_stop = stop_tx.clone();
-        let sleeper = move |dur: Duration| {
-            let mut stop_rx = sleeper_stop.subscribe();
-            Box::pin(async move {
-                tokio::select! {
-                    _ = tokio::time::sleep(dur) => false,
-                    _ = stop_rx.changed() => true,
-                }
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
-        };
         let _ = NO_LIQUIDITY_MANAGER; // keep import alive on no-LSPS path
-        if let Err(e) = process_events_async_with_kv_store_sync(
-            kv_store,
-            move |event| {
-                let h = event_handler.clone();
-                async move { h.handle(event).await }
-            },
-            chain_monitor,
-            channel_manager,
-            NO_ONION_MESSENGER,
-            GossipSync::p2p(gossip_sync),
-            peer_manager,
-            Some(liquidity_manager),
-            sweeper,
-            logger,
-            Some(scorer),
-            sleeper,
-            false,
-            || {
-                Some(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default(),
-                )
-            },
-        )
-        .await
-        {
-            tracing::error!(
-                target: "wick_lightning",
-                ?e,
-                "process_events_async exited with error"
-            );
+
+        // Supervised restart loop. LDK's `process_events_async` treats a
+        // persistence failure as fatal and returns `Err` — but its documented
+        // contract is to *restart* the processor after handling the error, not
+        // to abandon it. A transient DB-pool blip (e.g. a connection-acquire
+        // timeout during a channel-open persistence burst) must not permanently
+        // kill this node's event/persistence loop. That is especially critical
+        // for the singleton LSP node, which has no park/wake path to rebuild
+        // it: a dead loop there stops persisting state, dispatching LDK events
+        // (OpenChannel / HTLCIntercepted / ChannelReady), and pumping peer
+        // I/O, so every downstream JIT operation cascade-fails.
+        //
+        // We re-enter with the same `Arc` handles (cloned per attempt) and a
+        // capped exponential backoff, exiting only on a graceful `Ok(())`
+        // (the sleeper observed `stop_tx`) or an explicit shutdown signal.
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            let sleeper_stop = stop_tx.clone();
+            let sleeper = move |dur: Duration| {
+                let mut stop_rx = sleeper_stop.subscribe();
+                Box::pin(async move {
+                    tokio::select! {
+                        _ = tokio::time::sleep(dur) => false,
+                        _ = stop_rx.changed() => true,
+                    }
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+            };
+            let event_handler = event_handler.clone();
+            let result = process_events_async_with_kv_store_sync(
+                kv_store.clone(),
+                move |event| {
+                    let h = event_handler.clone();
+                    async move { h.handle(event).await }
+                },
+                chain_monitor.clone(),
+                channel_manager.clone(),
+                NO_ONION_MESSENGER,
+                GossipSync::p2p(gossip_sync.clone()),
+                peer_manager.clone(),
+                Some(liquidity_manager.clone()),
+                sweeper.clone(),
+                logger.clone(),
+                Some(scorer.clone()),
+                sleeper,
+                false,
+                || {
+                    Some(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default(),
+                    )
+                },
+            )
+            .await;
+
+            match result {
+                Ok(()) => break, // graceful stop — sleeper observed stop_tx
+                Err(e) => {
+                    tracing::error!(
+                        target: "wick_lightning",
+                        ?e,
+                        backoff_secs = backoff.as_secs(),
+                        "process_events_async exited; restarting after backoff"
+                    );
+                    let mut stop_rx = stop_tx.subscribe();
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = stop_rx.changed() => break,
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            }
         }
     })
 }

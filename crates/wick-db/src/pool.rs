@@ -30,6 +30,11 @@ impl Pool {
 
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            // Fail an acquire after 10s instead of the 30s default. Under a
+            // persistence burst the LDK event loop would otherwise stall 30s
+            // per blocked write before surfacing the error; failing fast lets
+            // the store's retry + the loop's supervised restart recover sooner.
+            .acquire_timeout(std::time::Duration::from_secs(10))
             .after_release(|conn, _meta| {
                 Box::pin(async move {
                     // Defence-in-depth reset. `SET LOCAL` already scopes the
