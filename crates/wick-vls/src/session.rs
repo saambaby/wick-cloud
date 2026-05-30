@@ -532,6 +532,15 @@ impl wick_lightning::WickSigner for SignerSession {
         SignerSession::set_signer_unblock(self, cb);
     }
 
+    fn preapprove_invoice(&self, bolt11: &str) -> anyhow::Result<()> {
+        let conn = self.active_conn()?;
+        let approved = block_vls!(rpc::rpc_preapprove_invoice(&conn, bolt11.to_owned()))?;
+        if !approved {
+            anyhow::bail!("device VLS signer declined to preapprove invoice");
+        }
+        Ok(())
+    }
+
     fn change_destination_source(
         &self,
     ) -> Option<Arc<dyn lightning::sign::ChangeDestinationSourceSync + Send + Sync>> {

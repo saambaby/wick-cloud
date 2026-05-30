@@ -197,6 +197,24 @@ pub async fn rpc_sign_invoice(
     Ok(reply.signature.0)
 }
 
+/// Pre-register a BOLT11 invoice the holder is about to pay with the device
+/// signer, so its `validate_payments` balance check accepts the resulting
+/// outbound HTLC. The on-device approver records the invoice via
+/// `Node::add_invoice`; the boolean reply is the approval result.
+pub async fn rpc_preapprove_invoice(
+    conn: &SignerConnection,
+    bolt11: String,
+) -> anyhow::Result<bool> {
+    let reply: msgs::PreapproveInvoiceReply = node_call(
+        conn,
+        msgs::PreapproveInvoice {
+            invstring: WireString(bolt11.into_bytes()),
+        },
+    )
+    .await?;
+    Ok(reply.result)
+}
+
 pub async fn rpc_sign_gossip_message(
     conn: &SignerConnection,
     message: Vec<u8>,

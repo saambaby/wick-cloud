@@ -515,6 +515,16 @@ where
             ..Default::default()
         };
 
+        // Pre-register the invoice with the signer's policy engine before LDK
+        // adds the outbound HTLC. VLS validates that every offered HTLC is
+        // backed by either a matching incoming HTLC (forwarding) or a
+        // preapproved invoice (originating); without this the device rejects
+        // the holder's own payment commitment with `policy-routing-balanced:
+        // unbalanced payments`. No-op for KeysManager-backed signers.
+        self.signer
+            .preapprove_invoice(bolt11)
+            .map_err(|e| anyhow::anyhow!("VLS preapprove_invoice: {e}"))?;
+
         self.channel_manager
             .pay_for_bolt11_invoice(
                 &invoice,

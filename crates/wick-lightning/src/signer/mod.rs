@@ -75,6 +75,27 @@ pub trait WickSigner:
     /// the unblock pump.
     fn set_signer_unblock_callback(&self, _cb: Box<dyn Fn() + Send + Sync>) {}
 
+    /// Pre-register a BOLT11 invoice the holder is about to pay with the
+    /// signer's policy engine, before [`crate::Node::send_payment`] hands the
+    /// invoice to LDK.
+    ///
+    /// VLS-backed signers ([`wick_vls::SignerSession`]) forward a
+    /// `PreapproveInvoice` to the on-device validator, which records the
+    /// invoice (`Node::add_invoice`) so its `validate_payments` balance check
+    /// accepts the originating outbound HTLC. Without this, the device rejects
+    /// the holder's own payment commitment with
+    /// `policy-routing-balanced: unbalanced payments` — an originating HTLC
+    /// has no matching incoming HTLC, so VLS requires a registered invoice to
+    /// prove the spend was authorised.
+    ///
+    /// The default no-op is correct for [`KeysManager`]-backed signers, which
+    /// run no validator.
+    ///
+    /// [`KeysManager`]: lightning::sign::KeysManager
+    fn preapprove_invoice(&self, _bolt11: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Optional [`ChangeDestinationSourceSync`] this signer wants the
     /// background [`OutputSweeperSync`](lightning::util::sweep::OutputSweeperSync)
     /// to use for force-close / HTLC-timeout / sweep change outputs.
