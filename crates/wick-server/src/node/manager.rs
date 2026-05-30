@@ -1437,6 +1437,7 @@ mod tests {
             &self,
             _: &lightning::ln::types::ChannelId,
             _: &bitcoin::secp256k1::PublicKey,
+            _: bool,
         ) -> anyhow::Result<()> {
             unimplemented!("StubNode: not used by park path")
         }

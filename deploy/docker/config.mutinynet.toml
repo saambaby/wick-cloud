@@ -32,7 +32,7 @@ listen_port_base    = 0
 # every keys-derive. The 2s default is too tight; 30s gives slow-start
 # tenants room without being abusive.
 [park_wake]
-wake_deadline_secs              = 30
+wake_deadline_secs              = 90
 # activity_poll_interval_secs     = 30     # how often the idle poller ticks
 # idle_threshold_secs             = 300    # 5 min idle before park candidate
 # max_error_attempts              = 5      # failures before ERROR state

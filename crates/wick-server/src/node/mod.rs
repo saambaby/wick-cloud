@@ -199,13 +199,17 @@ pub enum NodeCmd {
         /// Response channel.
         resp: oneshot::Sender<anyhow::Result<Vec<ChannelSummary>>>,
     },
-    /// Cooperatively close a channel. Phase-4: the closing transaction is
-    /// signed via the on-device VLS signer over `SignerService::Attach`.
+    /// Close a channel. Phase-4: the closing transaction is signed via the
+    /// on-device VLS signer over `SignerService::Attach`. When `force` is
+    /// true, broadcast the latest local commitment unilaterally — required
+    /// when in-flight HTLCs prevent a cooperative close.
     CloseChannel {
         /// 32-byte channel id of the channel to close.
         channel_id: lightning::ln::types::ChannelId,
         /// Counterparty pubkey carried on the channel.
         counterparty: bitcoin::secp256k1::PublicKey,
+        /// If true, force-close (unilateral broadcast).
+        force: bool,
         /// Response channel.
         resp: oneshot::Sender<anyhow::Result<()>>,
     },

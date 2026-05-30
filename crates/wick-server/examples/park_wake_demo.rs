@@ -196,7 +196,12 @@ impl NodeApi for StubNode {
     ) -> anyhow::Result<()> {
         unimplemented!("stub")
     }
-    async fn close_channel(&self, _: &ChannelId, _: &PublicKey) -> anyhow::Result<()> {
+    async fn close_channel(
+        &self,
+        _: &ChannelId,
+        _: &PublicKey,
+        _: bool,
+    ) -> anyhow::Result<()> {
         unimplemented!("stub")
     }
     async fn list_channels(&self) -> anyhow::Result<Vec<ChannelSummary>> {

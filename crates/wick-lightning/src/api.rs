@@ -140,11 +140,14 @@ pub trait NodeApi: Send + Sync + Debug + 'static {
         funding_tx: bitcoin::Transaction,
     ) -> anyhow::Result<()>;
 
-    /// Cooperatively close a channel.
+    /// Close a channel. When `force` is true, broadcast the latest local
+    /// commitment unilaterally (required when in-flight HTLCs prevent a
+    /// cooperative close).
     async fn close_channel(
         &self,
         channel_id: &ChannelId,
         counterparty: &PublicKey,
+        force: bool,
     ) -> anyhow::Result<()>;
 
     /// Snapshot of all channels known to the channel manager.

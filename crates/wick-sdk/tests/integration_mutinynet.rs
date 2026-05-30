@@ -953,6 +953,64 @@ const JIT_ALICE_CHANNEL_VALUE_SAT: u64 = 100_000;
 /// operator funding loop signing + LDK pipeline; 4 min is plenty.
 const JIT_SETTLE_TIMEOUT: Duration = Duration::from_secs(240);
 
+/// One-shot cleanup: force-close every channel Alice currently has on
+/// `wick-server`. Use when a prior test run left an HTLC in flight that
+/// LDK cannot clear (RouteNotFound with a low first-hop cap is the
+/// canonical symptom — see `next_outbound_htlc_limit_msat` capped by
+/// `counterparty_max_htlc_value_in_flight - pending_outbound`). Funds
+/// become spendable after the channel's `to_self_delay` (~144 blocks on
+/// mutinynet ≈ 72 min). The next JIT test run will detect no usable
+/// channel and open a fresh one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual: force-closes Alice's mutinynet channels"]
+async fn force_close_alice_mutinynet() {
+    if TcpStream::connect("127.0.0.1:50051").is_err() {
+        panic!("no wick-server listening on 127.0.0.1:50051");
+    }
+
+    // Register the operator LSP so Alice's wake doesn't stall on
+    // auto-reconnect to her persisted LSP peer. Without this, the LSP
+    // node isn't running and Alice's peer-reconnect loop blocks the wake
+    // past wake_deadline.
+    println!("→ minting admin macaroon …");
+    let admin_macaroon = mint_admin_macaroon_for_mutinynet();
+    let mut operator = OperatorClient::with_admin_macaroon(
+        FAUCET_MNEMONIC,
+        None,
+        admin_macaroon,
+        {
+            let mut cfg = WickConfig::for_network(WickNetwork::Mutinynet);
+            cfg.server_endpoint = "http://127.0.0.1:50051".to_owned();
+            cfg
+        },
+    )
+    .await
+    .expect("OperatorClient::with_admin_macaroon");
+    let lsp_pubkey = operator.register_lsp().await.expect("register_lsp");
+    println!("✓ LSP registered pubkey={lsp_pubkey}");
+
+    let alice = register_client(ALICE_MNEMONIC, "alice").await;
+    let channels = alice.list_channels().await.expect("alice list_channels");
+    if channels.is_empty() {
+        println!("alice has no channels — nothing to close");
+        return;
+    }
+    for c in channels {
+        let cid_hex = hex::encode(c.channel_id);
+        println!(
+            "→ force-closing channel {cid_hex} (peer={}, outbound={}msat)",
+            c.counterparty, c.outbound_capacity_msat
+        );
+        match alice
+            .force_close_channel(c.channel_id, c.counterparty)
+            .await
+        {
+            Ok(()) => println!("✓ force_close_channel returned (broadcast queued)"),
+            Err(e) => println!("✗ force_close_channel failed: {e}"),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "manual: wick-server with [lsp] enabled + WICK_ADMIN_SECRET on mutinynet"]
 async fn tenant_to_tenant_jit_payment_mutinynet() {

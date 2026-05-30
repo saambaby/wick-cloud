@@ -929,13 +929,24 @@ where
         &self,
         channel_id: &ChannelId,
         counterparty: &PublicKey,
+        force: bool,
     ) -> anyhow::Result<()> {
         if !self.is_running() {
             anyhow::bail!("node is not running");
         }
-        self.channel_manager
-            .close_channel(channel_id, counterparty)
-            .map_err(|e| anyhow::anyhow!("close_channel: {e:?}"))?;
+        if force {
+            self.channel_manager
+                .force_close_broadcasting_latest_txn(
+                    channel_id,
+                    counterparty,
+                    "wick force_close".to_string(),
+                )
+                .map_err(|e| anyhow::anyhow!("force_close_broadcasting_latest_txn: {e:?}"))?;
+        } else {
+            self.channel_manager
+                .close_channel(channel_id, counterparty)
+                .map_err(|e| anyhow::anyhow!("close_channel: {e:?}"))?;
+        }
         Ok(())
     }
 

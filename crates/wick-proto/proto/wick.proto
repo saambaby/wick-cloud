@@ -364,6 +364,12 @@ message CloseChannelRequest {
   // 33-byte compressed SEC1 counterparty pubkey hex. Must match the
   // counterparty stored on the channel; otherwise LDK rejects.
   string counterparty_pubkey_hex = 3;
+
+  // If true, broadcast the latest local commitment tx unilaterally
+  // (force-close). Required when in-flight HTLCs prevent a cooperative
+  // close. Funds become spendable after the channel's `to_self_delay`
+  // (LDK default ~144 blocks).
+  bool force = 4;
 }
 
 message CloseChannelResponse {}

@@ -870,6 +870,7 @@ impl WalletService for WickGrpcService {
                 NodeCmd::CloseChannel {
                     channel_id,
                     counterparty,
+                    force: req.force,
                     resp: tx,
                 },
             )

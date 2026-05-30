@@ -222,6 +222,7 @@ impl LightningClient {
         &self,
         channel_id: [u8; 32],
         counterparty: bitcoin::secp256k1::PublicKey,
+        force: bool,
     ) -> Result<()> {
         let mut client = self.inner.clone();
         client
@@ -229,6 +230,7 @@ impl LightningClient {
                 tenant_id: 0,
                 channel_id: channel_id.to_vec(),
                 counterparty_pubkey_hex: hex::encode(counterparty.serialize()),
+                force,
             })
             .await?;
         Ok(())

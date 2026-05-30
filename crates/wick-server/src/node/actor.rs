@@ -444,9 +444,10 @@ impl NodeActor {
             NodeCmd::CloseChannel {
                 channel_id,
                 counterparty,
+                force,
                 resp,
             } => {
-                let result = node.close_channel(&channel_id, &counterparty).await;
+                let result = node.close_channel(&channel_id, &counterparty, force).await;
                 if resp.send(result).is_err() {
                     warn!(tenant = %self.tenant_id, "CloseChannel: caller dropped response receiver");
                 }

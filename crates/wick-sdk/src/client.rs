@@ -475,7 +475,25 @@ impl WickClient {
         channel_id: [u8; 32],
         counterparty: PublicKey,
     ) -> Result<()> {
-        self.inner.ln.close_channel(channel_id, counterparty).await
+        self.inner
+            .ln
+            .close_channel(channel_id, counterparty, false)
+            .await
+    }
+
+    /// Force-close a channel by broadcasting the latest local commitment
+    /// transaction. Required when in-flight HTLCs prevent the cooperative
+    /// path. Funds become spendable after the channel's `to_self_delay`
+    /// (LDK default ~144 blocks).
+    pub async fn force_close_channel(
+        &self,
+        channel_id: [u8; 32],
+        counterparty: PublicKey,
+    ) -> Result<()> {
+        self.inner
+            .ln
+            .close_channel(channel_id, counterparty, true)
+            .await
     }
 
     // ── LSP / LSPS2 (Phase 3) ────────────────────────────────────────────────
