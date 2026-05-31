@@ -210,6 +210,50 @@ remaining `event.rs` `block_on` through `kv_runtime`.
 (the cascade is gone, so this is now a clean routing-correctness issue to chase
 next). Plus an occasional regtest setup flake at `bitcoind send_to_address`.
 
+## JIT settlement: VLS commitment-counter lag (open, precisely diagnosed 2026-05-31)
+
+The Bob→Alice JIT payment now runs end-to-end through routing, the LSP HTLC
+intercept, the JIT channel open to Alice, the operator funding loop signing +
+broadcasting the JIT funding tx, and `channel_ready` on the JIT channel. It
+fails at the final HTLC commitment dance because of a **persistent 1-commitment
+lag in the VLS device's `next_holder_commit_num`**.
+
+**Mechanism (confirmed by a per-call sequence trace + LDK/vls-core reads):**
+- The device advances `next_holder_commit_num` only on `RevokeCommitmentTx`
+  (`release_commitment_secret`), and `get_per_commitment_point(N)` is rejected
+  when `N > next + 1` (vls-core channel.rs:513; the `+1` is the author's
+  allowance for LDK fetching ONE point ahead before validate).
+- LDK 0.2 fetches the point **two** ahead on the signer-unblock / RAA resend
+  path: trace shows `get_per_commitment_point(3)` while `next=1` (gap 2 → fail),
+  then `(4)` while `next=2`, etc. — a steady 1-commitment lag on top of the
+  expected +1.
+- Fixes applied that move it forward but don't fully resolve it:
+  - `validate_holder_commitment` now forwards `ValidateCommitmentTx2` for
+    post-funding commitments (was a stub) — commit 870b3fe.
+  - `release_commitment_secret` now fires the signer-unblock callback after a
+    successful `RevokeCommitmentTx`, so LDK retries the parked
+    `get_per_commitment_point` once the counter advances. This makes the flow
+    *progress* (commits 1→2→3→4) but each step still fails once then retries,
+    and the cumulative instability makes LDK abandon the HTLC
+    ("Payment failed at the first hop … channel peer … is broken",
+    `TemporaryNodeFailure`).
+  - `accept_intercept_htlcs = true` (builder) — fixes the separate
+    `UnknownNextPeer`; the LSP now intercepts and opens the JIT channel.
+
+**The real fix (next session):** eliminate the lag rather than retry around it.
+Candidate directions, in order:
+1. Check whether vls-protocol-signer's `GetPerCommitmentPoint2` handler uses the
+   `get_per_commitment_point_unchecked` path at protocol **v6**
+   (`PROTOCOL_VERSION_NO_SECRET`) — if v6 lifts the ceiling (the secret is
+   decoupled), negotiating v6 *and confirming it actually lands* (the earlier v6
+   test may not have negotiated) is the clean fix. wick already uses
+   `GetPerCommitmentPoint2` + reads only the point.
+2. If the ceiling holds at v6, study a reference LDK+VLS integration (lnrod) for
+   how it keeps `next_holder_commit_num` in lockstep with LDK 0.2's eager
+   point-fetch — likely a specific validate/revoke ordering wick is missing.
+This is fund-securing signer code; do it carefully with the sequence trace
+(re-add the `wick_vls::seq` traces from the 870b3fe-era diff to observe ordering).
+
 ## End-goal payment (Alice↔Bob) — status (2026-05-30)
 
 Regtest `jit_flow` now gets the payment **almost** all the way: stability (no

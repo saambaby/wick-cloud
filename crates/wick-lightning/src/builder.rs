@@ -300,6 +300,14 @@ where
         user_config
             .channel_handshake_config
             .max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+        // Required for the LSP to intercept HTLCs on its JIT intercept SCIDs:
+        // without it LDK fails an HTLC routed to a `get_intercept_scid()` SCID
+        // with `UnknownNextPeer` instead of firing `Event::HTLCIntercepted`
+        // (which the LSPS2 service handler turns into an OpenChannel). Safe on
+        // tenant nodes too — only a node that mints intercept SCIDs (the LSP)
+        // ever receives an HTLC that matches one; a tenant that gets a stray
+        // intercept just fails it back (see event.rs HTLCIntercepted handler).
+        user_config.accept_intercept_htlcs = true;
         if lsp_peer.is_some() {
             user_config.manually_accept_inbound_channels = true;
         }

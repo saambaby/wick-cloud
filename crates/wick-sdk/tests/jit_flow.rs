@@ -504,7 +504,13 @@ async fn jit_invoice_carries_lsp_route_hint() {
     // broadcast by the operator goes to the mempool; LDK's chain
     // monitor needs to see it confirm before the channel marks
     // ChannelReady on Bob's side (Alice already accepts 0-conf).
-    let payment_deadline = Instant::now() + Duration::from_secs(60);
+    let payment_deadline = Instant::now() + Duration::from_secs(180);
+    // NOTE: settlement currently does not complete — see docs/phases/poc.md
+    // "JIT settlement: VLS commitment-counter lag". The payment routes, the LSP
+    // intercepts, the JIT channel opens + funds, but Bob's channel hits a
+    // persistent 1-commitment lag at the VLS device (get_per_commitment_point
+    // ceiling) that the fire_signer_unblock retry only papers over, so LDK
+    // eventually abandons the HTLC ("channel peer is broken").
     let hash_hex = hex::encode(invoice.payment_hash);
     loop {
         if Instant::now() >= payment_deadline {

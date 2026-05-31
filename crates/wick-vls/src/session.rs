@@ -1376,12 +1376,27 @@ impl ChannelSigner for VlsRemoteChannelSigner {
         self.await_setup()?;
         let conn = self.active_conn()?;
         let peer_id = self.current_peer_id();
-        block_vls!(rpc::rpc_release_commitment_secret(
+        let r = block_vls!(rpc::rpc_release_commitment_secret(
             &conn, self.dbid, peer_id, idx
         ))
         .map_err(|e| {
             tracing::error!(target: "wick_vls", ctx = %self.lookup.context_id(), %e, dbid = self.dbid, idx, "release_commitment_secret failed");
-        })
+        });
+        if r.is_ok() {
+            // `RevokeCommitmentTx` just advanced the device's
+            // `next_holder_commit_num`. LDK fetches the next per-commitment
+            // point *before* this revoke (the device's ceiling is
+            // `commitment_number <= next_holder_commit_num + 1`), so a
+            // `get_per_commitment_point` for the commitment beyond the old
+            // ceiling was rejected and parked as signer-pending. Now that the
+            // counter has advanced, nudge LDK to retry that parked call —
+            // otherwise the channel stalls waiting for a point the device is
+            // now ready to give. Without this, JIT HTLC settlement hangs with
+            // "get_per_commitment_point: commitment_number N invalid when
+            // next_holder_commit_num is N-2".
+            self.fire_signer_unblock();
+        }
+        r
     }
 
     fn validate_holder_commitment(
