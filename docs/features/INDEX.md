@@ -1,6 +1,6 @@
 # Features Index
 
-One-line summary per feature. Feature specs live in `docs/features/{feature-name}.md`. Specs are created just-in-time per the Half Cycle Method — this index tracks existence, not completion.
+One-line summary per feature. Feature specs live in `docs/features/{feature-name}.md`. This index tracks what exists and its status.
 
 Status legend: `shipped` | `in progress` | `designed` | `deferred`
 
@@ -41,9 +41,3 @@ Status legend: `shipped` | `in progress` | `designed` | `deferred`
 |---------|--------|------|-------|
 | Reference Flutter wallet | deferred | — | Demo surface; all functionality via SDK |
 | WebLN browser extension | deferred | — | Chrome/Firefox; per-site spend limits |
-
----
-
-## Next spec to write
-
-When picking up the next feature from `in progress`, create `docs/features/{name}.md` using the template in `docs/features/_template.md` before writing any code.

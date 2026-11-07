@@ -1,6 +1,5 @@
 # Wick — Product Spec
 
-**Reverse-engineered from existing code and architecture doc.**
 **Version 0.1 — May 2026**
 
 ---

@@ -1,6 +1,6 @@
 # Invariants
 
-Cross-cutting decisions for wick-cloud. Reference invariants by ID (e.g. `[INV-CUSTODY-1]`) from feature specs and code comments. Mark retired invariants as DEPRECATED rather than deleting.
+Cross-cutting rules for wick-cloud. Code and docs cite them by ID (for example `[INV-CUSTODY-1]`). Retired rules stay under Deprecated with their original ID.
 
 ---
 
@@ -237,5 +237,3 @@ Cross-cutting decisions for wick-cloud. Reference invariants by ID (e.g. `[INV-C
 ---
 
 ## Deprecated
-
-<!-- Move retired invariants here. Keep the original ID; add link to replacement. -->

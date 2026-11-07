@@ -175,9 +175,9 @@ A fully **fresh-open** run would set up the channel in-process and avoid this �
 
 ## LSP lifecycle stability under load — FIXED & verified (2026-05-30)
 
-Three parallel agents root-caused the regtest-burst JIT instability as a single
-cascade, and the fixes landed + verified (3 consecutive regtest `jit_flow` runs,
-**zero cascade errors** each):
+The regtest-burst JIT instability was one cascade. The fixes landed and were
+verified across 3 consecutive regtest `jit_flow` runs (**zero cascade errors**
+each):
 
 - **Trigger:** under a channel-open persistence burst, the `kv_runtime` funnels
   all KV connection returns (each paying a `RESET ALL` via the pool's
@@ -240,7 +240,7 @@ lag in the VLS device's `next_holder_commit_num`**.
   - `accept_intercept_htlcs = true` (builder) — fixes the separate
     `UnknownNextPeer`; the LSP now intercepts and opens the JIT channel.
 
-**The real fix (next session):** eliminate the lag rather than retry around it.
+**Remaining fix:** eliminate the lag rather than retry around it.
 Candidate directions, in order:
 1. Check whether vls-protocol-signer's `GetPerCommitmentPoint2` handler uses the
    `get_per_commitment_point_unchecked` path at protocol **v6**
@@ -261,8 +261,8 @@ wedge), routing (no RouteNotFound), Bob's channel + the JIT channel to Alice
 open with full VLS signing. The single remaining blocker is at HTLC settlement:
 
 **VLS commitment-number desync (`get_per_commitment_point: commitment_number 3
-invalid when next_holder_commit_num is 1`).** Precise diagnosis (2 agents +
-a sequence trace on Bob's channel, dbid=1):
+invalid when next_holder_commit_num is 1`).** Precise diagnosis from a sequence
+trace on Bob's channel (dbid=1):
 
 ```
 get_per_commitment_point 0,1            validate_holder_commitment 0 (initial, forwards)
@@ -282,7 +282,7 @@ Confirmed NOT version-related: the `> next+1` ceiling holds at both v5 and v6
 forwards `ValidateCommitmentTx2` for post-funding commitments (was a blanket
 `Ok(())` stub) — necessary but not sufficient.
 
-**The fix (next session — fund-securing signer code, do carefully):** drive
+**Remaining fix (fund-securing signer code):** drive
 `ValidateCommitmentTx2(n)` from inside `release_commitment_secret` (which IS on
 the resend path) before its `RevokeCommitmentTx(n-1)`, replaying the holder
 commitment cached from `validate_holder_commitment`. Reference a working
