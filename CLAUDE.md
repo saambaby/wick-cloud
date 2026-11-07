@@ -2,7 +2,7 @@
 
 Self-custodial Bitcoin Lightning platform — Rust workspace, LDK 0.2, multi-tenant.
 
-## Half Cycle Method — Layer 2 Docs
+## Docs
 
 - `docs/product-spec.md` — product vision, capabilities, non-goals, decisions
 - `docs/architecture-overview.md` — container-level Mermaid diagram (the system as it is)
@@ -38,9 +38,3 @@ Self-custodial Bitcoin Lightning platform — Rust workspace, LDK 0.2, multi-ten
 | `wick-proto` | gRPC protobuf definitions |
 | `wick-core` | Shared core types |
 | `wick-loom-models` | Concurrency test models (loom) |
-
-## Session rules
-
-- End every session with a context update — route changes to this file, `.claude/context/*`, or project memory.
-- Before starting any new feature: check `docs/features/INDEX.md`, then write a spec in `docs/features/{name}.md` before touching code.
-- New invariants go in `docs/invariants.md` first; reference by ID from feature specs and code.

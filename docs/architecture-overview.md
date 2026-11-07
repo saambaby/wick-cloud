@@ -1,7 +1,6 @@
 # Architecture Overview
 
-Container-level diagram of the Wick platform as it exists today (May 2026).
-This is the Layer 2 mandatory diagram — kept in sync with `docs/product-spec.md`.
+Container-level diagram of the Wick platform as it exists today (May 2026), kept in sync with `docs/product-spec.md`.
 
 ```mermaid
 graph TB
